@@ -1,8 +1,9 @@
 # Developer Quality Gates
 
-## Install Dev Dependencies
+## Install Quality Tooling
 ```bash
-python -m pip install -r requirements-dev.txt
+python -m pip install -r requirements.txt
+python -m pip install pytest ruff mypy types-requests pre-commit
 ```
 
 ## Run Full Quality Suite

@@ -121,7 +121,7 @@
 - Added scan diagnostics schema v2 + compatibility normalization for legacy readers.
 - Added trend payload quality/cadence aggregate fields for stocks and forex.
 - Added retention cleanup for stale scanner-quality export artifacts.
-- Added `requirements-dev.txt` and a one-command quality runner (`runtime/tools/run_quality_suite.py`).
+- Added one-command quality runner (`runtime/tools/run_quality_suite.py`) and documented quality-tool installs.
 - Added runtime artifact bootstrap utility (`runtime/tools/bootstrap_runtime_artifacts.py`) for legacy/missing hub_data files.
 
 ## v0.8.0 - 2026-03-05

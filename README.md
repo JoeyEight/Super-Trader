@@ -29,7 +29,6 @@ Recommended Python: `3.10.x`
 
 ```bash
 python3 -m pip install -r requirements.txt
-python3 -m pip install -r requirements-dev.txt
 ```
 
 If you use the launcher, it will create `venv/` automatically and install missing core dependencies before opening the hub.
