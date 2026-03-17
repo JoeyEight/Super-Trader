@@ -941,13 +941,13 @@ class MarketPositionsTableTests(unittest.TestCase):
         self.assertEqual(hub.btn_quick_diag.config["state"], "disabled")
         self.assertEqual(hub.btn_quick_diag.config["text"], "Running Diagnostics")
         self.assertEqual(hub.btn_toolbar_diag.config["state"], "disabled")
-        self.assertEqual(hub.btn_toolbar_diag.config["text"], "Running Diagnostics")
+        self.assertEqual(hub.btn_toolbar_diag.config["text"], "…")
 
         PowerTraderHub._set_diagnostics_busy_ui(hub, False)
         self.assertEqual(hub.btn_quick_diag.config["state"], "normal")
         self.assertEqual(hub.btn_quick_diag.config["text"], "Quick Diagnostics")
         self.assertEqual(hub.btn_toolbar_diag.config["state"], "normal")
-        self.assertEqual(hub.btn_toolbar_diag.config["text"], "Diagnostics")
+        self.assertEqual(hub.btn_toolbar_diag.config["text"], "✚")
 
     def test_refresh_market_chart_hover_restores_tooltip_after_render(self) -> None:
         hub = self._hub()

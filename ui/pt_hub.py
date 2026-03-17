@@ -3143,6 +3143,21 @@ class PowerTraderHub(tk.Tk):
                 foreground=[("active", DARK_ACCENT2)],
                 bordercolor=[("active", DARK_ACCENT2), ("focus", DARK_ACCENT2)],
             )
+            style.configure(
+                "ToolbarIcon.TButton",
+                background=DARK_PANEL2,
+                foreground=DARK_ACCENT2,
+                bordercolor=DARK_ACCENT2,
+                relief="flat",
+                font=("TkDefaultFont", 20, "bold"),
+                padding=(10, 2),
+            )
+            style.map(
+                "ToolbarIcon.TButton",
+                background=[("active", "#15304D"), ("pressed", DARK_PANEL)],
+                foreground=[("active", DARK_ACCENT)],
+                bordercolor=[("active", DARK_ACCENT), ("focus", DARK_ACCENT2)],
+            )
         except Exception:
             pass
 
@@ -5002,6 +5017,70 @@ class PowerTraderHub(tk.Tk):
         right = ttk.Frame(bar, style="Toolbar.TFrame")
         right.pack(side="right")
 
+        def _hide_toolbar_tooltip() -> None:
+            try:
+                tip = getattr(self, "_toolbar_tip_win", None)
+                if tip is not None:
+                    tip.destroy()
+            except Exception:
+                pass
+            self._toolbar_tip_win = None
+            self._toolbar_tip_label = None
+
+        def _show_toolbar_tooltip(widget: tk.Widget, text: str) -> None:
+            try:
+                if not str(text or "").strip():
+                    return
+                x = int(widget.winfo_rootx() + (widget.winfo_width() // 2) + 8)
+                y = int(widget.winfo_rooty() + widget.winfo_height() + 8)
+                tw = getattr(self, "_toolbar_tip_win", None)
+                lbl = getattr(self, "_toolbar_tip_label", None)
+                if tw is None or (not bool(tw.winfo_exists())):
+                    tw = tk.Toplevel(self)
+                    tw.overrideredirect(True)
+                    tw.attributes("-topmost", True)
+                    lbl = ttk.Label(
+                        tw,
+                        text=str(text),
+                        style="Subtle.TLabel",
+                        padding=(8, 4),
+                        justify="left",
+                    )
+                    lbl.pack()
+                    self._toolbar_tip_win = tw
+                    self._toolbar_tip_label = lbl
+                else:
+                    try:
+                        lbl.configure(text=str(text))
+                    except Exception:
+                        pass
+                tw.geometry(f"+{x}+{y}")
+            except Exception:
+                _hide_toolbar_tooltip()
+
+        def _bind_toolbar_tooltip(widget: tk.Widget, text: str) -> None:
+            try:
+                widget.bind("<Enter>", lambda _e, w=widget, t=text: _show_toolbar_tooltip(w, t), add="+")
+                widget.bind("<Leave>", lambda _e: _hide_toolbar_tooltip(), add="+")
+                widget.bind("<ButtonPress>", lambda _e: _hide_toolbar_tooltip(), add="+")
+                widget.bind("<Destroy>", lambda _e: _hide_toolbar_tooltip(), add="+")
+            except Exception:
+                pass
+
+        def _add_toolbar_icon_button(icon: str, tooltip: str, command: Any, *, keep_ref: Optional[str] = None) -> ttk.Button:
+            btn = ttk.Button(
+                right,
+                text=str(icon),
+                width=3,
+                style="ToolbarIcon.TButton",
+                command=command,
+            )
+            btn.pack(side="right", padx=(8, 0))
+            _bind_toolbar_tooltip(btn, tooltip)
+            if keep_ref:
+                setattr(self, keep_ref, btn)
+            return btn
+
         self.btn_toolbar_toggle = ttk.Button(
             right,
             text="Start Trades",
@@ -5010,49 +5089,13 @@ class PowerTraderHub(tk.Tk):
         )
         self.btn_toolbar_toggle.pack(side="right", padx=(8, 0))
 
-        ttk.Button(
-            right,
-            text="Settings",
-            style="Compact.TButton",
-            command=self.open_settings_dialog,
-        ).pack(side="right", padx=(8, 0))
-        self.btn_toolbar_diag = ttk.Button(
-            right,
-            text="Diagnostics",
-            style="Compact.TButton",
-            command=self._run_quick_diagnostics,
-        )
-        self.btn_toolbar_diag.pack(side="right", padx=(8, 0))
-        ttk.Button(
-            right,
-            text="Replay",
-            style="Compact.TButton",
-            command=lambda: self._run_rejection_replay("both"),
-        ).pack(side="right", padx=(8, 0))
-        ttk.Button(
-            right,
-            text="Strategy Lab",
-            style="Compact.TButton",
-            command=lambda: self._open_strategy_lab_window(self._active_market_key()),
-        ).pack(side="right", padx=(8, 0))
-        ttk.Button(
-            right,
-            text="Alerts",
-            style="Compact.TButton",
-            command=self.open_notification_center,
-        ).pack(side="right", padx=(8, 0))
-        ttk.Button(
-            right,
-            text="Export Snapshot",
-            style="Compact.TButton",
-            command=self._export_market_status_snapshot_json,
-        ).pack(side="right", padx=(8, 0))
-        ttk.Button(
-            right,
-            text="Quick Start",
-            style="Compact.TButton",
-            command=self._open_onboarding_wizard,
-        ).pack(side="right", padx=(8, 0))
+        _add_toolbar_icon_button("▶", "Quick Start", self._open_onboarding_wizard)
+        _add_toolbar_icon_button("⇩", "Export Snapshot", self._export_market_status_snapshot_json)
+        _add_toolbar_icon_button("⚠", "Alerts", self.open_notification_center)
+        _add_toolbar_icon_button("⚗", "Strategy Lab", lambda: self._open_strategy_lab_window(self._active_market_key()))
+        _add_toolbar_icon_button("↻", "Replay", lambda: self._run_rejection_replay("both"))
+        self.btn_toolbar_diag = _add_toolbar_icon_button("✚", "Diagnostics", self._run_quick_diagnostics)
+        _add_toolbar_icon_button("⚙", "Settings", self.open_settings_dialog)
         self._set_badge_style(self.lbl_toolbar_state_badge, "RUNTIME: STOPPED", tone="muted")
         self._set_badge_style(self.lbl_toolbar_api_badge, "BROKERS: N/A", tone="muted")
         self._set_badge_style(self.lbl_toolbar_checks_badge, "CHECKS: N/A", tone="muted")
@@ -6273,7 +6316,7 @@ class PowerTraderHub(tk.Tk):
             if getattr(self, "btn_toolbar_diag", None) is not None:
                 self.btn_toolbar_diag.configure(
                     state=("disabled" if busy else "normal"),
-                    text=("Running Diagnostics" if busy else "Diagnostics"),
+                    text=("…" if busy else "✚"),
                 )
         except Exception:
             pass
@@ -6941,24 +6984,8 @@ class PowerTraderHub(tk.Tk):
         )
         self.btn_crypto_test_connection.grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=(0, 2))
 
-        action_auto_row = ttk.Frame(action_box)
-        action_auto_row.pack(fill="x", padx=6, pady=(0, 6))
         self.crypto_auto_scan_var = tk.BooleanVar(value=bool(self.settings.get("crypto_dynamic_enabled", True)))
         self.crypto_auto_step_var = tk.BooleanVar(value=bool(self.settings.get("auto_start_trading_when_all_trained", True)))
-        self.crypto_auto_scan_chk = ttk.Checkbutton(
-            action_auto_row,
-            text="Auto scan",
-            variable=self.crypto_auto_scan_var,
-            command=self._on_crypto_auto_scan_toggle,
-        )
-        self.crypto_auto_scan_chk.pack(side="left")
-        self.crypto_auto_step_chk = ttk.Checkbutton(
-            action_auto_row,
-            text="Auto trader step",
-            variable=self.crypto_auto_step_var,
-            command=self._on_crypto_auto_step_toggle,
-        )
-        self.crypto_auto_step_chk.pack(side="left", padx=(18, 0))
 
         self.btn_quick_diag = None
         self.btn_ack_safety = None
@@ -8257,12 +8284,8 @@ class PowerTraderHub(tk.Tk):
         trader_step_market_key = market_key
 
         action_status_var = tk.StringVar(value="Next: configure broker credentials, then test connection.")
-        action_auto_row = ttk.Frame(action_box)
-        action_auto_row.pack(fill="x", padx=6, pady=(0, 6))
         auto_scan_var = tk.BooleanVar(value=True)
         auto_step_var = tk.BooleanVar(value=True)
-        auto_scan_chk = ttk.Checkbutton(action_auto_row, text="Auto scan", variable=auto_scan_var)
-        auto_step_chk = ttk.Checkbutton(action_auto_row, text="Auto trader step", variable=auto_step_var)
 
         portfolio_box = ttk.LabelFrame(market_dash_body, text="Portfolio")
         portfolio_box.pack(fill="x", padx=6, pady=(0, 6))
@@ -8378,7 +8401,6 @@ class PowerTraderHub(tk.Tk):
                 widget.grid(row=row, column=col, sticky="ew", padx=(0 if col == 0 else 6, 0), pady=(0, 4))
 
         action_widgets = [run_btn, trader_step_btn, refresh_btn, test_btn]
-        auto_widgets = [auto_scan_chk, auto_step_chk]
         chip_widgets = [chip_data, chip_broker, chip_orders, chip_cycle]
 
         def _reflow_market_dashboard(_e: Any = None) -> None:
@@ -8394,7 +8416,6 @@ class PowerTraderHub(tk.Tk):
                     pass
             _responsive_grid(health_chip_row, chip_widgets, min_col_width=112)
             _responsive_grid(action_buttons, action_widgets, min_col_width=150)
-            _responsive_grid(action_auto_row, auto_widgets, min_col_width=180)
             try:
                 max_open_row.columnconfigure(0, weight=1)
             except Exception:
