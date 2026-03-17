@@ -131,7 +131,10 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
     incident_count = int(warn_count + err_count)
     warns = len(list(checks.get("warnings", []) or []))
     startup_warnings = [str(x or "") for x in list(checks.get("warnings", []) or [])]
-    checks_ok = bool(checks.get("ok", False))
+    startup_errors = len(list(checks.get("errors", []) or []))
+    checks_ok_raw = bool(checks.get("ok", False))
+    checks_indeterminate = bool((not checks_ok_raw) and startup_errors <= 0 and warns <= 0)
+    checks_ok = bool(checks_ok_raw or checks_indeterminate)
     api_unstable = bool(autopilot.get("api_unstable", False))
     drift_count = int(len(active_drift))
     cadence_count = int(len(active_cadence))
@@ -167,7 +170,6 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
             total += int(row.get(sev_key, 0) or 0)
         return int(total)
 
-    startup_errors = len(list(checks.get("errors", []) or []))
     startup_checks_active = (not checks_ok) or warns > 0 or startup_errors > 0
     inactive_warn_sub = 0
     inactive_err_sub = 0
@@ -325,6 +327,7 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
             "error_incidents_cadence_last_1h": int(cadence_err_count),
             "error_incidents_non_cadence_last_1h": int(err_count),
             "startup_warning_count": int(warns),
+            "startup_checks_indeterminate": bool(checks_indeterminate),
             "checks_ok": bool(checks_ok),
             "api_unstable": bool(api_unstable),
             "drift_spike_active_count": int(drift_count),

@@ -278,7 +278,7 @@ def run_once(dry_run: bool = False) -> Dict[str, Any]:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="PowerTrader autonomous optimizer.")
+    ap = argparse.ArgumentParser(description="Super Trader autonomous optimizer.")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()

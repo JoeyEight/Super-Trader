@@ -456,7 +456,7 @@ def main() -> int:
     if bool(args.json_only):
         print(json.dumps(report, indent=2))
     else:
-        print("PowerTrader Preflight Readiness")
+        print("Super Trader Preflight Readiness")
         print(f"project: {report.get('project_dir')}")
         print(f"settings: {report.get('settings_path')}")
         for line in list(report.get("summary", []) or []):

@@ -1,11 +1,12 @@
-# PowerTrader AI
+# Super Trader
 
-PowerTrader AI is a multi-market trading hub with three coordinated engines:
+Super Trader is a multi-market trading hub with three coordinated engines:
 - Crypto (live-capable)
 - Stocks (Alpaca-backed)
 - Forex (OANDA-backed)
 
-The desktop hub UI is in [ui/pt_hub.py](/Users/joeydelestre/PowerTrader_AI/ui/pt_hub.py), with runtime orchestration in [runtime/pt_runner.py](/Users/joeydelestre/PowerTrader_AI/runtime/pt_runner.py).
+The desktop hub UI is in `ui/pt_hub.py`, with runtime orchestration in `runtime/pt_runner.py`.
+Primary repository: `https://github.com/JoeyEight/Super-Trader.git`
 
 ## Safety First
 - This software can place real orders when configured for live mode.
@@ -24,6 +25,8 @@ The desktop hub UI is in [ui/pt_hub.py](/Users/joeydelestre/PowerTrader_AI/ui/pt
 - `<COIN>/` coin-specific model/data directories (crypto training/runtime)
 
 ## Install
+Recommended Python: `3.10.x`
+
 ```bash
 python3 -m pip install -r requirements.txt
 python3 -m pip install -r requirements-dev.txt
@@ -31,10 +34,15 @@ python3 -m pip install -r requirements-dev.txt
 
 If you use the launcher, it will create `venv/` automatically and install missing core dependencies before opening the hub.
 
+Runtime packages currently used by the app code:
+- `requests`, `kucoin-python`, `PyNaCl`, `cryptography`, `colorama`
+- `matplotlib`, `psutil`
+- `python-dotenv`, `pandas` (used by `sources/*` helpers)
+
 ## Run
 ### Hub UI
 ```bash
-./launch_powertrader.command
+./launch_super_trader.command
 ```
 
 Alternative:
@@ -90,15 +98,19 @@ python3 runtime/tools/run_quality_suite.py --require-artifacts --require-stabili
 ## Key Runtime Files
 ### Core status
 - `hub_data/trader_status.json`
-- `hub_data/runner_status.json`
+- `hub_data/runner_ready.json`
+- `hub_data/runner.pid`
 - `hub_data/runtime_state.json`
 - `hub_data/market_loop_status.json`
+- `hub_data/runtime_startup_checks.json`
+- `hub_data/notification_center.json`
 
 ### Market status
 - `hub_data/stocks/stock_thinker_status.json`
 - `hub_data/stocks/stock_trader_status.json`
 - `hub_data/forex/forex_thinker_status.json`
 - `hub_data/forex/forex_trader_status.json`
+- `hub_data/forex/forexfactory_calendar_cache.json`
 
 ### Diagnostics
 - `hub_data/stocks/scan_diagnostics.json`
@@ -120,6 +132,7 @@ python3 runtime/tools/run_quality_suite.py --require-artifacts --require-stabili
 - Stocks and forex run from the same detached runtime supervisor used by crypto.
 - Stocks and forex use the native in-app charts and watchlists; the old TradingView launch path is not part of the active UI flow.
 - Notification Center reflects live runtime state plus recent unresolved incidents; stale resolved incidents are filtered out by the current app code.
+- Forex `event_feed` warnings indicate macro-event feed degradation and do not by themselves disable forex trading; execution gates still apply independently.
 
 ## Credentials
 ### Crypto (Robinhood)
@@ -151,9 +164,9 @@ python3 runtime/tools/run_quality_suite.py --require-artifacts --require-stabili
   - `POWERTRADER_OANDA_API_TOKEN`
 
 ## Operator Notes
-- Changelog: [docs/CHANGELOG.md](/Users/joeydelestre/PowerTrader_AI/docs/CHANGELOG.md)
-- Runbook: [docs/RUNBOOK.md](/Users/joeydelestre/PowerTrader_AI/docs/RUNBOOK.md)
-- Settings migration notes: [docs/SETTINGS_MIGRATIONS.md](/Users/joeydelestre/PowerTrader_AI/docs/SETTINGS_MIGRATIONS.md)
+- Changelog: [docs/CHANGELOG.md](docs/CHANGELOG.md)
+- Runbook: [docs/RUNBOOK.md](docs/RUNBOOK.md)
+- Settings migration notes: [docs/SETTINGS_MIGRATIONS.md](docs/SETTINGS_MIGRATIONS.md)
 
 ## Disclaimer
 Use at your own risk. You are responsible for all broker/account configuration, risk limits, and any resulting trades.

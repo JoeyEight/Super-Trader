@@ -2675,7 +2675,7 @@ class LogProc:
 class PowerTraderHub(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("PowerTrader - Hub")
+        self.title("Super Trader - Hub")
         self.geometry("1400x820")
 
         # Hard minimum window size so the UI can't be shrunk to a point where panes vanish.
@@ -2968,7 +2968,7 @@ class PowerTraderHub(tk.Tk):
 
         frame = ttk.Frame(win)
         frame.pack(fill="both", expand=True, padx=12, pady=12)
-        ttk.Label(frame, text="PowerTrader Quick Start", foreground=DARK_ACCENT2).pack(anchor="w", pady=(0, 8))
+        ttk.Label(frame, text="Super Trader Quick Start", foreground=DARK_ACCENT2).pack(anchor="w", pady=(0, 8))
         msg = (
             "1. Open Settings and add broker credentials.\n"
             "2. Test broker connections from Stocks and Forex tabs.\n"
@@ -4849,7 +4849,7 @@ class PowerTraderHub(tk.Tk):
 
         left = ttk.Frame(bar, style="Toolbar.TFrame")
         left.pack(side="left", fill="x", expand=True)
-        ttk.Label(left, text="PowerTrader Command Center", style="ToolbarTitle.TLabel").pack(anchor="w")
+        ttk.Label(left, text="Super Trader Command Center", style="ToolbarTitle.TLabel").pack(anchor="w")
         self.lbl_toolbar_subtitle = ttk.Label(
             left,
             text="Operator workflow: verify health -> scan leaders -> execute with safety gates.",
@@ -5347,7 +5347,7 @@ class PowerTraderHub(tk.Tk):
             scorecards = rt.get("shadow_scorecards", {}) if isinstance(rt.get("shadow_scorecards", {}), dict) else {}
             schema = rt.get("runtime_state_schema", {}) if isinstance(rt.get("runtime_state_schema", {}), dict) else {}
             lines = [
-                f"PowerTrader Runtime Summary | generated {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                f"Super Trader Runtime Summary | generated {time.strftime('%Y-%m-%d %H:%M:%S')}",
                 "",
                 f"Runner state: {str((rt.get('runner', {}) if isinstance(rt.get('runner', {}), dict) else {}).get('state', 'N/A'))}",
                 f"Runtime schema: v{int(schema.get('version', 0) or 0)} | min_reader={int(schema.get('min_reader_version', 0) or 0)}",
@@ -20692,7 +20692,7 @@ class PowerTraderHub(tk.Tk):
                 "  C) Click Crypto.\n"
                 "  D) Scroll down to API Trading and click + Add Key (or Add key).\n"
                 "  E) Paste the Public Key into the Public key field.\n"
-                "  F) Give it any name (example: PowerTrader).\n"
+                "  F) Give it any name (example: Super Trader).\n"
                 "  G) Permissions: this TRADER needs READ + TRADE. (READ-only cannot place orders.)\n"
                 "  H) Click Save. Robinhood shows your API Key — copy it right away (it may only show once).\n\n"
                 "📱 Mobile note: if you can't find API Trading in the app, use robinhood.com in a browser.\n\n"

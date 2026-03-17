@@ -1,7 +1,8 @@
 #!/bin/zsh
 set -euo pipefail
 
-PROJECT_DIR="$HOME/PowerTrader_AI"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$SCRIPT_DIR"
 cd "$PROJECT_DIR" || exit 1
 
 # Ensure runtime directories exist.

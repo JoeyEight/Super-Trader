@@ -34,7 +34,7 @@ ROLLOUT_ORDER = {
     "live_guarded": 5,
 }
 FOREX_FACTORY_EXPORT_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.csv"
-FOREX_FACTORY_USER_AGENT = "Mozilla/5.0 (PowerTrader/1.0)"
+FOREX_FACTORY_USER_AGENT = "Mozilla/5.0 (SuperTrader/1.0)"
 _FF_IMPACT_RANK = {"low": 1, "medium": 2, "high": 3}
 
 

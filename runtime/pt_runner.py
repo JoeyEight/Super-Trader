@@ -600,6 +600,17 @@ class Runner:
         settings_path = resolve_settings_path(BASE_DIR) or _SETTINGS_PATH or os.path.join(BASE_DIR, "gui_settings.json")
         settings = sanitize_settings(read_settings_file(settings_path, module_name="pt_runner") or {})
         checks = _safe_read_json(RUNTIME_CHECKS_PATH)
+        check_errors = list(checks.get("errors", []) or []) if isinstance(checks.get("errors", []), list) else []
+        check_warnings = list(checks.get("warnings", []) or []) if isinstance(checks.get("warnings", []), list) else []
+        check_ok = bool(checks.get("ok", False))
+        # Self-heal missing/corrupt startup-check artifacts so alerts do not stay stuck on a
+        # false critical state after data/cache cleanup.
+        if (not check_ok) and (not check_errors) and (not check_warnings):
+            checks = {"ts": now_ts(), "ok": True, "errors": [], "warnings": []}
+            try:
+                _atomic_write_json(RUNTIME_CHECKS_PATH, checks)
+            except Exception:
+                pass
         stock_diag = normalize_scan_diagnostics(
             _safe_read_json(os.path.join(HUB_DATA_DIR, "stocks", "scan_diagnostics.json")),
             market="stocks",

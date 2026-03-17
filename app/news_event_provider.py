@@ -163,7 +163,7 @@ def _fetch_symbol_headlines(symbol_query: str, timeout_s: float = 8.0, max_items
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "PowerTrader-AI/1.0",
+            "User-Agent": "SuperTrader-AI/1.0",
             "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
         },
     )

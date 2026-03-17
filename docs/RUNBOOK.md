@@ -1,4 +1,4 @@
-# PowerTrader Incident Runbook
+# Super Trader Incident Runbook
 
 ## 0. Preflight Before Shadow/Live
 - Run readiness checks before major environment changes:

@@ -63,6 +63,18 @@ class TestHealthRules(unittest.TestCase):
         self.assertEqual(out["severity"], "critical")
         self.assertIn("startup_checks_failed", out["reasons"])
 
+    def test_missing_startup_checks_artifact_does_not_raise_false_critical(self) -> None:
+        state = {
+            "checks": {"ok": False, "warnings": [], "errors": []},
+            "scan_health": {"stocks": {"reject_rate_pct": 0.0}, "forex": {"reject_rate_pct": 0.0}},
+            "incidents_last_200": {"count": 0, "by_severity": {"error": 0}},
+            "autopilot": {"api_unstable": False},
+        }
+        out = evaluate_runtime_alerts(state, {})
+        self.assertEqual(out["severity"], "ok")
+        self.assertNotIn("startup_checks_failed", out["reasons"])
+        self.assertTrue(bool(out.get("metrics", {}).get("startup_checks_indeterminate", False)))
+
     def test_warn_on_drift_spike(self) -> None:
         state = {
             "checks": {"ok": True, "warnings": []},

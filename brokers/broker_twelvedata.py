@@ -30,7 +30,7 @@ class TwelveDataClient:
         req = urllib.request.Request(
             url,
             headers={
-                "User-Agent": "PowerTrader/1.0 (+local trading bot)",
+                "User-Agent": "SuperTrader/1.0 (+local trading bot)",
                 "Accept": "application/json",
             },
         )
