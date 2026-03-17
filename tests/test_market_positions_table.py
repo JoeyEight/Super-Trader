@@ -828,9 +828,9 @@ class MarketPositionsTableTests(unittest.TestCase):
             [{"event": "exit", "instrument": "AUD_USD", "side": "short", "units": 2, "price": 0.6500, "pnl_usd": -0.12, "ok": True, "ts": 2}],
         )
         self.assertEqual(len(forex_rows), 1)
-        self.assertIn("BUY/CLOSE", forex_rows[0]["text"])
+        self.assertIn("SELL/CLOSE", forex_rows[0]["text"])
         self.assertIn("realized=-0.12", forex_rows[0]["text"])
-        self.assertEqual(forex_rows[0]["fg"], "#00E5FF")
+        self.assertEqual(forex_rows[0]["fg"], "#00FF66")
 
     def test_resolved_market_history_rows_backfills_missing_open_stock_entry(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -921,14 +921,14 @@ class MarketPositionsTableTests(unittest.TestCase):
             hub,
             "forex",
             [
-                {"text": "2026-03-12 16:58:24 | SELL/OPEN | GBP_USD | qty=32 | px=1.33455", "fg": "#FFB347"},
-                {"text": "2026-03-12 17:19:51 | BUY/CLOSE | AUD_CAD | qty=14 | px=0.96554 | realized=+0.12", "fg": "#00FF66"},
+                {"text": "2026-03-12 16:58:24 | BUY/OPEN  | GBP_USD | qty=32 | px=1.33455", "fg": "#00E5FF"},
+                {"text": "2026-03-12 17:19:51 | SELL/CLOSE | AUD_CAD | qty=14 | px=0.96554 | realized=+0.12", "fg": "#00FF66"},
             ],
         )
 
         self.assertEqual(len(listbox.rows), 2)
-        self.assertIn("SELL/OPEN", listbox.rows[0])
-        self.assertEqual(listbox.item_styles[0]["fg"], "#FFB347")
+        self.assertIn("BUY/OPEN", listbox.rows[0])
+        self.assertEqual(listbox.item_styles[0]["fg"], "#00E5FF")
         self.assertEqual(listbox.item_styles[1]["fg"], "#00FF66")
         self.assertEqual(listbox.y_pos, 0.0)
 

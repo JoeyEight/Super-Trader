@@ -452,6 +452,7 @@ DEFAULT_SETTINGS = {
     "crypto_dynamic_auto_train": True,
     "crypto_dynamic_max_trainers": 1,
     "crypto_dynamic_rotation_cooldown_s": 900,
+    "crypto_max_open_positions": 8,
     "news_event_enabled": True,
     "news_event_refresh_s": 900.0,
     "news_event_stale_max_s": 21600.0,
@@ -3422,6 +3423,46 @@ class PowerTraderHub(tk.Tk):
             return False, f"Save failed: {type(exc).__name__}: {exc}"
         return True, f"{label} max open positions saved: {new_val}"
 
+    def _save_crypto_max_open_positions(self, value: Any) -> Tuple[bool, str]:
+        cfg_key = "crypto_max_open_positions"
+        try:
+            new_val = max(1, int(float(str(value or "").strip() or "1")))
+        except Exception:
+            return False, "Enter a whole number of 1 or higher."
+        self.settings[cfg_key] = new_val
+        try:
+            overrides = self._profile_manual_override_keys()
+            overrides.add(cfg_key)
+            self.settings["profile_manual_overrides"] = sorted(overrides)
+        except Exception:
+            self.settings["profile_manual_overrides"] = [cfg_key]
+        try:
+            self._save_settings()
+        except Exception as exc:
+            return False, f"Save failed: {type(exc).__name__}: {exc}"
+        return True, f"Crypto max open positions saved: {new_val}"
+
+    def _crypto_max_open_positions_setting_value(self) -> int:
+        try:
+            fallback = max(
+                1,
+                int(
+                    float(
+                        self.settings.get(
+                            "crypto_dynamic_target_count",
+                            DEFAULT_SETTINGS.get("crypto_dynamic_target_count", 8),
+                        )
+                        or DEFAULT_SETTINGS.get("crypto_dynamic_target_count", 8)
+                    )
+                ),
+            )
+        except Exception:
+            fallback = 8
+        try:
+            return max(1, int(float(self.settings.get("crypto_max_open_positions", fallback) or fallback)))
+        except Exception:
+            return max(1, int(fallback))
+
     def _market_max_open_positions_setting_value(self, market_key: str) -> int:
         mk = str(market_key or "").strip().lower()
         cfg_key = "stock_max_open_positions" if mk == "stocks" else "forex_max_open_positions"
@@ -3439,6 +3480,7 @@ class PowerTraderHub(tk.Tk):
         else:
             seq = []
         allowed = {
+            "crypto_max_open_positions",
             "stock_max_open_positions",
             "forex_max_open_positions",
             "stock_trade_notional_usd",
@@ -3480,6 +3522,28 @@ class PowerTraderHub(tk.Tk):
                 dirty_var.set(False)
         finally:
             row["max_open_positions_syncing"] = False
+
+    def _sync_crypto_max_open_positions_editor(self, *, force: bool = False) -> None:
+        var = getattr(self, "crypto_max_open_positions_var", None)
+        if not (hasattr(var, "set") and hasattr(var, "get")):
+            return
+        dirty_var = getattr(self, "crypto_max_open_positions_dirty_var", None)
+        sync_state = getattr(self, "crypto_max_open_positions_sync_state", {})
+        try:
+            dirty = bool(dirty_var.get()) if hasattr(dirty_var, "get") else False
+        except Exception:
+            dirty = False
+        if (not force) and dirty:
+            return
+        if isinstance(sync_state, dict):
+            sync_state["value"] = True
+        try:
+            var.set(str(self._crypto_max_open_positions_setting_value()))
+            if hasattr(dirty_var, "set"):
+                dirty_var.set(False)
+        finally:
+            if isinstance(sync_state, dict):
+                sync_state["value"] = False
             if isinstance(sync_state, dict):
                 sync_state["value"] = False
 
@@ -6723,9 +6787,38 @@ class PowerTraderHub(tk.Tk):
         system_box = ttk.LabelFrame(controls_left, text="System")
         system_box.pack(fill="x", padx=6, pady=(0, 6))
         system_header = ttk.Frame(system_box)
-        system_header.pack(fill="x", padx=6, pady=(4, 2))
+        system_header.pack(fill="x", padx=6, pady=(4, 4))
+        health_chip_row = tk.Frame(system_header, bg=DARK_BG)
+        health_chip_row.pack(side="left", fill="x", expand=True)
+        self.crypto_chip_data = tk.Label(health_chip_row, text=" Data: N/A ", padx=8, pady=3)
+        self.crypto_chip_broker = tk.Label(health_chip_row, text=" Broker: N/A ", padx=8, pady=3)
+        self.crypto_chip_orders = tk.Label(health_chip_row, text=" Orders: N/A ", padx=8, pady=3)
+        self.crypto_chip_cycle = tk.Label(health_chip_row, text=" Cycle: N/A ", padx=8, pady=3)
+        for widget, text in (
+            (self.crypto_chip_data, "Data: N/A"),
+            (self.crypto_chip_broker, "Broker: N/A"),
+            (self.crypto_chip_orders, "Orders: N/A"),
+            (self.crypto_chip_cycle, "Cycle: N/A"),
+        ):
+            self._set_badge_style(widget, text, tone="muted")
+        try:
+            health_chip_row.grid_columnconfigure(0, weight=1)
+            health_chip_row.grid_columnconfigure(1, weight=1)
+        except Exception:
+            pass
+        for idx, widget in enumerate(
+            (
+                self.crypto_chip_data,
+                self.crypto_chip_broker,
+                self.crypto_chip_orders,
+                self.crypto_chip_cycle,
+            )
+        ):
+            row = idx // 2
+            col = idx % 2
+            widget.grid(row=row, column=col, sticky="ew", padx=(0 if col == 0 else 6, 0), pady=(0, 4))
+
         self.crypto_system_summary_var = tk.StringVar(value="Neural: stopped | Trader: stopped")
-        ttk.Label(system_header, textvariable=self.crypto_system_summary_var, justify="left").pack(side="left", fill="x", expand=True)
         self.crypto_system_details_visible_var = tk.BooleanVar(value=False)
         crypto_system_body = ttk.Frame(system_box)
         crypto_system_body.pack(fill="x", padx=6, pady=(0, 6))
@@ -6746,7 +6839,7 @@ class PowerTraderHub(tk.Tk):
 
         self.btn_crypto_system_toggle = ttk.Button(
             system_header,
-            text="Hide Details",
+            text="Show Details",
             width=12,
             style="Compact.TButton",
             command=lambda: (self.crypto_system_details_visible_var.set(not bool(self.crypto_system_details_visible_var.get())), _apply_crypto_system_visibility()),
@@ -6810,32 +6903,65 @@ class PowerTraderHub(tk.Tk):
             )
         except Exception:
             pass
-        # Start Trades (left control column; does not affect layout elsewhere)
-        start_all_row = ttk.Frame(crypto_system_body)
-        start_all_row.pack(fill="x", pady=(0, 6))
+        _apply_crypto_system_visibility()
 
+        action_box = ttk.LabelFrame(controls_left, text="Action Center")
+        action_box.pack(fill="x", padx=6, pady=(0, 6))
+        action_buttons = ttk.Frame(action_box)
+        action_buttons.pack(fill="x", padx=6, pady=(6, 4))
+        action_buttons.grid_columnconfigure(0, weight=1)
+        action_buttons.grid_columnconfigure(1, weight=1)
+
+        self.btn_crypto_run_scan = ttk.Button(
+            action_buttons,
+            text="Run Scan",
+            style="Accent.TButton",
+            command=self._run_crypto_scan_now,
+        )
+        self.btn_crypto_run_scan.grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=(0, 4))
         self.btn_toggle_all = ttk.Button(
-            start_all_row,
+            action_buttons,
             text="Start Trades",
-            width=BTN_W,
+            style="Compact.TButton",
             command=self.toggle_all_scripts,
         )
-        self.btn_toggle_all.pack(side="left")
-        self.btn_quick_diag = ttk.Button(
-            start_all_row,
-            text="Quick Diagnostics",
-            width=max(BTN_W, 18),
-            command=self._run_quick_diagnostics,
+        self.btn_toggle_all.grid(row=0, column=1, sticky="ew", padx=(4, 0), pady=(0, 4))
+        self.btn_crypto_refresh_snapshot = ttk.Button(
+            action_buttons,
+            text="Refresh Snapshot",
+            style="Compact.TButton",
+            command=self._refresh_crypto_dashboard_snapshot,
         )
-        self.btn_quick_diag.pack(side="left", padx=(8, 0))
-        self.btn_ack_safety = ttk.Button(
-            start_all_row,
-            text="Acknowledge Safety",
-            width=BTN_W,
-            command=self._acknowledge_drawdown_safety,
+        self.btn_crypto_refresh_snapshot.grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=(0, 2))
+        self.btn_crypto_test_connection = ttk.Button(
+            action_buttons,
+            text="Test Robinhood Connection",
+            style="Compact.TButton",
+            command=lambda: self.open_settings_dialog("crypto_credentials"),
         )
-        self.btn_ack_safety.pack(side="left", padx=(8, 0))
-        _apply_crypto_system_visibility()
+        self.btn_crypto_test_connection.grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=(0, 2))
+
+        action_auto_row = ttk.Frame(action_box)
+        action_auto_row.pack(fill="x", padx=6, pady=(0, 6))
+        self.crypto_auto_scan_var = tk.BooleanVar(value=bool(self.settings.get("crypto_dynamic_enabled", True)))
+        self.crypto_auto_step_var = tk.BooleanVar(value=bool(self.settings.get("auto_start_trading_when_all_trained", True)))
+        self.crypto_auto_scan_chk = ttk.Checkbutton(
+            action_auto_row,
+            text="Auto scan",
+            variable=self.crypto_auto_scan_var,
+            command=self._on_crypto_auto_scan_toggle,
+        )
+        self.crypto_auto_scan_chk.pack(side="left")
+        self.crypto_auto_step_chk = ttk.Checkbutton(
+            action_auto_row,
+            text="Auto trader step",
+            variable=self.crypto_auto_step_var,
+            command=self._on_crypto_auto_step_toggle,
+        )
+        self.crypto_auto_step_chk.pack(side="left", padx=(18, 0))
+
+        self.btn_quick_diag = None
+        self.btn_ack_safety = None
 
         def _build_runtime_summary_tab(parent: tk.Widget) -> None:
             runtime_summary_box = ttk.LabelFrame(parent, text="Runtime Summary")
@@ -6878,9 +7004,74 @@ class PowerTraderHub(tk.Tk):
         self.lbl_acct_holdings_value = _add_portfolio_metric(1, "Holdings Value")
         self.lbl_acct_buying_power = _add_portfolio_metric(2, "Buying Power")
         self.lbl_acct_percent_in_trade = _add_portfolio_metric(3, "Percent In Trade")
-        self.lbl_acct_dca_spread = _add_portfolio_metric(4, "DCA Levels (spread)")
-        self.lbl_acct_dca_single = _add_portfolio_metric(5, "DCA Levels (single)")
-        self.lbl_pnl = _add_portfolio_metric(6, "Total realized")
+        self.lbl_acct_open_positions = _add_portfolio_metric(4, "Open Positions")
+
+        ttk.Label(portfolio_grid, text="Max Open Positions").grid(row=5, column=0, sticky="w", padx=(0, 10), pady=2)
+        crypto_max_open_row = ttk.Frame(portfolio_grid)
+        crypto_max_open_row.grid(row=5, column=1, sticky="ew", pady=2)
+        crypto_max_open_row.columnconfigure(0, weight=1)
+        self.crypto_max_open_positions_var = tk.StringVar(value=str(self._crypto_max_open_positions_setting_value()))
+        self.crypto_max_open_positions_dirty_var = tk.BooleanVar(value=False)
+        self.crypto_max_open_positions_sync_state = {"value": False}
+        self.crypto_quick_setting_status_var = tk.StringVar(value="")
+        self.crypto_max_open_edit = ttk.Entry(
+            crypto_max_open_row,
+            textvariable=self.crypto_max_open_positions_var,
+            width=8,
+            justify="right",
+        )
+        self.crypto_max_open_edit.grid(row=0, column=0, sticky="e")
+
+        def _mark_crypto_max_open_positions_dirty(*_args: Any) -> None:
+            if bool(self.crypto_max_open_positions_sync_state.get("value", False)):
+                return
+            expected = str(self._crypto_max_open_positions_setting_value())
+            try:
+                dirty = str(self.crypto_max_open_positions_var.get()).strip() != expected
+            except Exception:
+                dirty = True
+            self.crypto_max_open_positions_dirty_var.set(bool(dirty))
+            if dirty:
+                self.crypto_quick_setting_status_var.set("")
+
+        self.crypto_max_open_positions_var.trace_add("write", _mark_crypto_max_open_positions_dirty)
+
+        def _save_crypto_max_open_positions() -> None:
+            ok, msg = self._save_crypto_max_open_positions(self.crypto_max_open_positions_var.get())
+            if ok:
+                self.crypto_quick_setting_status_var.set(msg)
+                self.crypto_max_open_positions_sync_state["value"] = True
+                try:
+                    self.crypto_max_open_positions_var.set(str(self._crypto_max_open_positions_setting_value()))
+                    self.crypto_max_open_positions_dirty_var.set(False)
+                finally:
+                    self.crypto_max_open_positions_sync_state["value"] = False
+                return
+            messagebox.showerror("Invalid value", msg)
+
+        self.crypto_max_open_save_btn = ttk.Button(
+            crypto_max_open_row,
+            text="Save",
+            width=6,
+            style="Compact.TButton",
+            command=_save_crypto_max_open_positions,
+        )
+        self.crypto_max_open_save_btn.grid(row=0, column=1, padx=(6, 0))
+        try:
+            self.crypto_max_open_edit.bind("<Return>", lambda _e: (_save_crypto_max_open_positions(), "break")[1])
+        except Exception:
+            pass
+
+        self.lbl_acct_dca_spread = _add_portfolio_metric(6, "DCA Levels (spread)")
+        self.lbl_acct_dca_single = _add_portfolio_metric(7, "DCA Levels (single)")
+        self.lbl_pnl = _add_portfolio_metric(8, "Total realized")
+        self.lbl_crypto_quick_setting = ttk.Label(
+            acct_box,
+            textvariable=self.crypto_quick_setting_status_var,
+            foreground=DARK_MUTED,
+            justify="left",
+        )
+        self.lbl_crypto_quick_setting.pack(anchor="w", padx=6, pady=(0, 4), fill="x")
 
         self.crypto_watchlist_box = None
         self.lbl_crypto_watchlist_meta = None
@@ -6949,116 +7140,12 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             pass
         self.chart_legend_text.configure(state="disabled")
-
-
-
-        # Neural levels overview (spans FULL width under the dual section)
-        # Shows the current LONG/SHORT level (0..7) for every coin at once.
-        neural_box = ttk.LabelFrame(dashboard_body, text="Neural Levels (0–7)")
-        neural_box.pack(fill="both", expand=True, padx=6, pady=(0, 6))
-        self.neural_box = neural_box
-
-        legend = ttk.Frame(neural_box)
-        legend.pack(fill="x", padx=6, pady=(4, 0))
-
-        ttk.Label(legend, text="Level bars: 0 = bottom, 7 = top").pack(side="left")
-        ttk.Label(legend, text="   ").pack(side="left")
-        ttk.Label(legend, text="Blue = Long").pack(side="left")
-        ttk.Label(legend, text="  ").pack(side="left")
-        ttk.Label(legend, text="Orange = Short").pack(side="left")
-
-        self.lbl_neural_overview_last = ttk.Label(legend, text="Last: N/A")
-        self.lbl_neural_overview_last.pack(side="right")
-
-        # Scrollable area for tiles (auto-hides the scrollbar if everything fits)
-        neural_viewport = ttk.Frame(neural_box)
-        neural_viewport.pack(fill="both", expand=True, padx=6, pady=(4, 6))
-        neural_viewport.grid_rowconfigure(0, weight=1)
-        neural_viewport.grid_columnconfigure(0, weight=1)
-
-        self._neural_overview_canvas = tk.Canvas(
-            neural_viewport,
-            bg=DARK_PANEL2,
-            highlightthickness=1,
-            highlightbackground=DARK_BORDER,
-            bd=0,
-        )
-        self._neural_overview_canvas.grid(row=0, column=0, sticky="nsew")
-
-        self._neural_overview_scroll = ttk.Scrollbar(
-            neural_viewport,
-            orient="vertical",
-            command=self._neural_overview_canvas.yview,
-        )
-        self._neural_overview_scroll.grid(row=0, column=1, sticky="ns")
-
-        self._neural_overview_canvas.configure(yscrollcommand=self._neural_overview_scroll.set)
-
-        self.neural_wrap = WrapFrame(self._neural_overview_canvas)
-        self._neural_overview_window = self._neural_overview_canvas.create_window(
-            (0, 0),
-            window=self.neural_wrap,
-            anchor="nw",
-        )
-
-        def _update_neural_overview_scrollbars(event=None) -> None:
-            """Update scrollregion + hide/show the scrollbar depending on overflow."""
-            try:
-                c = self._neural_overview_canvas
-                win = self._neural_overview_window
-
-                c.update_idletasks()
-                bbox = c.bbox(win)
-                if not bbox:
-                    self._neural_overview_scroll.grid_remove()
-                    return
-
-                c.configure(scrollregion=bbox)
-                content_h = int(bbox[3] - bbox[1])
-                view_h = int(c.winfo_height())
-
-                if content_h > (view_h + 1):
-                    self._neural_overview_scroll.grid()
-                else:
-                    self._neural_overview_scroll.grid_remove()
-                    try:
-                        c.yview_moveto(0)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-        def _on_neural_canvas_configure(e) -> None:
-            # Keep the inner wrap frame exactly the canvas width so wrapping is correct.
-            try:
-                self._neural_overview_canvas.itemconfigure(self._neural_overview_window, width=int(e.width))
-            except Exception:
-                pass
-            _update_neural_overview_scrollbars()
-
-        self._neural_overview_canvas.bind("<Configure>", _on_neural_canvas_configure, add="+")
-        self.neural_wrap.bind("<Configure>", _update_neural_overview_scrollbars, add="+")
-        self._update_neural_overview_scrollbars = _update_neural_overview_scrollbars
-
-        # Mousewheel scroll inside the tiles area
-        def _wheel(e):
-            try:
-                if self._neural_overview_scroll.winfo_ismapped():
-                    self._neural_overview_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-            except Exception:
-                pass
-
-        self._neural_overview_canvas.bind("<Enter>", lambda _e: self._neural_overview_canvas.focus_set(), add="+")
-        self._neural_overview_canvas.bind("<MouseWheel>", _wheel, add="+")
-
-        # tiles by coin
-        self.neural_tiles: Dict[str, NeuralSignalTile] = {}
-        # small cache: path -> (mtime, value)
-        self._neural_overview_cache: Dict[str, Tuple[float, Any]] = {}
-
-        self._rebuild_neural_overview()
+        # Removed Neural Levels panel from the account overview per UX request.
+        # Keep these placeholders so existing refresh helpers remain no-op safe.
+        self.neural_box = None
+        self.neural_tiles = {}
+        self._neural_overview_cache = {}
         try:
-            self.after_idle(self._update_neural_overview_scrollbars)
             self.after_idle(_update_dashboard_scroll)
         except Exception:
             pass
@@ -11741,6 +11828,10 @@ class PowerTraderHub(tk.Tk):
         out: List[Dict[str, Any]] = []
 
         def _entry_action(side: str) -> str:
+            # Keep forex wording aligned with crypto/stocks history semantics:
+            # opening a position is shown as BUY, regardless of long/short side.
+            if mk == "forex":
+                return "BUY"
             s = str(side or "").strip().lower()
             if s in {"buy", "long"}:
                 return "BUY"
@@ -11749,6 +11840,10 @@ class PowerTraderHub(tk.Tk):
             return "BUY"
 
         def _close_action(side: str) -> str:
+            # Keep forex wording aligned with crypto/stocks history semantics:
+            # closing a position is shown as SELL, regardless of long/short side.
+            if mk == "forex":
+                return "SELL"
             s = str(side or "").strip().lower()
             # Stocks audit exits typically log order-side (sell to close long).
             if mk == "stocks":
@@ -11757,11 +11852,6 @@ class PowerTraderHub(tk.Tk):
                 if s in {"buy", "short"}:
                     return "BUY"
                 return "SELL"
-            # Forex exits typically log position-side (long/short).
-            if s in {"buy", "long"}:
-                return "SELL"
-            if s in {"sell", "short"}:
-                return "BUY"
             return "SELL"
 
         for row in reversed(list(rows or [])[-250:]):
@@ -15415,6 +15505,38 @@ class PowerTraderHub(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Acknowledge failed", f"Could not write safety acknowledgment:\n{exc}")
 
+    def _refresh_crypto_dashboard_snapshot(self) -> None:
+        for fn in (
+            self._refresh_neural_overview,
+            self._refresh_trader_status,
+            self._refresh_crypto_watchlist_overview,
+            self._refresh_pnl,
+        ):
+            try:
+                fn()
+            except Exception:
+                pass
+
+    def _run_crypto_scan_now(self) -> None:
+        if self._runner_is_running():
+            self._refresh_crypto_dashboard_snapshot()
+            return
+        self.start_neural()
+
+    def _on_crypto_auto_scan_toggle(self) -> None:
+        try:
+            self.settings["crypto_dynamic_enabled"] = bool(self.crypto_auto_scan_var.get())
+            self._save_settings()
+        except Exception:
+            pass
+
+    def _on_crypto_auto_step_toggle(self) -> None:
+        try:
+            self.settings["auto_start_trading_when_all_trained"] = bool(self.crypto_auto_step_var.get())
+            self._save_settings()
+        except Exception:
+            pass
+
     def start_neural(self) -> None:
         self.start_all_scripts()
 
@@ -16044,6 +16166,45 @@ class PowerTraderHub(tk.Tk):
             )
         except Exception:
             pass
+        try:
+            self._set_badge_style(
+                getattr(self, "crypto_chip_data", None),
+                f"Data: {'OK' if neural_running else 'NO'}",
+                tone=("good" if neural_running else "warn"),
+            )
+            self._set_badge_style(
+                getattr(self, "crypto_chip_broker", None),
+                "Broker: N/A",
+                tone="muted",
+            )
+            self._set_badge_style(
+                getattr(self, "crypto_chip_orders", None),
+                f"Orders: {'OK' if trader_running else 'NO'}",
+                tone=("good" if trader_running else "warn"),
+            )
+            cycle_state = "OK" if (neural_running or trader_running) else "IDLE"
+            self._set_badge_style(
+                getattr(self, "crypto_chip_cycle", None),
+                f"Cycle: {cycle_state}",
+                tone=("info" if cycle_state == "OK" else "muted"),
+            )
+        except Exception:
+            pass
+        try:
+            desired_scan = bool(self.settings.get("crypto_dynamic_enabled", True))
+            desired_step = bool(self.settings.get("auto_start_trading_when_all_trained", True))
+            if hasattr(self, "crypto_auto_scan_var") and (self.crypto_auto_scan_var is not None):
+                if bool(self.crypto_auto_scan_var.get()) != desired_scan:
+                    self.crypto_auto_scan_var.set(desired_scan)
+            if hasattr(self, "crypto_auto_step_var") and (self.crypto_auto_step_var is not None):
+                if bool(self.crypto_auto_step_var.get()) != desired_step:
+                    self.crypto_auto_step_var.set(desired_step)
+        except Exception:
+            pass
+        try:
+            self._sync_crypto_max_open_positions_editor()
+        except Exception:
+            pass
         runtime_snapshot: Dict[str, Any] = {}
         try:
             runtime_snapshot = _safe_read_json(os.path.join(self.hub_dir, "runtime_state.json")) or {}
@@ -16145,6 +16306,27 @@ class PowerTraderHub(tk.Tk):
             self.lbl_runtime_guard.config(
                 text=f"Safety: stop-flag {sf_txt}{cooldown_hint} | drawdown guard {dd_txt} | market loops {loop_txt}"
             )
+            try:
+                kucoin_row = bh.get("kucoin", {}) if isinstance(bh.get("kucoin", {}), dict) else {}
+                kucoin_state = str(kucoin_row.get("state", "ok") or "ok").strip().lower()
+                checks_ok = bool(checks.get("ok", False))
+                stale_state = str(stale_history.get("state", "ok") or "ok").strip().lower()
+                data_ok = checks_ok and stale_state not in {"stale", "error"}
+                broker_ok = kucoin_state in {"ok", "ready"}
+                orders_ok = trader_running and (not sf_active)
+                cycle_target_s = max(1, int(float(self.settings.get("ui_refresh_seconds", 1.0) or 1.0)))
+                if loop_age >= 0:
+                    cycle_txt = f"Cycle: {'OK' if loop_age <= max(3, cycle_target_s * 3) else 'WARN'} {max(0, loop_age)}/{cycle_target_s}s"
+                    cycle_tone = "info" if loop_age <= max(3, cycle_target_s * 3) else "warn"
+                else:
+                    cycle_txt = "Cycle: N/A"
+                    cycle_tone = "muted"
+                self._set_badge_style(getattr(self, "crypto_chip_data", None), f"Data: {'OK' if data_ok else 'NO'}", tone=("good" if data_ok else "bad"))
+                self._set_badge_style(getattr(self, "crypto_chip_broker", None), f"Broker: {'OK' if broker_ok else 'NO'}", tone=("good" if broker_ok else "bad"))
+                self._set_badge_style(getattr(self, "crypto_chip_orders", None), f"Orders: {'OK' if orders_ok else 'NO'}", tone=("good" if orders_ok else "warn"))
+                self._set_badge_style(getattr(self, "crypto_chip_cycle", None), cycle_txt, tone=cycle_tone)
+            except Exception:
+                pass
 
             try:
                 spark = str(incident_trend.get("sparkline", "") or "").strip()
@@ -16715,6 +16897,9 @@ class PowerTraderHub(tk.Tk):
             text = str(getattr(chart, "_legend_panel_text", "") or "").strip()
             if not text:
                 text = f"{page}: waiting for chart data..."
+            neural_legend = "Signal levels: 0 = bottom, 7 = top\nBlue = Long | Orange = Short"
+            if neural_legend not in text:
+                text = f"{text}\n\n{neural_legend}".strip()
             try:
                 if header is not None and (not header.winfo_manager()):
                     header.pack(fill="x", padx=6, pady=(0, 0), before=box)
@@ -18000,10 +18185,15 @@ class PowerTraderHub(tk.Tk):
                 self.lbl_acct_holdings_value.config(text="N/A")
                 self.lbl_acct_buying_power.config(text="N/A")
                 self.lbl_acct_percent_in_trade.config(text="N/A")
+                self.lbl_acct_open_positions.config(text="0")
                 self.lbl_acct_dca_spread.config(text="N/A")
                 self.lbl_acct_dca_single.config(text="N/A")
                 self.lbl_pnl.config(text="N/A")
                 self.lbl_selected_coin_summary.config(text="Selected: ACCOUNT")
+            except Exception:
+                pass
+            try:
+                self._sync_crypto_max_open_positions_editor()
             except Exception:
                 pass
 
@@ -18085,9 +18275,14 @@ class PowerTraderHub(tk.Tk):
                 self.lbl_acct_holdings_value.config(text="N/A")
                 self.lbl_acct_buying_power.config(text="N/A")
                 self.lbl_acct_percent_in_trade.config(text="N/A")
+                self.lbl_acct_open_positions.config(text="0")
                 self.lbl_acct_dca_spread.config(text="N/A")
                 self.lbl_acct_dca_single.config(text="N/A")
                 self.lbl_selected_coin_summary.config(text="Selected: ACCOUNT")
+            except Exception:
+                pass
+            try:
+                self._sync_crypto_max_open_positions_editor()
             except Exception:
                 pass
             self._last_positions = {}
@@ -18181,6 +18376,24 @@ class PowerTraderHub(tk.Tk):
         positions = detail.get("positions", {}) or {}
         self._last_positions = positions
         self._sync_manual_sell_coin_choices(positions)
+        try:
+            open_positions_count = 0
+            if isinstance(positions, dict):
+                for _sym, row in positions.items():
+                    if not isinstance(row, dict):
+                        continue
+                    try:
+                        if float(row.get("quantity", 0.0) or 0.0) > 0.0:
+                            open_positions_count += 1
+                    except Exception:
+                        continue
+            self.lbl_acct_open_positions.config(text=str(open_positions_count))
+        except Exception:
+            pass
+        try:
+            self._sync_crypto_max_open_positions_editor()
+        except Exception:
+            pass
 
         # --- precompute per-coin DCA count in rolling 24h (and after last SELL for that coin) ---
         dca_24h_by_coin: Dict[str, int] = {}

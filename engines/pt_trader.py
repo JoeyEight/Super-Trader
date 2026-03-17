@@ -57,6 +57,7 @@ _gui_settings_cache = {
 	"dca_multiplier": 2.0,
 	"dca_levels": [-2.5, -5.0, -10.0, -20.0, -30.0, -40.0, -50.0],
 	"max_dca_buys_per_24h": 2,
+	"crypto_max_open_positions": 8,
 
 	# Trailing PM settings (defaults match previous hardcoded behavior)
 	"pm_start_pct_no_dca": 5.0,
@@ -173,6 +174,14 @@ def _load_gui_settings() -> dict:
 		if max_dca_buys_per_24h < 0:
 			max_dca_buys_per_24h = 0
 
+		crypto_max_open_positions = data.get("crypto_max_open_positions", _gui_settings_cache.get("crypto_max_open_positions", 8))
+		try:
+			crypto_max_open_positions = int(float(crypto_max_open_positions))
+		except Exception:
+			crypto_max_open_positions = int(_gui_settings_cache.get("crypto_max_open_positions", 8))
+		if crypto_max_open_positions < 1:
+			crypto_max_open_positions = 1
+
 
 		# --- Trailing PM settings ---
 		pm_start_pct_no_dca = data.get("pm_start_pct_no_dca", _gui_settings_cache.get("pm_start_pct_no_dca", 5.0))
@@ -239,6 +248,7 @@ def _load_gui_settings() -> dict:
 		_gui_settings_cache["dca_multiplier"] = dca_multiplier
 		_gui_settings_cache["dca_levels"] = dca_levels
 		_gui_settings_cache["max_dca_buys_per_24h"] = max_dca_buys_per_24h
+		_gui_settings_cache["crypto_max_open_positions"] = crypto_max_open_positions
 
 		_gui_settings_cache["pm_start_pct_no_dca"] = pm_start_pct_no_dca
 		_gui_settings_cache["pm_start_pct_with_dca"] = pm_start_pct_with_dca
@@ -258,6 +268,7 @@ def _load_gui_settings() -> dict:
 			"dca_multiplier": dca_multiplier,
 			"dca_levels": list(dca_levels),
 			"max_dca_buys_per_24h": max_dca_buys_per_24h,
+			"crypto_max_open_positions": crypto_max_open_positions,
 
 			"pm_start_pct_no_dca": pm_start_pct_no_dca,
 			"pm_start_pct_with_dca": pm_start_pct_with_dca,
@@ -313,6 +324,7 @@ START_ALLOC_PCT = 0.5
 DCA_MULTIPLIER = 2.0
 DCA_LEVELS = [-2.5, -5.0, -10.0, -20.0, -30.0, -40.0, -50.0]
 MAX_DCA_BUYS_PER_24H = 2
+MAX_OPEN_POSITIONS = 8
 MAX_POSITION_USD_PER_COIN = 0.0
 MAX_TOTAL_EXPOSURE_PCT = 0.0
 CRYPTO_TRADER_LOOP_SLEEP_S = 1.0
@@ -338,7 +350,7 @@ def _refresh_paths_and_symbols():
 	                TRAILING_GAP_PCT, PM_START_PCT_NO_DCA, PM_START_PCT_WITH_DCA
 	"""
 	global crypto_symbols, main_dir, base_paths
-	global TRADE_START_LEVEL, START_ALLOC_PCT, DCA_MULTIPLIER, DCA_LEVELS, MAX_DCA_BUYS_PER_24H
+	global TRADE_START_LEVEL, START_ALLOC_PCT, DCA_MULTIPLIER, DCA_LEVELS, MAX_DCA_BUYS_PER_24H, MAX_OPEN_POSITIONS
 	global MAX_POSITION_USD_PER_COIN, MAX_TOTAL_EXPOSURE_PCT
 	global TRAILING_GAP_PCT, PM_START_PCT_NO_DCA, PM_START_PCT_WITH_DCA
 	global CRYPTO_TRADER_LOOP_SLEEP_S, CRYPTO_TRADER_ERROR_SLEEP_S
@@ -377,6 +389,13 @@ def _refresh_paths_and_symbols():
 		MAX_DCA_BUYS_PER_24H = int(MAX_DCA_BUYS_PER_24H)
 	if MAX_DCA_BUYS_PER_24H < 0:
 		MAX_DCA_BUYS_PER_24H = 0
+
+	try:
+		MAX_OPEN_POSITIONS = int(float(s.get("crypto_max_open_positions", MAX_OPEN_POSITIONS) or MAX_OPEN_POSITIONS))
+	except Exception:
+		MAX_OPEN_POSITIONS = int(MAX_OPEN_POSITIONS)
+	if MAX_OPEN_POSITIONS < 1:
+		MAX_OPEN_POSITIONS = 1
 
 
 	# Trailing PM hot-reload values
@@ -2912,8 +2931,24 @@ class CryptoAPITrading:
 
         holding_full_symbols = [f"{h['asset_code']}-USD" for h in holdings.get("results", [])]
 
+        def _open_positions_count() -> int:
+            count = 0
+            for full in list(holding_full_symbols or []):
+                base = str(full).split("-", 1)[0].strip().upper()
+                if not base or base == "USDC":
+                    continue
+                count += 1
+            return count
+
         start_index = 0
         while start_index < len(crypto_symbols):
+            if int(MAX_OPEN_POSITIONS or 0) > 0:
+                open_count = _open_positions_count()
+                if open_count >= int(MAX_OPEN_POSITIONS):
+                    msg = f"Max open positions reached ({open_count}/{int(MAX_OPEN_POSITIONS)})."
+                    self._set_status_note(msg)
+                    self._log_rate_limited("max_open_positions_reached", msg)
+                    break
             base_symbol = crypto_symbols[start_index].upper().strip()
             full_symbol = f"{base_symbol}-USD"
 
