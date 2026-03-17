@@ -31,6 +31,7 @@ ROLLOUT_ORDER = {
     "risk_caps": 2,
     "execution_v2": 3,
     "shadow_only": 4,
+    "live": 5,
     "live_guarded": 5,
 }
 FOREX_FACTORY_EXPORT_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.csv"
@@ -85,7 +86,12 @@ def _request_json(url: str, headers: Dict[str, str], timeout: float = 10.0) -> A
 
 def _rollout_at_least(settings: Dict[str, Any], stage: str) -> bool:
     cur = str(settings.get("market_rollout_stage", "legacy") or "legacy").strip().lower()
-    return int(ROLLOUT_ORDER.get(cur, 0)) >= int(ROLLOUT_ORDER.get(stage, 0))
+    target = str(stage or "").strip().lower()
+    if cur == "live_guarded":
+        cur = "live"
+    if target == "live_guarded":
+        target = "live"
+    return int(ROLLOUT_ORDER.get(cur, 0)) >= int(ROLLOUT_ORDER.get(target, 0))
 
 
 def _rankings_path(hub_dir: str) -> str:
@@ -531,7 +537,7 @@ def _append_reason_parts(row: Dict[str, Any], logic: str = "", data: str = "") -
 
 def _live_guarded_entry_gate_reason(settings: Dict[str, Any], row: Dict[str, Any]) -> str:
     stage = str(settings.get("market_rollout_stage", "legacy") or "legacy").strip().lower()
-    if stage != "live_guarded":
+    if stage not in {"live_guarded", "live"}:
         return ""
     pair = str(row.get("pair", "") or "").strip().upper()
     if not pair:
@@ -1302,7 +1308,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                     row["side"] = "watch"
                     _append_reason_parts(
                         row,
-                        logic="Calibration history insufficient for live_guarded entry; hold as watch",
+                        logic="Calibration history insufficient for live entry; hold as watch",
                         data=entry_gate_reason,
                     )
             row["leader_rank_score"] = round(_leader_rank_score(row), 6)

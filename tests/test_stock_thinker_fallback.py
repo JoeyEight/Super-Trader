@@ -262,6 +262,61 @@ class TestStockThinkerFallback(unittest.TestCase):
             self.assertEqual(str(reject_summary.get("dominant_reason", "")), "liquidity")
             self.assertAlmostEqual(float(reject_summary.get("reject_rate_pct", 0.0) or 0.0), 100.0, places=2)
 
+    def test_relaxes_missing_liquidity_gate_for_large_universe_feed_gaps(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            stocks_dir = os.path.join(td, "stocks")
+            os.makedirs(stocks_dir, exist_ok=True)
+            universe = [f"S{i:03d}" for i in range(40)]
+            bars_map = {
+                sym: [_mk_bar(i, 40.0 + (i * 0.05)) for i in range(64)]
+                for sym in universe
+            }
+
+            def _score(symbol: str, bars: list[dict], spread_bps: float = 0.0) -> dict:
+                sym = str(symbol).upper()
+                idx = int(sym[1:]) if len(sym) > 1 and sym[1:].isdigit() else 0
+                return {
+                    "symbol": sym,
+                    "score": round(1.25 - (idx * 0.001), 6),
+                    "side": "long",
+                    "last": 40.0,
+                    "change_6h_pct": 0.8,
+                    "change_24h_pct": 1.9,
+                    "volatility_pct": 0.6,
+                    "spread_bps": float(spread_bps),
+                    "confidence": "MED",
+                    "reason": "test",
+                }
+
+            settings = {
+                "alpaca_api_key_id": "abc",
+                "alpaca_secret_key": "xyz",
+                "stock_scan_max_symbols": 40,
+                "stock_min_bars_required": 24,
+                "stock_min_valid_bars_ratio": 0.70,
+                "stock_min_dollar_volume": 2_500_000.0,
+                "stock_max_spread_bps": 40.0,
+            }
+            with (
+                patch.object(stock_thinker, "get_alpaca_creds", return_value=("abc", "xyz")),
+                patch.object(stock_thinker, "AlpacaBrokerClient", _FakeRejectHeavyAlpacaClient),
+                patch.object(stock_thinker, "_select_universe", return_value=list(universe)),
+                patch.object(stock_thinker, "_market_open_now", return_value=True),
+                patch.object(stock_thinker, "_score_bars", side_effect=_score),
+                patch.object(stock_thinker, "_apply_stock_mtf_confirmation", return_value=None),
+                patch.object(stock_thinker, "_fetch_bars_for_symbols", return_value=bars_map),
+            ):
+                out = stock_thinker.run_scan(settings, td)
+
+            diag_path = os.path.join(stocks_dir, "scan_diagnostics.json")
+            with open(diag_path, "r", encoding="utf-8") as f:
+                diag = json.load(f)
+            self.assertEqual(str(out.get("state", "")), "READY")
+            self.assertTrue(bool(diag.get("liquidity_missing_allowed", False)))
+            self.assertGreater(float(diag.get("liquidity_missing_ratio_pct", 0.0) or 0.0), 90.0)
+            self.assertGreater(int(len(list(out.get("leaders", []) or []))), 0)
+            self.assertNotIn("No symbols passed stock marketability prefilters", str(out.get("msg", "")))
+
     def test_applies_leader_hysteresis_to_previous_top(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             stocks_dir = os.path.join(td, "stocks")

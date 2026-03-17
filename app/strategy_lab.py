@@ -295,6 +295,68 @@ def _market_config(settings: Dict[str, Any], market: str, sample_count: int) -> 
     }
 
 
+def _build_simulation_summary(account_value_usd: float, back_metrics: Dict[str, Any]) -> Dict[str, Any]:
+    start_equity = float(max(1.0, account_value_usd))
+    net_pnl = _f(back_metrics.get("net_pnl_usd", 0.0), 0.0)
+    end_equity = float(max(1.0, start_equity + net_pnl))
+    return {
+        "starting_equity_usd": round(start_equity, 6),
+        "ending_equity_usd": round(end_equity, 6),
+        "net_pnl_usd": round(float(end_equity - start_equity), 6),
+        "net_return_pct": round(_f(back_metrics.get("cumulative_return_pct", 0.0), 0.0), 6),
+        "max_drawdown_pct": round(_f(back_metrics.get("max_drawdown_pct", 0.0), 0.0), 6),
+        "win_rate_pct": round(_f(back_metrics.get("win_rate_pct", 0.0), 0.0), 6),
+        "closed_trades": int(_i(back_metrics.get("closed_trades", 0), 0)),
+    }
+
+
+def _recommended_settings_payload(
+    market: str,
+    account_value_usd: float,
+    config: Dict[str, Any],
+    sweep: Dict[str, Any],
+) -> Dict[str, Any]:
+    m = str(market or "").strip().lower()
+    top10 = list(sweep.get("top10", []) or []) if isinstance(sweep.get("top10", []), list) else []
+    best_threshold = None
+    if top10 and isinstance(top10[0], dict):
+        best_threshold = _f(top10[0].get("threshold", 0.0), 0.0)
+    if best_threshold is None or best_threshold <= 0.0:
+        best_threshold = _f(config.get("score_threshold", 0.2), 0.2)
+
+    start_equity = float(max(1.0, account_value_usd))
+    max_open_cfg = max(1, _i(config.get("max_open_positions", 1), 1))
+
+    if m == "stocks":
+        current_notional = max(1.0, _f(config.get("trade_notional", 25.0), 25.0))
+        target_notional = max(1.0, round(start_equity * 0.15, 2))
+        recommended_notional = min(max(1.0, target_notional), max(1.0, current_notional * 2.0))
+        affordable_slots = max(1, int((start_equity * 0.90) / max(1.0, recommended_notional)))
+        recommended_open = max(1, min(max_open_cfg, affordable_slots))
+        return {
+            "notes": "Account-sized stock simulation: per-trade size targets ~15% of account value.",
+            "settings": {
+                "stock_score_threshold": round(float(best_threshold), 6),
+                "stock_trade_notional_usd": round(float(recommended_notional), 6),
+                "stock_max_open_positions": int(recommended_open),
+            },
+        }
+
+    current_units = max(1, _i(config.get("trade_notional", 25), 25))
+    target_units = max(1, int(round(start_equity * 0.25)))
+    recommended_units = min(target_units, max(1, current_units * 2))
+    affordable_slots = max(1, int((start_equity * 0.90) / max(1.0, float(recommended_units))))
+    recommended_open = max(1, min(max_open_cfg, affordable_slots))
+    return {
+        "notes": "Account-sized forex simulation: trade units scale from current account value.",
+        "settings": {
+            "forex_score_threshold": round(float(best_threshold), 6),
+            "forex_trade_units": int(recommended_units),
+            "forex_max_open_positions": int(recommended_open),
+        },
+    }
+
+
 def run_strategy_lab_suite(hub_dir: str, market: str, settings: Dict[str, Any] | None = None) -> Dict[str, Any]:
     m = str(market or "").strip().lower()
     if m not in {"stocks", "forex"}:
@@ -316,6 +378,8 @@ def run_strategy_lab_suite(hub_dir: str, market: str, settings: Dict[str, Any] |
     walk = _build_walkforward_summary(hub_dir, m)
     sweep = _build_sweep_payload(hub_dir, m, cfg)
     mc = _build_monte_carlo(closed_rows, account_value_usd=account_value_usd, settings=cfg)
+    simulation = _build_simulation_summary(account_value_usd, back_metrics)
+    recommendations = _recommended_settings_payload(m, account_value_usd, config, sweep)
 
     summary_dir = os.path.join(hub_dir, "strategy_lab", m)
     _ensure_dir(summary_dir)
@@ -367,6 +431,8 @@ def run_strategy_lab_suite(hub_dir: str, market: str, settings: Dict[str, Any] |
             "windows": int(walk.get("windows", 0) or 0),
             "summary": dict(walk.get("summary", {}) if isinstance(walk.get("summary", {}), dict) else {}),
         },
+        "simulation": simulation,
+        "recommendations": recommendations,
         "sweep": {"top10": list(sweep.get("top10", []) or [])},
         "monte_carlo": {
             "state": str(mc.get("state", "READY") or "READY"),
@@ -383,4 +449,3 @@ def run_strategy_lab_suite(hub_dir: str, market: str, settings: Dict[str, Any] |
     }
     _write_json(summary_path, payload)
     return payload
-

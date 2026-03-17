@@ -106,14 +106,21 @@ ROLLOUT_ORDER: Dict[str, int] = {
     "risk_caps": 2,
     "execution_v2": 3,
     "shadow_only": 4,
+    "live": 5,
     "live_guarded": 5,
+}
+
+ROLLOUT_STAGE_ALIASES: Dict[str, str] = {
+    "live_guarded": "live",
 }
 
 
 def _normalize_rollout_stage(stage: str, default: str = "legacy") -> str:
     cur = str(stage or "").strip().lower()
+    cur = str(ROLLOUT_STAGE_ALIASES.get(cur, cur))
     if cur not in ROLLOUT_ORDER:
         cur = str(default or "legacy").strip().lower()
+    cur = str(ROLLOUT_STAGE_ALIASES.get(cur, cur))
     if cur not in ROLLOUT_ORDER:
         cur = "legacy"
     return cur
@@ -128,11 +135,11 @@ def _resolve_rollout_stage_for_broker_modes(stage: str, alpaca_paper_mode: bool,
     if not bool(oanda_practice_mode):
         live_markets.append("Forex/OANDA")
     if live_markets and int(ROLLOUT_ORDER.get(cur, 0)) < int(ROLLOUT_ORDER["execution_v2"]):
-        cur = "live_guarded"
+        cur = "live"
     elif live_markets and cur == "shadow_only":
-        cur = "live_guarded"
+        cur = "live"
     if live_markets and cur != original:
-        return cur, "Live broker mode requires an executable rollout stage. Auto-promoted rollout to live_guarded."
+        return cur, "Live broker mode requires an executable rollout stage. Auto-promoted rollout to live."
     return cur, ""
 
 
@@ -477,7 +484,7 @@ DEFAULT_SETTINGS = {
     "twelvedata_daily_credits": 800,
     "twelvedata_scan_symbol_cap": 8,
     "alpaca_paper_mode": False,
-    "market_rollout_stage": "live_guarded",  # internal rollout stage (locked to live)
+    "market_rollout_stage": "live",  # internal rollout stage (locked to live)
     "settings_control_mode": "self_managed",  # preset_managed | self_managed
     "settings_profile": "balanced",  # guarded | balanced | performance
     "ui_role_mode": "basic",  # basic | advanced | admin
@@ -4314,8 +4321,9 @@ class PowerTraderHub(tk.Tk):
             return out or ["stocks", "forex"]
 
         if key == "shadow_scorecard_blocked":
-            stage = str((self.settings if isinstance(getattr(self, "settings", {}), dict) else {}).get("market_rollout_stage", "legacy") or "legacy").strip().lower()
-            if stage in {"execution_v2", "live_guarded"}:
+            stage_raw = str((self.settings if isinstance(getattr(self, "settings", {}), dict) else {}).get("market_rollout_stage", "legacy") or "legacy").strip().lower()
+            stage = _normalize_rollout_stage(stage_raw, default="legacy")
+            if stage in {"execution_v2", "live"}:
                 return []
             scorecards = snap.get("shadow_scorecards", {}) if isinstance(snap.get("shadow_scorecards", {}), dict) else {}
             out: List[str] = []
@@ -5898,6 +5906,12 @@ class PowerTraderHub(tk.Tk):
                 run_btn.configure(state="disabled", text="Running...")
             except Exception:
                 pass
+        apply_btn = ui.get("apply_btn")
+        if apply_btn is not None:
+            try:
+                apply_btn.configure(state="disabled")
+            except Exception:
+                pass
 
         def _worker() -> None:
             ok = True
@@ -5987,6 +6001,8 @@ class PowerTraderHub(tk.Tk):
         market_combo.pack(side="left", padx=(6, 8))
         busy_var = tk.StringVar(value="Ready")
         ttk.Label(top, textvariable=busy_var, foreground=DARK_MUTED).pack(side="left", padx=(4, 10), fill="x", expand=True)
+        apply_btn = ttk.Button(top, text="Apply To Account", state="disabled")
+        apply_btn.pack(side="right", padx=(8, 0))
         run_btn = ttk.Button(top, text="Run Strategy Lab", command=lambda: self._run_strategy_lab(str(market_var.get() or "stocks"), notify=False))
         run_btn.pack(side="right")
         ttk.Button(top, text="Run Both", command=lambda: self._run_strategy_lab("both", notify=False)).pack(side="right", padx=(0, 8))
@@ -5999,41 +6015,261 @@ class PowerTraderHub(tk.Tk):
         frame = ttk.Frame(win)
         frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(0, weight=1)
-        txt = tk.Text(
-            frame,
-            bg=DARK_PANEL,
-            fg=DARK_FG,
-            insertbackground=DARK_FG,
-            relief="flat",
-            bd=0,
-            highlightthickness=1,
-            highlightbackground=DARK_BORDER,
-            highlightcolor=DARK_ACCENT,
-            wrap="word",
-        )
-        ys = ttk.Scrollbar(frame, orient="vertical", command=txt.yview)
-        txt.configure(yscrollcommand=ys.set)
-        txt.grid(row=0, column=0, sticky="nsew")
-        ys.grid(row=0, column=1, sticky="ns")
+        frame.rowconfigure(1, weight=1)
 
-        def _render() -> None:
-            payload = self._load_strategy_lab_summary(str(market_var.get() or "stocks"))
-            text = self._format_strategy_lab_summary_text(payload)
+        sim_box = ttk.LabelFrame(frame, text="Simulator (Based On Current Account Holdings)")
+        sim_box.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        for c in range(6):
+            sim_box.columnconfigure(c, weight=(1 if c % 2 == 1 else 0))
+
+        sim_vars = {
+            "updated": tk.StringVar(value="Updated: N/A"),
+            "state": tk.StringVar(value="State: WAITING"),
+            "message": tk.StringVar(value="Run Strategy Lab to generate a holdings-based simulator output."),
+            "start_value": tk.StringVar(value="N/A"),
+            "end_value": tk.StringVar(value="N/A"),
+            "net_pnl": tk.StringVar(value="N/A"),
+            "net_return": tk.StringVar(value="N/A"),
+            "max_dd": tk.StringVar(value="N/A"),
+            "win_rate": tk.StringVar(value="N/A"),
+            "trades": tk.StringVar(value="N/A"),
+        }
+
+        ttk.Label(sim_box, textvariable=sim_vars["updated"], foreground=DARK_MUTED).grid(row=0, column=0, columnspan=3, sticky="w", padx=8, pady=(6, 2))
+        ttk.Label(sim_box, textvariable=sim_vars["state"], foreground=DARK_MUTED).grid(row=0, column=3, columnspan=3, sticky="e", padx=8, pady=(6, 2))
+        ttk.Label(sim_box, textvariable=sim_vars["message"], foreground=DARK_MUTED, justify="left", wraplength=860).grid(row=1, column=0, columnspan=6, sticky="w", padx=8, pady=(0, 6))
+
+        ttk.Label(sim_box, text="Starting Value:").grid(row=2, column=0, sticky="w", padx=(8, 6), pady=4)
+        ttk.Label(sim_box, textvariable=sim_vars["start_value"]).grid(row=2, column=1, sticky="w", padx=(0, 10), pady=4)
+        ttk.Label(sim_box, text="Ending Value:").grid(row=2, column=2, sticky="w", padx=(0, 6), pady=4)
+        ttk.Label(sim_box, textvariable=sim_vars["end_value"]).grid(row=2, column=3, sticky="w", padx=(0, 10), pady=4)
+        ttk.Label(sim_box, text="Net PnL:").grid(row=2, column=4, sticky="w", padx=(0, 6), pady=4)
+        ttk.Label(sim_box, textvariable=sim_vars["net_pnl"]).grid(row=2, column=5, sticky="w", padx=(0, 8), pady=4)
+
+        ttk.Label(sim_box, text="Net Return:").grid(row=3, column=0, sticky="w", padx=(8, 6), pady=(0, 8))
+        ttk.Label(sim_box, textvariable=sim_vars["net_return"]).grid(row=3, column=1, sticky="w", padx=(0, 10), pady=(0, 8))
+        ttk.Label(sim_box, text="Max Drawdown:").grid(row=3, column=2, sticky="w", padx=(0, 6), pady=(0, 8))
+        ttk.Label(sim_box, textvariable=sim_vars["max_dd"]).grid(row=3, column=3, sticky="w", padx=(0, 10), pady=(0, 8))
+        ttk.Label(sim_box, text="Win Rate / Trades:").grid(row=3, column=4, sticky="w", padx=(0, 6), pady=(0, 8))
+        ttk.Label(sim_box, textvariable=sim_vars["win_rate"]).grid(row=3, column=5, sticky="w", padx=(0, 8), pady=(0, 8))
+
+        rec_box = ttk.LabelFrame(frame, text="Recommended Setting Updates")
+        rec_box.grid(row=1, column=0, sticky="nsew")
+        rec_box.columnconfigure(0, weight=1)
+        rec_box.rowconfigure(0, weight=1)
+        rec_tree = ttk.Treeview(rec_box, columns=("setting", "current", "recommended"), show="headings", height=8)
+        rec_tree.heading("setting", text="Setting")
+        rec_tree.heading("current", text="Current")
+        rec_tree.heading("recommended", text="Recommended")
+        rec_tree.column("setting", width=320, anchor="w")
+        rec_tree.column("current", width=170, anchor="e")
+        rec_tree.column("recommended", width=170, anchor="e")
+        rec_tree.tag_configure("changed", foreground=DARK_ACCENT2)
+        rec_tree.grid(row=0, column=0, sticky="nsew", padx=(0, 2), pady=(0, 6))
+        rec_ys = ttk.Scrollbar(rec_box, orient="vertical", command=rec_tree.yview)
+        rec_tree.configure(yscrollcommand=rec_ys.set)
+        rec_ys.grid(row=0, column=1, sticky="ns", pady=(0, 6))
+        rec_note_var = tk.StringVar(value="Recommendations will appear after simulation completes.")
+        ttk.Label(rec_box, textvariable=rec_note_var, foreground=DARK_MUTED, justify="left", wraplength=860).grid(row=1, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 8))
+
+        def _setting_label(setting_key: str) -> str:
+            labels = {
+                "stock_score_threshold": "Stock Score Threshold",
+                "stock_trade_notional_usd": "Stock Trade Notional (USD)",
+                "stock_max_open_positions": "Stock Max Open Positions",
+                "forex_score_threshold": "Forex Score Threshold",
+                "forex_trade_units": "Forex Trade Units",
+                "forex_max_open_positions": "Forex Max Open Positions",
+            }
+            return str(labels.get(setting_key, setting_key))
+
+        def _setting_value_text(setting_key: str, value: Any) -> str:
+            key = str(setting_key or "").strip().lower()
+            if value is None:
+                return "N/A"
+            if key in {"stock_trade_notional_usd"}:
+                return _fmt_money(value)
+            if key in {"stock_max_open_positions", "forex_trade_units", "forex_max_open_positions"}:
+                try:
+                    return str(int(float(value)))
+                except Exception:
+                    return str(value)
             try:
-                txt.configure(state="normal")
-                txt.delete("1.0", "end")
-                txt.insert("1.0", text)
-                txt.configure(state="disabled")
+                return f"{float(value):.4f}"
+            except Exception:
+                return str(value)
+
+        def _derive_fallback_recommendations(payload: Dict[str, Any], market_key: str) -> Tuple[Dict[str, Any], str]:
+            row = payload if isinstance(payload, dict) else {}
+            cfg = row.get("config", {}) if isinstance(row.get("config", {}), dict) else {}
+            sweep = row.get("sweep", {}) if isinstance(row.get("sweep", {}), dict) else {}
+            top10 = list(sweep.get("top10", []) or []) if isinstance(sweep.get("top10", []), list) else []
+            best_threshold = None
+            if top10 and isinstance(top10[0], dict):
+                try:
+                    best_threshold = float(top10[0].get("threshold", 0.0) or 0.0)
+                except Exception:
+                    best_threshold = None
+            if market_key == "stocks":
+                rec = {
+                    "stock_score_threshold": float(best_threshold if (best_threshold is not None and best_threshold > 0.0) else float(cfg.get("score_threshold", self.settings.get("stock_score_threshold", 0.2)) or 0.2)),
+                    "stock_trade_notional_usd": float(cfg.get("trade_notional", self.settings.get("stock_trade_notional_usd", 25.0)) or 25.0),
+                    "stock_max_open_positions": int(float(cfg.get("max_open_positions", self.settings.get("stock_max_open_positions", 1)) or 1)),
+                }
+                return rec, "Fallback recommendations generated from existing Strategy Lab config + sweep threshold."
+            rec = {
+                "forex_score_threshold": float(best_threshold if (best_threshold is not None and best_threshold > 0.0) else float(cfg.get("score_threshold", self.settings.get("forex_score_threshold", 0.2)) or 0.2)),
+                "forex_trade_units": int(float(cfg.get("trade_notional", self.settings.get("forex_trade_units", 25)) or 25)),
+                "forex_max_open_positions": int(float(cfg.get("max_open_positions", self.settings.get("forex_max_open_positions", 1)) or 1)),
+            }
+            return rec, "Fallback recommendations generated from existing Strategy Lab config + sweep threshold."
+
+        def _apply_recommendations() -> None:
+            ui_now = getattr(self, "_strategy_lab_ui", {}) if isinstance(getattr(self, "_strategy_lab_ui", {}), dict) else {}
+            market_key = str(market_var.get() or "stocks").strip().lower()
+            payload_now = ui_now.get("payload")
+            recs_now = ui_now.get("recommendations")
+            if not isinstance(payload_now, dict):
+                messagebox.showinfo("Apply Settings", "Run Strategy Lab first so recommendations are available.")
+                return
+            if not isinstance(recs_now, dict) or not recs_now:
+                messagebox.showinfo("Apply Settings", "No recommendations are available for the selected market.")
+                return
+            keys_sorted = sorted(str(k) for k in recs_now.keys())
+            if not keys_sorted:
+                messagebox.showinfo("Apply Settings", "No recommendation keys were found.")
+                return
+            prompt = (
+                f"Apply Strategy Lab settings to {market_key.upper()}?\n\n"
+                "This will overwrite current settings (including preset-managed values) for:\n"
+                + "\n".join(f"- {str(_setting_label(k))}" for k in keys_sorted)
+                + "\n\nContinue?"
+            )
+            if not messagebox.askyesno("Apply Strategy Lab Settings", prompt):
+                return
+            for k, v in recs_now.items():
+                self.settings[str(k)] = v
+            self.settings["settings_control_mode"] = "self_managed"
+            raw_overrides = self.settings.get("profile_manual_overrides", [])
+            overrides = set()
+            if isinstance(raw_overrides, list):
+                for item in raw_overrides:
+                    txt = str(item or "").strip()
+                    if txt:
+                        overrides.add(txt)
+            for k in recs_now.keys():
+                overrides.add(str(k))
+            self.settings["profile_manual_overrides"] = sorted(overrides)
+            self._save_settings()
+            self._audit_operator_action(
+                "strategy_lab_recommendations_applied",
+                {"market": market_key, "settings": keys_sorted},
+            )
+            messagebox.showinfo(
+                "Settings Applied",
+                "Strategy Lab recommendations were applied.\n\n"
+                "Settings mode was switched to Self Managed so these values stay in effect.",
+            )
+            try:
+                render_fn = ui_now.get("render")
+                if callable(render_fn):
+                    render_fn()
             except Exception:
                 pass
 
+        apply_btn.configure(command=_apply_recommendations)
+
+        def _render() -> None:
+            payload = self._load_strategy_lab_summary(str(market_var.get() or "stocks"))
+            row = payload if isinstance(payload, dict) else {}
+            market_key = str(market_var.get() or "stocks").strip().lower()
+
+            state = str(row.get("state", "WAITING") or "WAITING").strip().upper()
+            ts = self._format_ui_timestamp(int(row.get("ts", 0) or 0), include_date=True)
+            sim = row.get("simulation", {}) if isinstance(row.get("simulation", {}), dict) else {}
+            back = row.get("backtest", {}) if isinstance(row.get("backtest", {}), dict) else {}
+            metrics = back.get("metrics", {}) if isinstance(back.get("metrics", {}), dict) else {}
+            if not sim and metrics:
+                start_equity = float(max(1.0, float(metrics.get("net_pnl_usd", 0.0) or 0.0) + 100.0))
+                net_pnl = float(metrics.get("net_pnl_usd", 0.0) or 0.0)
+                sim = {
+                    "starting_equity_usd": start_equity,
+                    "ending_equity_usd": start_equity + net_pnl,
+                    "net_pnl_usd": net_pnl,
+                    "net_return_pct": float(metrics.get("cumulative_return_pct", 0.0) or 0.0),
+                    "max_drawdown_pct": float(metrics.get("max_drawdown_pct", 0.0) or 0.0),
+                    "win_rate_pct": float(metrics.get("win_rate_pct", 0.0) or 0.0),
+                    "closed_trades": int(metrics.get("closed_trades", 0) or 0),
+                }
+
+            sim_vars["updated"].set(f"Updated: {ts}")
+            sim_vars["state"].set(f"State: {state}")
+            sim_vars["message"].set(str(row.get("msg", "") or "Run Strategy Lab to generate a holdings-based simulator output."))
+            sim_vars["start_value"].set(_fmt_money(sim.get("starting_equity_usd", None)))
+            sim_vars["end_value"].set(_fmt_money(sim.get("ending_equity_usd", None)))
+            sim_vars["net_pnl"].set(_fmt_money(sim.get("net_pnl_usd", None)))
+            try:
+                sim_vars["net_return"].set(f"{float(sim.get('net_return_pct', 0.0) or 0.0):+.2f}%")
+            except Exception:
+                sim_vars["net_return"].set("N/A")
+            try:
+                sim_vars["max_dd"].set(f"{float(sim.get('max_drawdown_pct', 0.0) or 0.0):+.2f}%")
+            except Exception:
+                sim_vars["max_dd"].set("N/A")
+            try:
+                win_pct = float(sim.get("win_rate_pct", 0.0) or 0.0)
+                trades_n = int(sim.get("closed_trades", 0) or 0)
+                sim_vars["win_rate"].set(f"{win_pct:.1f}% / {trades_n}")
+            except Exception:
+                sim_vars["win_rate"].set("N/A")
+
+            rec_block = row.get("recommendations", {}) if isinstance(row.get("recommendations", {}), dict) else {}
+            rec_settings = rec_block.get("settings", {}) if isinstance(rec_block.get("settings", {}), dict) else {}
+            rec_note = str(rec_block.get("notes", "") or "").strip()
+            if not rec_settings:
+                rec_settings, fallback_note = _derive_fallback_recommendations(row, market_key)
+                if (not rec_note) and fallback_note:
+                    rec_note = fallback_note
+            if not rec_note:
+                rec_note = "Recommendations are tuned from simulator output and current account size."
+            rec_note_var.set(rec_note)
+
+            try:
+                for item in rec_tree.get_children():
+                    rec_tree.delete(item)
+            except Exception:
+                pass
+
+            for sk in sorted(rec_settings.keys()):
+                rv = rec_settings.get(sk)
+                cv = self.settings.get(sk, None)
+                tags = ("changed",) if str(rv) != str(cv) else ()
+                rec_tree.insert(
+                    "",
+                    "end",
+                    values=(str(_setting_label(sk)), str(_setting_value_text(sk, cv)), str(_setting_value_text(sk, rv))),
+                    tags=tags,
+                )
+
+            can_apply = bool(row) and (state == "READY") and bool(rec_settings)
+            try:
+                apply_btn.configure(state=("normal" if can_apply else "disabled"))
+            except Exception:
+                pass
+
+            ui_now = getattr(self, "_strategy_lab_ui", {}) if isinstance(getattr(self, "_strategy_lab_ui", {}), dict) else {}
+            ui_now["payload"] = row
+            ui_now["recommendations"] = rec_settings
+            self._strategy_lab_ui = ui_now
+
         market_combo.bind("<<ComboboxSelected>>", lambda _e: _render(), add="+")
         self._strategy_lab_ui = {
-            "text": txt,
             "market_var": market_var,
             "busy_var": busy_var,
             "run_btn": run_btn,
+            "apply_btn": apply_btn,
+            "sim_vars": sim_vars,
+            "rec_tree": rec_tree,
             "render": _render,
         }
         _render()
@@ -20512,7 +20748,6 @@ class PowerTraderHub(tk.Tk):
         market_settings_nb = ttk.Notebook(frm)
         market_settings_nb.grid(row=r, column=0, columnspan=3, sticky="nsew")
         r += 1
-        frm.rowconfigure(r - 1, weight=1)
 
         crypto_tab = ttk.Frame(market_settings_nb)
         stocks_tab = ttk.Frame(market_settings_nb)
@@ -20550,6 +20785,7 @@ class PowerTraderHub(tk.Tk):
 
         role_mode_default = str(self.settings.get("ui_role_mode", DEFAULT_SETTINGS.get("ui_role_mode", "basic")) or "basic").strip().lower()
         show_adv_default = role_mode_default in {"advanced", "admin"}
+        crypto_advanced_var = tk.BooleanVar(value=show_adv_default)
         stock_advanced_var = tk.BooleanVar(value=show_adv_default)
         forex_advanced_var = tk.BooleanVar(value=show_adv_default)
 
@@ -20627,17 +20863,31 @@ class PowerTraderHub(tk.Tk):
         settings_search_vars["crypto"] = crypto_search_var
         ttk.Entry(crypto_header, textvariable=crypto_search_var, width=22).grid(row=0, column=2, sticky="e")
         crypto_search_var.trace_add("write", lambda *_: _apply_settings_search("crypto"))
-        cr += 1
-        add_row(cr, "Main neural folder:", main_dir_var, browse="dir", parent=crypto_tab); cr += 1
-        add_row(cr, "Coins (comma):", coins_var, parent=crypto_tab); cr += 1
-        add_row(cr, "Trade start level (1-7):", trade_start_level_var, parent=crypto_tab); cr += 1
+        crypto_basic_box = ttk.LabelFrame(crypto_tab, text="Basic Settings")
+        crypto_basic_box.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        _init_settings_grid(crypto_basic_box)
+        ttk.Checkbutton(
+            crypto_tab,
+            text="Show advanced crypto settings",
+            variable=crypto_advanced_var,
+            command=lambda: (_set_section_visible(crypto_advanced_box, bool(crypto_advanced_var.get())), win.after(0, _update_settings_scrollbars)),
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        crypto_advanced_box = ttk.LabelFrame(crypto_tab, text="Advanced Settings")
+        crypto_advanced_box.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        _init_settings_grid(crypto_advanced_box)
+        _set_section_visible(crypto_advanced_box, bool(crypto_advanced_var.get()))
+
+        cb = 1  # row 0 reserved for Robinhood API key status/update row
+        add_row(cb, "Main neural folder:", main_dir_var, browse="dir", parent=crypto_basic_box); cb += 1
+        add_row(cb, "Coins (comma):", coins_var, parent=crypto_basic_box); cb += 1
+        add_row(cb, "Trade start level (1-7):", trade_start_level_var, parent=crypto_basic_box); cb += 1
 
         # Start allocation % (shows approx $/coin using the last known account value; always displays the $0.50 minimum).
-        start_alloc_label = ttk.Label(crypto_tab, text="Start allocation %:")
-        start_alloc_label.grid(row=cr, column=0, sticky="w", padx=(0, 10), pady=6)
-        _register_settings_search_label(crypto_tab, start_alloc_label, _clean_settings_label("Start allocation %:", crypto_tab))
-        start_alloc_entry = ttk.Entry(crypto_tab, textvariable=start_alloc_pct_var)
-        start_alloc_entry.grid(row=cr, column=1, sticky="ew", pady=6)
+        start_alloc_label = ttk.Label(crypto_basic_box, text="Start allocation %:")
+        start_alloc_label.grid(row=cb, column=0, sticky="w", padx=(0, 10), pady=6)
+        _register_settings_search_label(crypto_basic_box, start_alloc_label, _clean_settings_label("Start allocation %:", crypto_basic_box))
+        start_alloc_entry = ttk.Entry(crypto_basic_box, textvariable=start_alloc_pct_var)
+        start_alloc_entry.grid(row=cb, column=1, sticky="ew", pady=6)
         _register_managed_control(start_alloc_entry, "normal", managed=True)
         start_hint = _resolve_help("Start allocation %:", "")
         if start_hint:
@@ -20645,7 +20895,7 @@ class PowerTraderHub(tk.Tk):
             _attach_tooltip(start_alloc_entry, start_hint)
 
         start_alloc_hint_var = tk.StringVar(value="")
-        ttk.Label(crypto_tab, textvariable=start_alloc_hint_var).grid(row=cr, column=2, sticky="w", padx=(10, 0), pady=6)
+        ttk.Label(crypto_basic_box, textvariable=start_alloc_hint_var).grid(row=cb, column=2, sticky="w", padx=(10, 0), pady=6)
 
         def _update_start_alloc_hint(*_):
             # Parse % (allow "0.01" or "0.01%").
@@ -20681,82 +20931,83 @@ class PowerTraderHub(tk.Tk):
         _update_start_alloc_hint()
         start_alloc_pct_var.trace_add("write", _update_start_alloc_hint)
         coins_var.trace_add("write", _update_start_alloc_hint)
-        cr += 1
+        cb += 1
 
-        add_row(cr, "DCA levels (% list):", dca_levels_var, parent=crypto_tab); cr += 1
-        add_row(cr, "DCA multiplier:", dca_mult_var, parent=crypto_tab); cr += 1
-        add_row(cr, "Max DCA buys / coin (rolling 24h):", max_dca_var, parent=crypto_tab); cr += 1
-        add_row(cr, "Trailing PM start % (no DCA):", pm_no_dca_var, parent=crypto_tab); cr += 1
-        add_row(cr, "Trailing PM start % (with DCA):", pm_with_dca_var, parent=crypto_tab); cr += 1
-        add_row(cr, "Trailing gap % (behind peak):", trailing_gap_var, parent=crypto_tab); cr += 1
-        add_row(cr, "Max position USD / coin (0=off):", max_pos_per_coin_var, parent=crypto_tab); cr += 1
-        add_row(cr, "Max total exposure % (0=off):", max_total_exposure_var, parent=crypto_tab); cr += 1
+        add_row(cb, "DCA levels (% list):", dca_levels_var, parent=crypto_basic_box); cb += 1
+        add_row(cb, "DCA multiplier:", dca_mult_var, parent=crypto_basic_box); cb += 1
+        add_row(cb, "Max DCA buys / coin (rolling 24h):", max_dca_var, parent=crypto_basic_box); cb += 1
+        add_row(cb, "Trailing PM start % (no DCA):", pm_no_dca_var, parent=crypto_basic_box); cb += 1
+        add_row(cb, "Trailing PM start % (with DCA):", pm_with_dca_var, parent=crypto_basic_box); cb += 1
+        add_row(cb, "Trailing gap % (behind peak):", trailing_gap_var, parent=crypto_basic_box); cb += 1
+        add_row(cb, "Max position USD / coin (0=off):", max_pos_per_coin_var, parent=crypto_basic_box); cb += 1
+        add_row(cb, "Max total exposure % (0=off):", max_total_exposure_var, parent=crypto_basic_box); cb += 1
 
-        ttk.Separator(crypto_tab, orient="horizontal").grid(row=cr, column=0, columnspan=3, sticky="ew", pady=10); cr += 1
+        ca = 0
+        ttk.Separator(crypto_advanced_box, orient="horizontal").grid(row=ca, column=0, columnspan=3, sticky="ew", pady=10); ca += 1
         ttk.Label(
-            crypto_tab,
+            crypto_advanced_box,
             text="Runtime and process wiring",
             foreground=DARK_MUTED,
-        ).grid(row=cr, column=0, columnspan=3, sticky="w", pady=(0, 4))
-        cr += 1
-        add_row(cr, "Hub data dir (optional):", hub_dir_var, browse="dir", parent=crypto_tab); cr += 1
+        ).grid(row=ca, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        ca += 1
+        add_row(ca, "Hub data dir (optional):", hub_dir_var, browse="dir", parent=crypto_advanced_box); ca += 1
         ttk.Label(
-            crypto_tab,
+            crypto_advanced_box,
             text="Script paths are managed by the app package and hidden from standard settings.",
             foreground=DARK_MUTED,
             justify="left",
             wraplength=660,
-        ).grid(row=cr, column=0, columnspan=3, sticky="w", pady=(0, 6))
-        cr += 1
-        add_row(cr, "KuCoin unsupported cooldown sec:", kucoin_unsupported_cooldown_var, parent=crypto_tab); cr += 1
-        add_row(cr, "Crypto price error log cooldown sec:", crypto_price_error_log_cd_var, parent=crypto_tab); cr += 1
-        add_row(cr, "Key rotation warn days:", key_rotation_warn_days_var, parent=crypto_tab); cr += 1
+        ).grid(row=ca, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        ca += 1
+        add_row(ca, "KuCoin unsupported cooldown sec:", kucoin_unsupported_cooldown_var, parent=crypto_advanced_box); ca += 1
+        add_row(ca, "Crypto price error log cooldown sec:", crypto_price_error_log_cd_var, parent=crypto_advanced_box); ca += 1
+        add_row(ca, "Key rotation warn days:", key_rotation_warn_days_var, parent=crypto_advanced_box); ca += 1
 
-        ttk.Separator(crypto_tab, orient="horizontal").grid(row=cr, column=0, columnspan=3, sticky="ew", pady=10); cr += 1
+        ttk.Separator(crypto_advanced_box, orient="horizontal").grid(row=ca, column=0, columnspan=3, sticky="ew", pady=10); ca += 1
         ttk.Label(
-            crypto_tab,
+            crypto_advanced_box,
             text="Dashboard behavior",
             foreground=DARK_MUTED,
-        ).grid(row=cr, column=0, columnspan=3, sticky="w", pady=(0, 4))
-        cr += 1
-        add_row(cr, "UI refresh seconds:", ui_refresh_var, parent=crypto_tab); cr += 1
-        add_row(cr, "Chart refresh seconds:", chart_refresh_var, parent=crypto_tab); cr += 1
-        add_row(cr, "Candles limit:", candles_limit_var, parent=crypto_tab); cr += 1
-        add_choice_row(cr, "Font scale preset (small/normal/large):", font_scale_var, ["small", "normal", "large"], parent=crypto_tab); cr += 1
-        add_choice_row(cr, "Layout preset (auto/compact/normal/wide):", layout_preset_var, ["auto", "compact", "normal", "wide"], parent=crypto_tab); cr += 1
-        add_choice_row(cr, "UI role mode:", ui_role_mode_var, ["basic", "advanced", "admin"], parent=crypto_tab); cr += 1
-        add_choice_row(cr, "Timestamp display mode:", ui_timestamp_mode_var, ["local_24h", "local_12h", "utc_24h"], parent=crypto_tab); cr += 1
+        ).grid(row=ca, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        ca += 1
+        add_row(ca, "UI refresh seconds:", ui_refresh_var, parent=crypto_advanced_box); ca += 1
+        add_row(ca, "Chart refresh seconds:", chart_refresh_var, parent=crypto_advanced_box); ca += 1
+        add_row(ca, "Candles limit:", candles_limit_var, parent=crypto_advanced_box); ca += 1
+        add_choice_row(ca, "Font scale preset (small/normal/large):", font_scale_var, ["small", "normal", "large"], parent=crypto_advanced_box); ca += 1
+        add_choice_row(ca, "Layout preset (auto/compact/normal/wide):", layout_preset_var, ["auto", "compact", "normal", "wide"], parent=crypto_advanced_box); ca += 1
+        add_choice_row(ca, "UI role mode:", ui_role_mode_var, ["basic", "advanced", "admin"], parent=crypto_advanced_box); ca += 1
+        add_choice_row(ca, "Timestamp display mode:", ui_timestamp_mode_var, ["local_24h", "local_12h", "utc_24h"], parent=crypto_advanced_box); ca += 1
         add_toggle_row(
-            cr,
+            ca,
             "Market panel compact mode:",
             "Use compact market tables/layout sizing",
             market_panel_compact_var,
-            parent=crypto_tab,
-        ); cr += 1
+            parent=crypto_advanced_box,
+        ); ca += 1
         add_toggle_row(
-            cr,
+            ca,
             "Startup automation:",
             "Auto start scripts on GUI launch",
             auto_start_var,
-            parent=crypto_tab,
+            parent=crypto_advanced_box,
             tooltip="When enabled, opening the hub immediately launches runtime scripts.",
-        ); cr += 1
+        ); ca += 1
         add_toggle_row(
-            cr,
+            ca,
             "Drawdown auto-resume:",
             "Allow automatic stop-flag clear after cooloff + recovery",
             drawdown_auto_resume_var,
-            parent=crypto_tab,
-        ); cr += 1
-        add_row(cr, "Drawdown resume cooloff (seconds):", drawdown_cooloff_var, parent=crypto_tab); cr += 1
-        add_row(cr, "Drawdown recovery buffer %:", drawdown_recovery_var, parent=crypto_tab); cr += 1
+            parent=crypto_advanced_box,
+        ); ca += 1
+        add_row(ca, "Drawdown resume cooloff (seconds):", drawdown_cooloff_var, parent=crypto_advanced_box); ca += 1
+        add_row(ca, "Drawdown recovery buffer %:", drawdown_recovery_var, parent=crypto_advanced_box); ca += 1
         add_toggle_row(
-            cr,
+            ca,
             "Drawdown manual acknowledgment:",
             "Require operator acknowledgment before resume",
             drawdown_ack_required_var,
-            parent=crypto_tab,
-        ); cr += 1
+            parent=crypto_advanced_box,
+        ); ca += 1
 
         sr = 0
         add_status_action_row(
@@ -20825,7 +21076,6 @@ class PowerTraderHub(tk.Tk):
         add_row(sa, "Stock symbol cooldown reasons:", stock_symbol_cooldown_reasons_var, parent=stock_advanced_box); sa += 1
 
         fr = 0
-        add_toggle_row(fr, "Live-mode guard:", "Require checklist green", paper_only_guard_var, parent=forex_basic_box, tooltip="Blocks trading until runtime checklist passes."); fr += 1
         add_status_action_row(
             fr,
             "OANDA API keys:",
@@ -20835,6 +21085,7 @@ class PowerTraderHub(tk.Tk):
             parent=forex_basic_box,
             tooltip="Shows whether OANDA credentials are valid. Use Update Keys to edit stored credentials.",
         ); fr += 1
+        add_toggle_row(fr, "Live-mode guard:", "Require checklist green", paper_only_guard_var, parent=forex_basic_box, tooltip="Blocks trading until runtime checklist passes."); fr += 1
         add_row(fr, "Forex universe pairs (blank=auto broker universe):", forex_pairs_var, parent=forex_basic_box); fr += 1
         add_row(fr, "Forex scan max pairs:", forex_scan_max_pairs_var, parent=forex_basic_box); fr += 1
         add_row(fr, "Forex background scan interval seconds:", forex_scan_interval_var, parent=forex_basic_box); fr += 1
@@ -21458,17 +21709,15 @@ class PowerTraderHub(tk.Tk):
             ttk.Button(save_btns, text="Save", command=do_save).pack(side="left")
             ttk.Button(save_btns, text="Close", command=wiz.destroy).pack(side="left", padx=8)
 
-        ttk.Separator(crypto_tab, orient="horizontal").grid(row=cr, column=0, columnspan=3, sticky="ew", pady=10)
-        cr += 1
-
-        ttk.Label(crypto_tab, text="Robinhood API:").grid(row=cr, column=0, sticky="w", padx=(0, 10), pady=6)
-        api_row = ttk.Frame(crypto_tab)
-        api_row.grid(row=cr, column=1, columnspan=2, sticky="ew", pady=6)
-        api_row.columnconfigure(0, weight=1)
-        ttk.Label(api_row, textvariable=api_status_var).grid(row=0, column=0, sticky="w")
-        ttk.Button(api_row, text="Update Keys", command=_open_robinhood_api_wizard).grid(row=0, column=1, sticky="e", padx=(10, 0))
-        _attach_tooltip(api_row, "Launches the credential wizard for Robinhood crypto API keys used by the crypto trader.")
-        cr += 1
+        add_status_action_row(
+            0,
+            "Robinhood API keys:",
+            api_status_var,
+            "Update Keys",
+            _open_robinhood_api_wizard,
+            parent=crypto_basic_box,
+            tooltip="Shows whether Robinhood API credentials are valid. Use Update Keys to run the setup wizard.",
+        )
 
         _refresh_api_status()
         settings_mode_var.trace_add("write", _sync_settings_mode_ui)
@@ -21648,7 +21897,7 @@ class PowerTraderHub(tk.Tk):
                 self.settings["alpaca_base_url"] = str(alpaca_base_url_txt or alpaca_base_default)
                 self.settings["alpaca_data_url"] = str(alpaca_data_url_txt or f"https://{ALPACA_DATA_HOST}")
                 self.settings["alpaca_paper_mode"] = False
-                self.settings["market_rollout_stage"] = "live_guarded"
+                self.settings["market_rollout_stage"] = "live"
                 mode = str(stock_universe_mode_var.get() or "").strip().lower()
                 if mode not in {"core", "watchlist", "all_tradable_filtered"}:
                     mode = str(DEFAULT_SETTINGS.get("stock_universe_mode", "core"))

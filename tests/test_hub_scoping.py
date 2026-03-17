@@ -359,14 +359,14 @@ class HubScopingTests(unittest.TestCase):
         self.assertEqual(symbols[:5], ["BTC", "ETH", "SOL", "LINK", "DOT"])
         self.assertIn("AVAX", symbols)
 
-    def test_live_forex_promotes_shadow_only_to_live_guarded(self) -> None:
+    def test_live_forex_promotes_shadow_only_to_live(self) -> None:
         stage, note = _resolve_rollout_stage_for_broker_modes("shadow_only", True, False)
-        self.assertEqual(stage, "live_guarded")
-        self.assertIn("live_guarded", note)
+        self.assertEqual(stage, "live")
+        self.assertIn("live", note)
 
     def test_live_stock_promotes_non_executable_stage(self) -> None:
         stage, note = _resolve_rollout_stage_for_broker_modes("risk_caps", False, True)
-        self.assertEqual(stage, "live_guarded")
+        self.assertEqual(stage, "live")
         self.assertIn("Live broker mode", note)
 
     def test_execution_stage_is_preserved_for_live_broker(self) -> None:

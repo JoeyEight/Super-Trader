@@ -144,7 +144,7 @@ class TestSettingsSanitize(unittest.TestCase):
         self.assertEqual(float(out["stock_max_price"]), 10.0)
         self.assertEqual(float(out["stock_min_valid_bars_ratio"]), 1.0)
         self.assertEqual(float(out["forex_min_valid_bars_ratio"]), 0.0)
-        self.assertEqual(out["market_rollout_stage"], "live_guarded")
+        self.assertEqual(out["market_rollout_stage"], "live")
         self.assertEqual(out["settings_control_mode"], "self_managed")
         self.assertEqual(out["settings_profile"], "balanced")
         self.assertEqual(out["stock_universe_mode"], "all_tradable_filtered")

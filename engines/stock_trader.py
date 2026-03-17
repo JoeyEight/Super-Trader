@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List
 from zoneinfo import ZoneInfo
 
@@ -21,6 +21,7 @@ ROLLOUT_ORDER = {
     "risk_caps": 2,
     "execution_v2": 3,
     "shadow_only": 4,
+    "live": 5,
     "live_guarded": 5,
 }
 
@@ -55,7 +56,12 @@ def _append_jsonl(path: str, row: Dict[str, Any]) -> None:
 
 def _rollout_at_least(settings: Dict[str, Any], stage: str) -> bool:
     cur = str(settings.get("market_rollout_stage", "legacy") or "legacy").strip().lower()
-    return int(ROLLOUT_ORDER.get(cur, 0)) >= int(ROLLOUT_ORDER.get(stage, 0))
+    target = str(stage or "").strip().lower()
+    if cur == "live_guarded":
+        cur = "live"
+    if target == "live_guarded":
+        target = "live"
+    return int(ROLLOUT_ORDER.get(cur, 0)) >= int(ROLLOUT_ORDER.get(target, 0))
 
 
 def _broker_mode_label(settings: Dict[str, Any]) -> str:
@@ -95,6 +101,74 @@ def _parse_positions(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
 
 def _now_et() -> datetime:
     return datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York"))
+
+
+def _et_date_from_ts(ts: float | int) -> date:
+    try:
+        val = float(ts or 0.0)
+    except Exception:
+        val = 0.0
+    if val <= 0.0:
+        return _now_et().date()
+    return datetime.fromtimestamp(val, timezone.utc).astimezone(ZoneInfo("America/New_York")).date()
+
+
+def _same_et_day(ts_a: float | int, ts_b: float | int) -> bool:
+    return _et_date_from_ts(ts_a) == _et_date_from_ts(ts_b)
+
+
+def _normalize_event_timestamps(raw: Any, now_ts: int, keep_days: int = 45) -> List[int]:
+    seq = raw if isinstance(raw, list) else []
+    out: List[int] = []
+    cutoff_ts = max(0, int(now_ts - (max(1, int(keep_days)) * 86400)))
+    for item in seq:
+        try:
+            ts = int(float(item or 0))
+        except Exception:
+            continue
+        if ts <= 0:
+            continue
+        if ts < cutoff_ts:
+            continue
+        if ts > int(now_ts + 300):
+            continue
+        out.append(ts)
+    out = sorted(set(out))
+    return out[-500:]
+
+
+def _count_events_on_et_day(events: List[int], ref_ts: int) -> int:
+    if not events:
+        return 0
+    ref_day = _et_date_from_ts(ref_ts)
+    count = 0
+    for ts in events:
+        if _et_date_from_ts(ts) == ref_day:
+            count += 1
+    return int(count)
+
+
+def _pdt_window_start_ts(now_ts: int, trading_days: int = 5) -> int:
+    local = datetime.fromtimestamp(max(0, int(now_ts)), timezone.utc).astimezone(ZoneInfo("America/New_York"))
+    target_days = max(1, int(trading_days))
+    cursor = local.date()
+    counted = 1 if cursor.weekday() < 5 else 0
+    while counted < target_days:
+        cursor = cursor - timedelta(days=1)
+        if cursor.weekday() < 5:
+            counted += 1
+    start_local = datetime(cursor.year, cursor.month, cursor.day, 0, 0, 0, tzinfo=ZoneInfo("America/New_York"))
+    return int(start_local.astimezone(timezone.utc).timestamp())
+
+
+def _count_events_in_window(events: List[int], start_ts: int, end_ts: int) -> int:
+    count = 0
+    lo = int(start_ts)
+    hi = int(end_ts)
+    for ts in events:
+        if lo <= int(ts) <= hi:
+            count += 1
+    return int(count)
 
 
 def _market_open_now() -> bool:
@@ -314,6 +388,35 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     profit_target_pct = max(0.0, float(settings.get("stock_profit_target_pct", 0.35) or 0.35))
     trailing_gap_pct = max(0.0, float(settings.get("stock_trailing_gap_pct", 0.2) or 0.2))
     max_day_trades = max(0, int(float(settings.get("stock_max_day_trades", 3) or 3)))
+    min_hold_minutes = max(0, int(float(settings.get("stock_min_hold_minutes", 1440) or 1440)))
+    same_day_exception_enabled = bool(settings.get("stock_same_day_exit_exception_enabled", True))
+    same_day_exception_min_hold_minutes = max(
+        0,
+        int(float(settings.get("stock_same_day_exception_min_hold_minutes", 120) or 120)),
+    )
+    same_day_exception_min_pnl_pct = max(
+        0.0,
+        float(settings.get("stock_same_day_exception_min_pnl_pct", 2.5) or 2.5),
+    )
+    same_day_exception_min_pullback_pct = max(
+        0.0,
+        float(settings.get("stock_same_day_exception_min_pullback_pct", 0.9) or 0.9),
+    )
+    same_day_exception_require_score_flip = bool(
+        settings.get("stock_same_day_exception_require_score_flip", True),
+    )
+    same_day_exception_score_floor_mult = max(
+        0.0,
+        float(settings.get("stock_same_day_exception_score_floor_mult", 0.75) or 0.75),
+    )
+    pdt_equity_threshold_usd = max(
+        0.0,
+        float(settings.get("stock_pdt_equity_threshold_usd", 25_000.0) or 25_000.0),
+    )
+    pdt_max_day_trades_rolling_5d = max(
+        0,
+        int(float(settings.get("stock_pdt_max_day_trades_rolling_5d", 3) or 3)),
+    )
     max_pos_usd = max(0.0, float(settings.get("stock_max_position_usd_per_symbol", 0.0) or 0.0))
     max_total_exposure_pct = max(0.0, float(settings.get("stock_max_total_exposure_pct", 0.0) or 0.0))
     max_daily_loss_usd = max(0.0, float(settings.get("stock_max_daily_loss_usd", 0.0) or 0.0))
@@ -333,10 +436,12 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     except Exception:
         cached_scan_entry_size_mult = 0.60
     stage = str(settings.get("market_rollout_stage", "legacy") or "legacy").strip().lower()
+    if stage == "live_guarded":
+        stage = "live"
     enable_exec_v2 = _rollout_at_least(settings, "execution_v2")
     enable_risk_caps = _rollout_at_least(settings, "risk_caps")
     shadow_only = stage == "shadow_only"
-    live_guarded = stage == "live_guarded"
+    live_guarded = stage == "live"
     live_guarded_calibration = live_guarded and (not bool(settings.get("alpaca_paper_mode", True)))
 
     alpaca_key, alpaca_secret = get_alpaca_creds(settings, base_dir=BASE_DIR)
@@ -359,13 +464,21 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     thinker = _safe_read_json(thinker_path)
     candidate_rows = _stock_candidates_from_thinker(thinker)
     candidate_rows = sorted(candidate_rows, key=_stock_entry_priority, reverse=True)
+    candidate_lookup: Dict[str, Dict[str, Any]] = {}
+    for row in candidate_rows:
+        symbol = str((row or {}).get("symbol", "") or "").strip().upper()
+        if symbol and symbol not in candidate_lookup:
+            candidate_lookup[symbol] = row
     top_pick = candidate_rows[0] if candidate_rows else {}
+    adaptive_thr_hint = float(thinker.get("adaptive_threshold", score_threshold) or score_threshold)
+    same_day_score_floor = max(0.0, float(adaptive_thr_hint) * float(same_day_exception_score_floor_mult))
 
     today = time.strftime("%Y-%m-%d", time.localtime(now_ts))
     state = _safe_read_json(state_path)
     trail_state = state.get("trail", {}) or {}
     opened_today = state.get("opened_today", {}) or {}
     day_trades = state.get("day_trades", {}) or {}
+    day_trade_events = _normalize_event_timestamps(state.get("day_trade_events", []), now_ts=now_ts, keep_days=45)
     cooldown_until = state.get("cooldown_until", {}) or {}
     loss_streak = int(float(state.get("loss_streak", 0) or 0))
     last_divergence_ts = int(float(state.get("last_divergence_ts", 0) or 0))
@@ -384,9 +497,24 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         open_meta = {}
     if not isinstance(pending, dict):
         pending = {}
-    day_trades_today = int(float(day_trades.get(today, 0) or 0))
+    legacy_day_trades_today = int(float(day_trades.get(today, 0) or 0))
+    day_trades_today = max(legacy_day_trades_today, _count_events_on_et_day(day_trade_events, now_ts))
     day_trades = {today: day_trades_today}
-    opened_today = {str(k).upper(): int(v) for k, v in opened_today.items() if str(k).strip()}
+    normalized_opened_today: Dict[str, int] = {}
+    for k, v in opened_today.items():
+        symbol = str(k).strip().upper()
+        if not symbol:
+            continue
+        try:
+            ts = int(float(v) or 0)
+        except Exception:
+            ts = 0
+        if ts <= 0:
+            continue
+        if not _same_et_day(ts, now_ts):
+            continue
+        normalized_opened_today[symbol] = ts
+    opened_today = normalized_opened_today
     cooldown_until = {str(k).upper(): float(v) for k, v in cooldown_until.items() if str(k).strip()}
     open_meta = {str(k).upper(): (v if isinstance(v, dict) else {}) for k, v in open_meta.items() if str(k).strip()}
     loss_size_scale = max(loss_size_floor_pct, 1.0 - (loss_size_step_pct * float(max(0, loss_streak))))
@@ -414,6 +542,9 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     acct = client.get_account_summary()
     equity = float(acct.get("equity", 0.0) or 0.0) if isinstance(acct, dict) else 0.0
     total_positions_value = sum(max(0.0, float(pos.get("market_value", 0.0) or 0.0)) for pos in positions.values())
+    pdt_window_start_ts = _pdt_window_start_ts(now_ts, trading_days=5)
+    day_trades_rolling_5d = _count_events_in_window(day_trade_events, pdt_window_start_ts, now_ts)
+    pdt_restricted = bool(pdt_equity_threshold_usd > 0.0 and equity > 0.0 and equity < pdt_equity_threshold_usd)
 
     actions: List[str] = []
     thinker_health = thinker.get("health", {}) if isinstance(thinker, dict) else {}
@@ -456,6 +587,53 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         if armed:
             peak = max(peak, pnl)
             if pnl <= (peak - trailing_gap_pct):
+                hold_s = max(0, int(now_ts - entry_ts))
+                same_day_roundtrip = _same_et_day(entry_ts, now_ts)
+                hold_gate_block = ""
+                intraday_exception_used = False
+                if same_day_roundtrip and hold_s < (max(0, min_hold_minutes) * 60):
+                    min_exc_hold_s = max(0, same_day_exception_min_hold_minutes) * 60
+                    if not same_day_exception_enabled:
+                        hold_gate_block = f"PDT hold gate: same-day exits disabled for {symbol}"
+                    elif hold_s < min_exc_hold_s:
+                        hold_gate_block = (
+                            f"PDT hold gate: {symbol} held {int(hold_s // 60)}m; "
+                            f"need >= {int(same_day_exception_min_hold_minutes)}m before exception"
+                        )
+                    elif pdt_restricted and pdt_max_day_trades_rolling_5d > 0 and day_trades_rolling_5d >= pdt_max_day_trades_rolling_5d:
+                        hold_gate_block = (
+                            "PDT guard: rolling 5-day day-trade cap reached "
+                            f"({day_trades_rolling_5d}/{pdt_max_day_trades_rolling_5d})"
+                        )
+                    elif pnl < same_day_exception_min_pnl_pct:
+                        hold_gate_block = (
+                            f"PDT hold gate: boom exception needs pnl >= {same_day_exception_min_pnl_pct:.2f}% for {symbol}"
+                        )
+                    elif (mfe - pnl) < same_day_exception_min_pullback_pct:
+                        hold_gate_block = (
+                            f"PDT hold gate: boom exception needs pullback >= {same_day_exception_min_pullback_pct:.2f}% for {symbol}"
+                        )
+                    else:
+                        cand = candidate_lookup.get(symbol, {}) if isinstance(candidate_lookup.get(symbol, {}), dict) else {}
+                        cand_side = str(cand.get("side", "watch") or "watch").strip().lower()
+                        cand_score = float(cand.get("score", 0.0) or 0.0)
+                        score_flip_confirmed = bool((cand_side != "long") or (cand_score < same_day_score_floor))
+                        if same_day_exception_require_score_flip and (not score_flip_confirmed):
+                            hold_gate_block = (
+                                "PDT hold gate: momentum still long; no dip-risk confirmation "
+                                f"for {symbol} (score {cand_score:.4f} >= floor {same_day_score_floor:.4f})"
+                            )
+                        else:
+                            intraday_exception_used = True
+                if hold_gate_block:
+                    actions.append(f"HOLD {symbol} | {hold_gate_block}")
+                    trail_state[symbol] = {"armed": armed, "peak_pct": peak, "last_pnl_pct": pnl, "updated_at": now_ts}
+                    continue
+                if intraday_exception_used:
+                    actions.append(
+                        f"INTRADAY EXIT EXCEPTION {symbol} | pnl {pnl:.2f}% from peak {mfe:.2f}% "
+                        f"(pullback {max(0.0, mfe - pnl):.2f}%)"
+                    )
                 ok, msg, payload = client.close_position(symbol)
                 actions.append(f"CLOSE {symbol} | {'OK' if ok else 'FAIL'} | {msg}")
                 _append_jsonl(
@@ -473,7 +651,9 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                         "pnl_usd": pnl_usd,
                         "mfe_pct": round(mfe, 4),
                         "mae_pct": round(mae, 4),
-                        "hold_s": max(0, int(now_ts - entry_ts)),
+                        "hold_s": hold_s,
+                        "same_day_roundtrip": bool(same_day_roundtrip),
+                        "intraday_exception_used": bool(intraday_exception_used),
                         "ok": ok,
                         "msg": msg,
                         "payload": payload if isinstance(payload, dict) else {},
@@ -482,10 +662,13 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 if ok:
                     trail_state.pop(symbol, None)
                     open_meta.pop(symbol, None)
-                    if symbol in opened_today:
+                    if same_day_roundtrip:
                         day_trades_today += 1
                         day_trades[today] = day_trades_today
-                        opened_today.pop(symbol, None)
+                        day_trade_events.append(int(now_ts))
+                        day_trade_events = _normalize_event_timestamps(day_trade_events, now_ts=now_ts, keep_days=45)
+                        day_trades_rolling_5d = _count_events_in_window(day_trade_events, pdt_window_start_ts, now_ts)
+                    opened_today.pop(symbol, None)
                     if pnl_usd < 0:
                         loss_streak += 1
                         cooldown_until[symbol] = float(now_ts + max(60, int(float(settings.get("stock_loss_cooldown_seconds", 1800) or 1800))))
@@ -714,6 +897,8 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "trail": trail_state,
         "opened_today": opened_today,
         "day_trades": day_trades,
+        "day_trade_events": day_trade_events,
+        "day_trades_rolling_5d": int(day_trades_rolling_5d),
         "cooldown_until": cooldown_until,
         "loss_streak": int(loss_streak),
         "open_meta": open_meta,
@@ -732,6 +917,11 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "cached_fallback_active": bool(fallback_active),
             "cached_fallback_age_s": int(fallback_age_s),
             "cached_fallback_hard_block_age_s": int(cached_scan_hard_block_age_s),
+            "pdt_restricted": bool(pdt_restricted),
+            "pdt_equity_threshold_usd": float(round(pdt_equity_threshold_usd, 4)),
+            "day_trades_rolling_5d": int(day_trades_rolling_5d),
+            "pdt_max_day_trades_rolling_5d": int(pdt_max_day_trades_rolling_5d),
+            "same_day_exit_min_hold_minutes": int(min_hold_minutes),
         },
         "trade_notional_entry_usd": round(float(trade_notional_entry), 4),
         "entry_size_scale": round(float(entry_size_scale), 4),
@@ -794,6 +984,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "auto_enabled": auto_enabled,
         "broker_mode": str(_broker_mode_label(settings)).lower(),
         "day_trades_today": day_trades_today,
+        "day_trades_rolling_5d": int(day_trades_rolling_5d),
         "rollout_stage": str(settings.get("market_rollout_stage", "legacy") or "legacy"),
         "execution_enabled": enable_exec_v2 and (not shadow_only),
         "trade_notional_usd": round(float(trade_notional), 4),
@@ -818,6 +1009,11 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "cached_fallback_active": bool(fallback_active),
             "cached_fallback_age_s": int(fallback_age_s),
             "cached_fallback_hard_block_age_s": int(cached_scan_hard_block_age_s),
+            "pdt_restricted": bool(pdt_restricted),
+            "pdt_equity_threshold_usd": float(round(pdt_equity_threshold_usd, 4)),
+            "day_trades_rolling_5d": int(day_trades_rolling_5d),
+            "pdt_max_day_trades_rolling_5d": int(pdt_max_day_trades_rolling_5d),
+            "same_day_exit_min_hold_minutes": int(min_hold_minutes),
         },
         "updated_at": now_ts,
         "health": {"data_ok": thinker_data_ok, "broker_ok": True, "orders_ok": True, "drift_warning": drift_warning},

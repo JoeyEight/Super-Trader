@@ -9,7 +9,7 @@ SANITIZER_DEFAULTS: Dict[str, Any] = {
     "settings_schema_version": CURRENT_SETTINGS_VERSION,
     "settings_upgrade_notes": [],
     "coins": ["BTC", "ETH", "XRP", "BNB", "DOGE"],
-    "market_rollout_stage": "live_guarded",
+    "market_rollout_stage": "live",
     "alpaca_paper_mode": False,
     "oanda_practice_mode": False,
     "profile_manual_overrides": [],
@@ -491,7 +491,7 @@ _INT_BOUNDS: Dict[str, Tuple[int, int, int]] = {
 }
 
 _ENUMS: Dict[str, Iterable[str]] = {
-    "market_rollout_stage": ("legacy", "scan_expanded", "risk_caps", "execution_v2", "shadow_only", "live_guarded"),
+    "market_rollout_stage": ("legacy", "scan_expanded", "risk_caps", "execution_v2", "shadow_only", "live", "live_guarded"),
     "settings_control_mode": ("preset_managed", "self_managed"),
     "settings_profile": ("guarded", "balanced", "performance"),
     "ui_role_mode": ("basic", "advanced", "admin"),
@@ -1254,6 +1254,6 @@ def sanitize_settings(raw: Dict[str, Any] | None, defaults: Dict[str, Any] | Non
     # Live-only configuration: disable legacy modes and lock rollout to live.
     out["alpaca_paper_mode"] = False
     out["oanda_practice_mode"] = False
-    out["market_rollout_stage"] = "live_guarded"
+    out["market_rollout_stage"] = "live"
 
     return out

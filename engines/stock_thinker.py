@@ -58,8 +58,16 @@ ROLLOUT_ORDER = {
     "risk_caps": 2,
     "execution_v2": 3,
     "shadow_only": 4,
+    "live": 5,
     "live_guarded": 5,
 }
+
+
+def _normalize_rollout_stage(stage: Any) -> str:
+    cur = str(stage or "legacy").strip().lower()
+    if cur == "live_guarded":
+        return "live"
+    return cur
 
 
 def _float(v: Any, default: float = 0.0) -> float:
@@ -171,8 +179,9 @@ def _request_json(url: str, headers: Dict[str, str], timeout: float = 10.0) -> A
 
 
 def _rollout_at_least(settings: Dict[str, Any], stage: str) -> bool:
-    cur = str(settings.get("market_rollout_stage", "legacy") or "legacy").strip().lower()
-    return int(ROLLOUT_ORDER.get(cur, 0)) >= int(ROLLOUT_ORDER.get(stage, 0))
+    cur = _normalize_rollout_stage(settings.get("market_rollout_stage", "legacy"))
+    target = _normalize_rollout_stage(stage)
+    return int(ROLLOUT_ORDER.get(cur, 0)) >= int(ROLLOUT_ORDER.get(target, 0))
 
 
 def _now_et() -> datetime:
@@ -1018,11 +1027,11 @@ def _append_reason_parts(row: Dict[str, Any], logic: str = "", data: str = "") -
 
 
 def _live_guarded_entry_gate_reason(settings: Dict[str, Any], row: Dict[str, Any]) -> str:
-    stage = str(settings.get("market_rollout_stage", "legacy") or "legacy").strip().lower()
-    if stage != "live_guarded":
+    stage = _normalize_rollout_stage(settings.get("market_rollout_stage", "legacy"))
+    if stage != "live":
         return ""
     # Paper mode is the calibration warmup path; keep live-only calibration gates off
-    # so the stock paper trader can accumulate the samples required for live_guarded.
+    # so the stock paper trader can accumulate the samples required for live.
     if _setting_bool(settings, "alpaca_paper_mode", True):
         return ""
     symbol = str(row.get("symbol", "") or "").strip().upper()
@@ -1920,6 +1929,8 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         )
     allow_missing_liquidity = False
     liquidity_missing_ratio_pct = 0.0
+    liquidity_relief_min_universe = 25
+    liquidity_relief_missing_ratio_pct = 65.0
     try:
         if universe:
             missing = sum(
@@ -1928,10 +1939,14 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 if _float((snap.get(sym, {}) or {}).get("dollar_vol", 0.0), 0.0) <= 0.0
             )
             liquidity_missing_ratio_pct = (float(missing) / float(len(universe))) * 100.0
-            allow_missing_liquidity = liquidity_missing_ratio_pct >= 65.0
+            # Some feeds intermittently omit dollar-volume for most symbols while
+            # price/spread fields are still valid. In that case, keep scan flow alive
+            # for broad universes and let downstream bars/quality gates decide.
+            allow_missing_liquidity = bool(
+                len(universe) >= int(liquidity_relief_min_universe)
+                and liquidity_missing_ratio_pct >= float(liquidity_relief_missing_ratio_pct)
+            )
     except Exception:
-        allow_missing_liquidity = False
-    if market_open:
         allow_missing_liquidity = False
     min_price = max(0.0, float(settings.get("stock_min_price", 2.0) or 2.0))
     max_price = max(min_price, float(settings.get("stock_max_price", 500.0) or 500.0))
@@ -2598,7 +2613,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 row["side"] = "watch"
                 _append_reason_parts(
                     row,
-                    logic="Calibration history insufficient for live_guarded entry; hold as watch",
+                    logic="Calibration history insufficient for live entry; hold as watch",
                     data=entry_gate_reason,
                 )
         row["leader_rank_score"] = round(_leader_rank_score(row), 6)

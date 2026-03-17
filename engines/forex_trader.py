@@ -20,6 +20,7 @@ ROLLOUT_ORDER = {
     "risk_caps": 2,
     "execution_v2": 3,
     "shadow_only": 4,
+    "live": 5,
     "live_guarded": 5,
 }
 
@@ -54,7 +55,12 @@ def _append_jsonl(path: str, row: Dict[str, Any]) -> None:
 
 def _rollout_at_least(settings: Dict[str, Any], stage: str) -> bool:
     cur = str(settings.get("market_rollout_stage", "legacy") or "legacy").strip().lower()
-    return int(ROLLOUT_ORDER.get(cur, 0)) >= int(ROLLOUT_ORDER.get(stage, 0))
+    target = str(stage or "").strip().lower()
+    if cur == "live_guarded":
+        cur = "live"
+    if target == "live_guarded":
+        target = "live"
+    return int(ROLLOUT_ORDER.get(cur, 0)) >= int(ROLLOUT_ORDER.get(target, 0))
 
 
 def _broker_mode_label(settings: Dict[str, Any]) -> str:
@@ -432,10 +438,12 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     except Exception:
         cached_scan_entry_size_mult = 0.65
     stage = str(settings.get("market_rollout_stage", "legacy") or "legacy").strip().lower()
+    if stage == "live_guarded":
+        stage = "live"
     enable_exec_v2 = _rollout_at_least(settings, "execution_v2")
     enable_risk_caps = _rollout_at_least(settings, "risk_caps")
     shadow_only = stage == "shadow_only"
-    live_guarded = stage == "live_guarded"
+    live_guarded = stage == "live"
 
     oanda_account, oanda_token = get_oanda_creds(settings, base_dir=BASE_DIR)
     client = OandaBrokerClient(

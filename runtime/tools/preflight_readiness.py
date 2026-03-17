@@ -136,6 +136,8 @@ def build_preflight_report(project_dir: str, now_ts: int | None = None) -> Dict[
             )
 
     rollout_stage = str(settings.get("market_rollout_stage", "legacy") or "legacy").strip().lower()
+    if rollout_stage == "live_guarded":
+        rollout_stage = "live"
     paper_only_guard = bool(settings.get("paper_only_unless_checklist_green", True))
     alpaca_paper = bool(settings.get("alpaca_paper_mode", True))
     oanda_practice = bool(settings.get("oanda_practice_mode", True))
@@ -256,7 +258,7 @@ def build_preflight_report(project_dir: str, now_ts: int | None = None) -> Dict[
                 {"path": scorecards_path},
             )
         )
-    elif rollout_stage in {"execution_v2", "live_guarded"}:
+    elif rollout_stage in {"execution_v2", "live"}:
         if stock_gate == "BLOCK" or forex_gate == "BLOCK":
             issues.append(
                 _issue(
@@ -280,7 +282,7 @@ def build_preflight_report(project_dir: str, now_ts: int | None = None) -> Dict[
     notif = _safe_read_json(notif_path)
     notif_by_sev = notif.get("by_severity", {}) if isinstance(notif.get("by_severity", {}), dict) else {}
     crit_notif = int(notif_by_sev.get("critical", 0) or 0)
-    if crit_notif > 0 and rollout_stage in {"execution_v2", "live_guarded"}:
+    if crit_notif > 0 and rollout_stage in {"execution_v2", "live"}:
         issues.append(
             _issue(
                 "warning",
@@ -290,12 +292,12 @@ def build_preflight_report(project_dir: str, now_ts: int | None = None) -> Dict[
             )
         )
 
-    if rollout_stage == "live_guarded" and alpaca_paper:
-        issues.append(_issue("warning", "alpaca_still_paper", "Rollout is `live_guarded` but Alpaca is still in paper mode."))
-    if rollout_stage == "live_guarded" and oanda_practice:
-        issues.append(_issue("warning", "oanda_still_practice", "Rollout is `live_guarded` but OANDA is still in practice mode."))
+    if rollout_stage == "live" and alpaca_paper:
+        issues.append(_issue("warning", "alpaca_still_paper", "Rollout is `live` but Alpaca is still in paper mode."))
+    if rollout_stage == "live" and oanda_practice:
+        issues.append(_issue("warning", "oanda_still_practice", "Rollout is `live` but OANDA is still in practice mode."))
 
-    if (rollout_stage in {"execution_v2", "live_guarded"}) and (not stock_auto) and (not forex_auto):
+    if (rollout_stage in {"execution_v2", "live"}) and (not stock_auto) and (not forex_auto):
         issues.append(_issue("warning", "market_auto_trade_off", "Rollout stage is execution-capable but Stocks/Forex auto-trade are both disabled."))
 
     if not paper_only_guard:
