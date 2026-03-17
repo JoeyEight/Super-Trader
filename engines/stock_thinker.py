@@ -13,7 +13,9 @@ from typing import Any, Dict, List
 from zoneinfo import ZoneInfo
 
 from app.credential_utils import get_alpaca_creds, get_twelvedata_api_key
+from app.confidence_calibration import build_market_confidence_calibration
 from app.http_utils import retry_after_from_urllib_http_error
+from app.news_event_provider import blend_score_with_news, build_unified_news_event_context
 from app.path_utils import resolve_runtime_paths
 from app.rejection_replay import recommend_threshold_from_scores, replay_target_entries_for_market
 from app.scan_diagnostics_schema import with_scan_schema
@@ -65,6 +67,20 @@ def _float(v: Any, default: float = 0.0) -> float:
         return float(v)
     except Exception:
         return float(default)
+
+
+def _setting_bool(settings: Dict[str, Any], key: str, default: bool = False) -> bool:
+    raw = settings.get(key, default)
+    if isinstance(raw, bool):
+        return raw
+    if raw is None:
+        return bool(default)
+    text = str(raw).strip().lower()
+    if text in {"1", "true", "yes", "on", "y", "t"}:
+        return True
+    if text in {"0", "false", "no", "off", "n", "f"}:
+        return False
+    return bool(default)
 
 
 def _stock_data_provider(settings: Dict[str, Any]) -> str:
@@ -171,6 +187,33 @@ def _market_open_now() -> bool:
     return (9 * 60 + 30) <= mins < (16 * 60)
 
 
+def _market_clock_status(settings: Dict[str, Any], api_key: str, secret: str) -> Dict[str, Any]:
+    out = {
+        "market_open": bool(_market_open_now()),
+        "source": "local_schedule",
+        "next_open": "",
+        "next_close": "",
+        "timestamp": "",
+    }
+    try:
+        client = AlpacaBrokerClient(
+            api_key_id=str(api_key or "").strip(),
+            secret_key=str(secret or "").strip(),
+            base_url=str(settings.get("alpaca_base_url", "https://paper-api.alpaca.markets") or ""),
+            data_url=str(settings.get("alpaca_data_url", "https://data.alpaca.markets") or ""),
+        )
+        clock = client.get_market_clock()
+        if isinstance(clock, dict) and clock:
+            out["market_open"] = bool(clock.get("is_open", out["market_open"]))
+            out["source"] = "alpaca_clock"
+            out["next_open"] = str(clock.get("next_open", "") or "").strip()
+            out["next_close"] = str(clock.get("next_close", "") or "").strip()
+            out["timestamp"] = str(clock.get("timestamp", "") or "").strip()
+    except Exception:
+        pass
+    return out
+
+
 def _cache_path(hub_dir: str) -> str:
     return os.path.join(hub_dir, "stocks", "stock_universe_cache.json")
 
@@ -209,6 +252,10 @@ def _symbol_cooldown_path(hub_dir: str) -> str:
 
 def _quality_report_path(hub_dir: str) -> str:
     return os.path.join(hub_dir, "stocks", "universe_quality.json")
+
+
+def _opening_plan_path(hub_dir: str) -> str:
+    return os.path.join(hub_dir, "stocks", "opening_plan.json")
 
 
 def _norm_id_list(value: Any) -> List[str]:
@@ -510,6 +557,126 @@ def _save_json_map(path: str, payload: Dict[str, Any]) -> None:
 
 def _thinker_status_path(hub_dir: str) -> str:
     return os.path.join(hub_dir, "stocks", "stock_thinker_status.json")
+
+
+def _confidence_calibration_path(hub_dir: str) -> str:
+    return os.path.join(hub_dir, "confidence_calibration.json")
+
+
+def _build_opening_plan(
+    settings: Dict[str, Any],
+    leaders: List[Dict[str, Any]],
+    all_scores: List[Dict[str, Any]],
+    adaptive_threshold: float,
+    ts_now: int,
+    market_clock: Dict[str, Any] | None,
+    market_open: bool,
+    msg: str,
+    fallback_cached: bool = False,
+) -> Dict[str, Any]:
+    enabled = _setting_bool(settings, "stock_opening_plan_enabled", True)
+    rows_limit = max(1, min(20, int(float(settings.get("stock_opening_plan_max_symbols", 8) or 8))))
+    window_minutes = max(5, min(240, int(float(settings.get("stock_opening_plan_minutes", 45) or 45))))
+    next_open = str((market_clock or {}).get("next_open", "") or "").strip()
+    threshold = max(0.01, float(adaptive_threshold or settings.get("stock_score_threshold", 0.2) or 0.2))
+
+    merged: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in list(leaders or []) + list(all_scores or []):
+        if not isinstance(row, dict):
+            continue
+        symbol = str(row.get("symbol", "") or "").strip().upper()
+        if (not symbol) or (symbol in seen):
+            continue
+        seen.add(symbol)
+        merged.append(dict(row))
+    merged.sort(
+        key=lambda r: (
+            1 if bool(r.get("eligible_for_entry", False)) else 0,
+            float(r.get("score", 0.0) or 0.0),
+        ),
+        reverse=True,
+    )
+
+    rows: List[Dict[str, Any]] = []
+    for row in merged[:rows_limit]:
+        symbol = str(row.get("symbol", "") or "").strip().upper()
+        side = str(row.get("side", "watch") or "watch").strip().lower()
+        score = float(row.get("score", 0.0) or 0.0)
+        eligible = bool(row.get("eligible_for_entry", False))
+        data_ok = bool(row.get("data_quality_ok", True))
+        confidence = str(row.get("confidence", "N/A") or "N/A").strip().upper() or "N/A"
+        calib_prob = float(row.get("calibration_effective_prob", row.get("calib_prob", 0.0)) or 0.0)
+        quality_score = float(row.get("quality_score", 0.0) or 0.0)
+        gate_reason = str(row.get("entry_gate_reason", "") or "").strip()
+        logic = str(row.get("reason_logic", row.get("reason", "")) or "").strip()
+
+        ready = bool(side == "long" and eligible and data_ok and (score >= threshold))
+        if ready:
+            status = "READY"
+            trigger = f"Open-entry candidate if score >= {threshold:.3f} and spread/slippage checks pass."
+        elif side == "long":
+            status = "ENTRY WAIT"
+            trigger = gate_reason or "Needs scanner promotion or quality gate clearance before entry."
+        else:
+            status = "WATCH"
+            trigger = "Watch for scanner promotion from WATCH to LONG."
+
+        rows.append(
+            {
+                "symbol": symbol,
+                "side": side.upper(),
+                "score": round(score, 6),
+                "confidence": confidence,
+                "calib_prob": round(calib_prob, 4),
+                "quality_score": round(quality_score, 3),
+                "status": status,
+                "logic": logic,
+                "trigger": trigger,
+            }
+        )
+
+    ready_count = sum(1 for row in rows if str(row.get("status", "")).upper() == "READY")
+    return {
+        "enabled": bool(enabled),
+        "generated_ts": int(ts_now),
+        "market_open": bool(market_open),
+        "next_open": next_open,
+        "plan_window_minutes": int(window_minutes),
+        "adaptive_threshold": round(float(threshold), 6),
+        "source_msg": str(msg or ""),
+        "fallback_cached": bool(fallback_cached),
+        "rows": rows if enabled else [],
+        "summary": f"{ready_count} ready | {max(0, len(rows) - ready_count)} watch/wait",
+    }
+
+
+def _persist_opening_plan(
+    settings: Dict[str, Any],
+    hub_dir: str,
+    *,
+    leaders: List[Dict[str, Any]],
+    all_scores: List[Dict[str, Any]],
+    adaptive_threshold: float,
+    ts_now: int,
+    market_clock: Dict[str, Any] | None,
+    market_open: bool,
+    msg: str,
+    fallback_cached: bool = False,
+) -> Dict[str, Any]:
+    plan = _build_opening_plan(
+        settings=settings,
+        leaders=leaders,
+        all_scores=all_scores,
+        adaptive_threshold=adaptive_threshold,
+        ts_now=ts_now,
+        market_clock=market_clock,
+        market_open=market_open,
+        msg=msg,
+        fallback_cached=fallback_cached,
+    )
+    _save_json_map(_opening_plan_path(hub_dir), plan)
+    return plan
 
 
 def _cached_scan_fallback(
@@ -856,22 +1023,67 @@ def _live_guarded_entry_gate_reason(settings: Dict[str, Any], row: Dict[str, Any
         return ""
     # Paper mode is the calibration warmup path; keep live-only calibration gates off
     # so the stock paper trader can accumulate the samples required for live_guarded.
-    if bool(settings.get("alpaca_paper_mode", True)):
+    if _setting_bool(settings, "alpaca_paper_mode", True):
         return ""
     symbol = str(row.get("symbol", "") or "").strip().upper()
     if not symbol:
         return ""
-    sample_count = int(float(row.get("samples", 0) or 0))
+    sample_count = int(float(row.get("calibration_effective_samples", row.get("samples", 0)) or 0))
+    symbol_samples = int(float(row.get("symbol_samples", row.get("samples", 0)) or 0))
+    market_samples = int(float(row.get("market_calibration_samples", 0) or 0))
     min_samples_guarded = max(0, int(float(settings.get("stock_min_samples_live_guarded", 5) or 5)))
+    bootstrap_allow = _setting_bool(settings, "stock_live_guarded_bootstrap_allow", True)
     if sample_count < min_samples_guarded:
-        return f"Calibration sample gate for {symbol} ({sample_count} < {min_samples_guarded})"
-    calib_prob = float(row.get("calib_prob", 0.0) or 0.0)
+        if bootstrap_allow and symbol_samples <= 0 and market_samples <= 0:
+            return ""
+        if market_samples > symbol_samples:
+            return f"Calibration sample gate for {symbol} ({symbol_samples} symbol / {market_samples} pooled < {min_samples_guarded})"
+        return f"Calibration sample gate for {symbol} ({symbol_samples} < {min_samples_guarded})"
+    calib_prob = float(row.get("calibration_effective_prob", row.get("calib_prob", 0.0)) or 0.0)
     if calib_prob <= 0.0:
         calib_prob = 0.5
     min_calib_prob = max(0.0, min(1.0, float(settings.get("stock_min_calib_prob_live_guarded", 0.58) or 0.58)))
     if calib_prob < min_calib_prob:
         return f"Calibrated confidence gate for {symbol} ({calib_prob:.2f} < {min_calib_prob:.2f})"
     return ""
+
+
+def _market_pooled_calibration_samples(hub_dir: str, settings: Dict[str, Any]) -> int:
+    payload = _load_json_map(_confidence_calibration_path(hub_dir))
+    row: Dict[str, Any] = {}
+    if isinstance(payload.get("stocks", {}), dict):
+        row = dict(payload.get("stocks", {}) or {})
+    elif str(payload.get("market", "") or "").strip().lower() == "stocks":
+        row = payload
+    try:
+        samples = int(float(row.get("samples", 0) or 0))
+    except Exception:
+        samples = 0
+    if samples > 0:
+        return samples
+    try:
+        base_threshold = float(settings.get("stock_score_threshold", 0.2) or 0.2)
+    except Exception:
+        base_threshold = 0.2
+    try:
+        adaptive_min_samples = max(6, int(float(settings.get("adaptive_confidence_min_samples", 18) or 18)))
+    except Exception:
+        adaptive_min_samples = 18
+    try:
+        target_success = max(30.0, min(90.0, float(settings.get("adaptive_confidence_target_success_pct", 55.0) or 55.0)))
+    except Exception:
+        target_success = 55.0
+    built = build_market_confidence_calibration(
+        hub_dir,
+        "stocks",
+        base_threshold=base_threshold,
+        min_samples=adaptive_min_samples,
+        target_success_pct=target_success,
+    )
+    try:
+        return int(float(built.get("samples", 0) or 0))
+    except Exception:
+        return 0
 
 
 def _apply_stock_mtf_confirmation(
@@ -1411,9 +1623,8 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 "market_open": _market_open_now(),
             }
 
-    market_open = _market_open_now()
-    # Keep scanner active outside market hours so watchlist/history are ready at open.
-    # Trade-entry gating remains enforced in stock_trader (market-hours + near-close checks).
+    clock_status = _market_clock_status(settings, api_key, secret)
+    market_open = bool(clock_status.get("market_open", _market_open_now()))
     pause_state = _load_json_map(_scan_pause_path(hub_dir))
     if int(pause_state.get("pause_until_ts", 0) or 0) > 0:
         _save_json_map(
@@ -1425,6 +1636,130 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 "market_open": bool(market_open),
             },
         )
+    rotation_info: Dict[str, Any] = {
+        "active": False,
+        "core_size": 0,
+        "tail_size": 0,
+        "offset": 0,
+        "next_offset": 0,
+        "min_rotate_slots": 0,
+    }
+    if not market_open:
+        next_open = str(clock_status.get("next_open", "") or "").strip()
+        msg = "Market closed; stocks scanner paused"
+        if next_open:
+            msg = f"{msg} until {next_open}"
+        closed_universe = list(prev_candidates or prev_diag.get("candidate_symbols", []) or DEFAULT_STOCK_UNIVERSE)
+        fallback = _cached_scan_fallback(
+            hub_dir,
+            ts_now,
+            msg,
+            universe=list(closed_universe),
+            market_open=False,
+        )
+        if fallback:
+            out = dict(fallback)
+            out.update(
+                {
+                    "state": "READY",
+                    "ai_state": "Market closed (cached)",
+                    "msg": str(out.get("msg", msg) or msg),
+                    "updated_at": ts_now,
+                    "market_open": False,
+                    "market_clock": dict(clock_status),
+                    "hints": [
+                        f"Stocks market is closed; showing cached scan until next open{f' ({next_open})' if next_open else ''}.",
+                        "Scanning/data pulls are paused outside market hours.",
+                    ],
+                    "scan_rotation": dict(rotation_info),
+                    "health": {"data_ok": True, "broker_ok": True, "orders_ok": True, "drift_warning": False},
+                }
+            )
+        else:
+            out = {
+                "state": "READY",
+                "ai_state": "Market closed",
+                "msg": msg,
+                "universe": list(closed_universe),
+                "leaders": [],
+                "all_scores": [],
+                "top_pick": {},
+                "top_chart": [],
+                "top_chart_map": {},
+                "top_chart_source": "",
+                "updated_at": ts_now,
+                "market_open": False,
+                "market_clock": dict(clock_status),
+                "rejected": [],
+                "reject_summary": {"total_rejected_events": 0, "reject_rate_pct": 0.0, "dominant_reason": "market_closed"},
+                "feed_order": [],
+                "hints": [
+                    f"Stocks market is closed; waiting for next open{f' ({next_open})' if next_open else ''}.",
+                    "No stock scans/data pulls are performed while closed.",
+                ],
+                "candidate_churn_pct": 0.0,
+                "leader_churn_pct": 0.0,
+                "leader_mode": "none",
+                "leader_stability_applied": False,
+                "leader_stability_prev_symbol": str(prev_top_symbol),
+                "scan_rotation": dict(rotation_info),
+                "window_policy": {"active": False, "window": "OFF", "score_mult": 1.0, "minutes": 0},
+                "window_policy_hits": 0,
+                "universe_quality": {},
+                "fallback_cached": False,
+                "health": {"data_ok": True, "broker_ok": True, "orders_ok": True, "drift_warning": False},
+                "pdt_note": "Paper mode can still simulate PDT protections; live day-trading may be limited under $25k.",
+            }
+        leaders_out = [row for row in list(out.get("leaders", []) or []) if isinstance(row, dict)]
+        top_pick = out.get("top_pick", {}) if isinstance(out.get("top_pick", {}), dict) else {}
+        opening_plan = _persist_opening_plan(
+            settings,
+            hub_dir,
+            leaders=list(leaders_out),
+            all_scores=[row for row in list(out.get("all_scores", []) or []) if isinstance(row, dict)],
+            adaptive_threshold=float(
+                out.get(
+                    "adaptive_threshold",
+                    settings.get("stock_score_threshold", 0.2),
+                )
+                or settings.get("stock_score_threshold", 0.2)
+                or 0.2
+            ),
+            ts_now=ts_now,
+            market_clock=clock_status,
+            market_open=False,
+            msg=str(out.get("msg", msg) or msg),
+            fallback_cached=bool(out.get("fallback_cached", False)),
+        )
+        out["opening_plan"] = dict(opening_plan)
+        _save_scan_diagnostics(
+            hub_dir,
+            {
+                "ts": ts_now,
+                "state": "READY",
+                "mode": "closed_cache",
+                "market_open": False,
+                "universe_total": int(len(list(out.get("universe", []) or []))),
+                "candidates_total": int(len(list(out.get("universe", []) or []))),
+                "scores_total": int(len(list(out.get("all_scores", []) or []))),
+                "leaders_total": int(len(leaders_out)),
+                "top_symbol": str((top_pick.get("symbol", "") if isinstance(top_pick, dict) else "") or ""),
+                "top_score": float((top_pick.get("score", 0.0) if isinstance(top_pick, dict) else 0.0) or 0.0),
+                "msg": str(out.get("msg", msg) or msg),
+                "reject_summary": dict(out.get("reject_summary", {}) if isinstance(out.get("reject_summary", {}), dict) else {}),
+                "feed_order": list(out.get("feed_order", []) or []),
+                "candidate_symbols": list(out.get("universe", []) or []),
+                "leader_symbols": [str((row or {}).get("symbol", "") or "").strip().upper() for row in leaders_out],
+                "leader_mode": str(out.get("leader_mode", "none") or "none"),
+                "leader_stability_applied": bool(out.get("leader_stability_applied", False)),
+                "leader_stability_prev_symbol": str(out.get("leader_stability_prev_symbol", prev_top_symbol) or prev_top_symbol),
+                "scan_rotation": dict(rotation_info),
+                "candidate_churn_pct": float(out.get("candidate_churn_pct", 0.0) or 0.0),
+                "leader_churn_pct": float(out.get("leader_churn_pct", 0.0) or 0.0),
+                "quality_summary": "Market closed; scanner paused and cached stock scan is displayed.",
+            },
+        )
+        return out
     headers = {"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": secret}
     now_utc = datetime.now(timezone.utc)
     start_utc = now_utc - timedelta(days=10)
@@ -1456,16 +1791,9 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "top_chart_map": {},
             "updated_at": ts_now,
             "market_open": market_open,
+            "market_clock": dict(clock_status),
         }
     max_scan = max(8, int(float(settings.get("stock_scan_max_symbols", 120) or 120)))
-    rotation_info: Dict[str, Any] = {
-        "active": False,
-        "core_size": 0,
-        "tail_size": 0,
-        "offset": 0,
-        "next_offset": 0,
-        "min_rotate_slots": 0,
-    }
     if provider == "twelvedata":
         td_cap = max(1, int(float(settings.get("twelvedata_scan_symbol_cap", 8) or 8)))
         max_scan = min(max_scan, td_cap)
@@ -1609,7 +1937,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     max_price = max(min_price, float(settings.get("stock_max_price", 500.0) or 500.0))
     min_dollar_vol = max(0.0, float(settings.get("stock_min_dollar_volume", 2_000_000.0) or 2_000_000.0))
     max_spread_bps = max(0.0, float(settings.get("stock_max_spread_bps", 40.0) or 40.0))
-    use_daily_when_closed = bool(settings.get("stock_scan_use_daily_when_closed", True))
+    use_daily_when_closed = _setting_bool(settings, "stock_scan_use_daily_when_closed", True)
     closed_max_stale_hours = max(1.0, float(settings.get("stock_closed_max_stale_hours", 96.0) or 96.0))
     min_bars_required = max(8, int(float(settings.get("stock_min_bars_required", 24) or 24)))
 
@@ -1672,18 +2000,25 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             except Exception:
                 pass
 
+    cooldown_enforced = bool(market_open)
     for sym in universe:
         c_row = cooldown_map.get(sym, {}) if isinstance(cooldown_map.get(sym, {}), dict) else {}
-        if int(c_row.get("until", 0) or 0) > now_ts:
-            add_rejected(
-                {
-                    "symbol": sym,
-                    "reason": "cooldown",
-                    "cooldown_until": int(c_row.get("until", 0) or 0),
-                    "source": "cooldown",
-                }
-            )
-            continue
+        cooldown_reason = str(c_row.get("reason", "") or "").strip().lower()
+        if cooldown_enforced and int(c_row.get("until", 0) or 0) > now_ts:
+            # Data-quality failures are often transient (feed timing/shape noise).
+            # Keep probing each cycle instead of hard-blocking symbols for minutes.
+            if cooldown_reason == "data_quality":
+                pass
+            else:
+                add_rejected(
+                    {
+                        "symbol": sym,
+                        "reason": "cooldown",
+                        "cooldown_until": int(c_row.get("until", 0) or 0),
+                        "source": "cooldown",
+                    }
+                )
+                continue
         d = snap.get(sym, {}) if isinstance(snap, dict) else {}
         px = _float(d.get("mid", 0.0), 0.0)
         spread_bps = _float(d.get("spread_bps", 0.0), 0.0)
@@ -1704,19 +2039,23 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         # When closed, we prefer daily bars for better historical coverage.
         if px > 0.0 and (px < min_price or px > max_price):
             add_rejected({"symbol": sym, "reason": "price_band", "price": px})
-            _apply_symbol_cooldown(cooldown_map, sym, "price_band", settings, now_ts)
+            if cooldown_enforced:
+                _apply_symbol_cooldown(cooldown_map, sym, "price_band", settings, now_ts)
             continue
-        if max_spread_bps > 0.0 and spread_bps > 0.0 and spread_bps > max_spread_bps:
+        if market_open and max_spread_bps > 0.0 and spread_bps > 0.0 and spread_bps > max_spread_bps:
             add_rejected({"symbol": sym, "reason": "spread", "spread_bps": spread_bps})
-            _apply_symbol_cooldown(cooldown_map, sym, "spread", settings, now_ts)
+            if cooldown_enforced:
+                _apply_symbol_cooldown(cooldown_map, sym, "spread", settings, now_ts)
             continue
         if market_open and dollar_vol <= 0.0 and (not allow_missing_liquidity):
             add_rejected({"symbol": sym, "reason": "liquidity", "dollar_vol": dollar_vol})
-            _apply_symbol_cooldown(cooldown_map, sym, "liquidity", settings, now_ts)
+            if cooldown_enforced:
+                _apply_symbol_cooldown(cooldown_map, sym, "liquidity", settings, now_ts)
             continue
         if dollar_vol > 0.0 and dollar_vol < min_dollar_vol:
             add_rejected({"symbol": sym, "reason": "liquidity", "dollar_vol": dollar_vol})
-            _apply_symbol_cooldown(cooldown_map, sym, "liquidity", settings, now_ts)
+            if cooldown_enforced:
+                _apply_symbol_cooldown(cooldown_map, sym, "liquidity", settings, now_ts)
             continue
         candidates.append(sym)
     scored: List[Dict[str, Any]] = []
@@ -1764,7 +2103,14 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                     if provider != "twelvedata" and client is not None:
                         try:
                             if market_open:
-                                symbol_bars = client.get_stock_bars(symbol, timeframe="1Hour", limit=160, feed=feed)
+                                symbol_bars = client.get_stock_bars(
+                                    symbol,
+                                    timeframe="1Hour",
+                                    limit=160,
+                                    feed=feed,
+                                    start_iso=start_iso,
+                                    end_iso=end_iso,
+                                )
                                 data_source = "symbol_1h"
                             else:
                                 # Closed-session fallback: prefer richer intraday window if daily bars are sparse.
@@ -1828,7 +2174,8 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                             "requested_end": daily_end_iso if data_source == "symbol_1d" else end_iso,
                         }
                     )
-                    _apply_symbol_cooldown(cooldown_map, symbol, "insufficient_bars", settings, now_ts)
+                    if cooldown_enforced:
+                        _apply_symbol_cooldown(cooldown_map, symbol, "insufficient_bars", settings, now_ts)
                     continue
                 spread_bps = _float((snap.get(symbol, {}) or {}).get("spread_bps", 0.0), 0.0)
                 row = _score_bars(symbol, symbol_bars, spread_bps=spread_bps)
@@ -1867,7 +2214,8 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                             "source": f"{data_source}:{feed}",
                         }
                     )
-                    _apply_symbol_cooldown(cooldown_map, symbol, "data_quality", settings, now_ts)
+                    if cooldown_enforced:
+                        _apply_symbol_cooldown(cooldown_map, symbol, "data_quality", settings, now_ts)
                     row["side"] = "watch"
                     continue
                 if float(row.get("score", -9999.0) or -9999.0) <= -9999.0:
@@ -1879,7 +2227,8 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                             "source": f"{data_source}:{feed}",
                         }
                     )
-                    _apply_symbol_cooldown(cooldown_map, symbol, "insufficient_bars", settings, now_ts)
+                    if cooldown_enforced:
+                        _apply_symbol_cooldown(cooldown_map, symbol, "insufficient_bars", settings, now_ts)
                     continue
                 best_bars_by_symbol[symbol] = list(symbol_bars or [])
                 scored.append(row)
@@ -2020,12 +2369,26 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         for h in quality_hints(quality_report):
             if h not in hints:
                 hints.append(h)
+        if not market_open:
+            hints.append("Off-hours scan mode: spread/cooldown gates relaxed until market open.")
         if bool(rotation_info.get("active", False)):
             hints.append(
                 "Stock universe rotation active: "
                 f"sticky core {int(rotation_info.get('core_size', 0))}, "
                 f"rotating tail {int(rotation_info.get('tail_size', 0))}."
             )
+        opening_plan = _persist_opening_plan(
+            settings,
+            hub_dir,
+            leaders=[],
+            all_scores=[],
+            adaptive_threshold=float(settings.get("stock_score_threshold", 0.2) or 0.2),
+            ts_now=ts_now,
+            market_clock=clock_status,
+            market_open=bool(market_open),
+            msg=str(msg),
+            fallback_cached=False,
+        )
         fallback_allowed = bool(feed_issue_parts or (last_exc is not None))
         fallback = None
         if fallback_allowed:
@@ -2037,6 +2400,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 market_open=bool(market_open),
             )
         if fallback:
+            fallback["opening_plan"] = dict(opening_plan)
             _save_scan_diagnostics(
                 hub_dir,
                 {
@@ -2093,12 +2457,86 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "leader_stability_prev_symbol": str(prev_top_symbol),
             "scan_rotation": dict(rotation_info),
             "universe_quality": quality_report,
+            "opening_plan": dict(opening_plan),
             "health": {"data_ok": False, "broker_ok": True, "orders_ok": True, "drift_warning": drift_warning},
             "pdt_note": "Paper mode can still simulate PDT protections; live day-trading may be limited under $25k.",
         }
 
+    news_weight = max(0.0, min(1.0, float(settings.get("stock_news_event_weight", 0.12) or 0.12)))
+    news_event_context: Dict[str, Any] = {
+        "enabled": bool(settings.get("news_event_enabled", True)),
+        "market": "stocks",
+        "state": "disabled",
+        "state_code": "disabled",
+        "symbols": {},
+        "errors": {},
+    }
+    if scored:
+        try:
+            news_event_context = build_unified_news_event_context(
+                hub_dir=hub_dir,
+                settings=settings,
+                market="stocks",
+                symbols=[str((row or {}).get("symbol", "") or "").strip().upper() for row in scored],
+                now_ts=ts_now,
+            )
+        except Exception as exc:
+            news_event_context = {
+                "enabled": bool(settings.get("news_event_enabled", True)),
+                "market": "stocks",
+                "state": "unavailable",
+                "state_code": "provider_error",
+                "symbols": {},
+                "errors": {"provider": f"{type(exc).__name__}: {exc}"},
+            }
+        news_symbols = (
+            dict(news_event_context.get("symbols", {}))
+            if isinstance(news_event_context.get("symbols", {}), dict)
+            else {}
+        )
+        if news_weight > 0.0 and news_symbols:
+            for row in scored:
+                symbol = str(row.get("symbol", "") or "").strip().upper()
+                if not symbol:
+                    continue
+                n_row = news_symbols.get(symbol, {}) if isinstance(news_symbols.get(symbol, {}), dict) else {}
+                if not n_row:
+                    continue
+                base_score = float(row.get("score", 0.0) or 0.0)
+                n_score = _float(n_row.get("score", 0.0), 0.0)
+                n_conf = _float(n_row.get("confidence", 0.0), 0.0)
+                n_impact = _float(n_row.get("impact", 0.0), 0.0)
+                merged_score = blend_score_with_news(
+                    base_score=base_score,
+                    news_score=n_score,
+                    confidence=n_conf,
+                    impact=n_impact,
+                    weight=news_weight,
+                )
+                row["score_base"] = round(base_score, 6)
+                row["score_news"] = round(float(n_score), 6)
+                row["news_confidence"] = round(float(n_conf), 4)
+                row["news_impact"] = round(float(n_impact), 4)
+                row["news_weight"] = round(float(news_weight), 4)
+                row["news_bias"] = str(n_row.get("bias", "neutral") or "neutral")
+                row["news_headline_count"] = int(n_row.get("headline_count", 0) or 0)
+                row["news_event_risk"] = bool(n_row.get("event_risk", False))
+                row["news_top_headline"] = str(n_row.get("top_headline", "") or "")
+                row["score"] = round(float(merged_score), 6)
+                row["side"] = "long" if float(row["score"]) > 0.0 else "watch"
+                if abs(float(row["score"]) - base_score) >= 0.0001:
+                    _append_reason_parts(
+                        row,
+                        logic=f"News/event {row['news_bias']} bias adjusted conviction",
+                        data=(
+                            f"news {n_score:+.3f} | conf {n_conf:.2f} | "
+                            f"impact {n_impact:.2f} | w {news_weight:.2f}"
+                        ),
+                    )
+
     scored.sort(key=lambda row: float(row.get("score", -9999.0)), reverse=True)
     outcome_map = _compute_outcome_map(hub_dir)
+    market_calibration_samples = _market_pooled_calibration_samples(hub_dir, settings)
     for row in scored:
         sym = str(row.get("symbol", "") or "").strip().upper()
         m = outcome_map.get(sym, {})
@@ -2109,6 +2547,11 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         row["avg_pnl_pct"] = round(ap, 4)
         row["calib_prob"] = _calibrated_prob(float(row.get("score", 0.0) or 0.0), hr, ap)
         row["samples"] = int(smp)
+        row["symbol_samples"] = int(smp)
+        row["market_calibration_samples"] = int(market_calibration_samples)
+        row["calibration_scope"] = "symbol"
+        row["calibration_effective_samples"] = int(smp)
+        row["calibration_effective_prob"] = float(row.get("calib_prob", 0.0) or 0.0)
         quality_score = (
             (100.0 * float(row.get("valid_ratio", 0.0)))
             - (2.0 * float(row.get("spread_bps", 0.0)))
@@ -2140,6 +2583,14 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             )
             row["side"] = "watch"
         elif str(row.get("side", "watch") or "watch").strip().lower() == "long":
+            min_samples_guarded = max(0, int(float(settings.get("stock_min_samples_live_guarded", 5) or 5)))
+            symbol_samples = int(float(row.get("symbol_samples", row.get("samples", 0)) or 0))
+            pooled_samples = int(float(row.get("market_calibration_samples", 0) or 0))
+            if symbol_samples < min_samples_guarded and pooled_samples >= min_samples_guarded:
+                row["samples"] = int(pooled_samples)
+                row["calibration_scope"] = "market_pooled"
+                row["calibration_effective_samples"] = int(pooled_samples)
+                row["calibration_effective_prob"] = float(row.get("calib_prob", 0.0) or 0.0)
             entry_gate_reason = _live_guarded_entry_gate_reason(settings, row)
             if entry_gate_reason:
                 row["eligible_for_entry"] = False
@@ -2157,7 +2608,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     vol_med = (sorted(vols)[len(vols) // 2] if vols else 0.0)
     base_thr = max(0.05, float(settings.get("stock_score_threshold", 0.2) or 0.2))
     volatility_threshold = float(round(base_thr * (1.25 if vol_med >= 0.65 else 1.0), 6))
-    replay_enabled = bool(settings.get("stock_replay_adaptive_enabled", True))
+    replay_enabled = _setting_bool(settings, "stock_replay_adaptive_enabled", True)
     replay_weight = max(0.0, min(1.0, float(settings.get("stock_replay_adaptive_weight", 0.35) or 0.35)))
     replay_step_cap_pct = max(5.0, min(90.0, float(settings.get("stock_replay_adaptive_step_cap_pct", 40.0) or 40.0)))
     replay_target_entries = replay_target_entries_for_market(settings, "stocks")
@@ -2197,7 +2648,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     )[:10]
     leader_mode = "long"
     leaders = list(leaders_long)
-    publish_watch = bool(settings.get("stock_scan_publish_watch_leaders", True))
+    publish_watch = _setting_bool(settings, "stock_scan_publish_watch_leaders", True)
     if (not leaders) and publish_watch and scored:
         watch_n = max(1, min(10, int(float(settings.get("stock_scan_watch_leaders_count", 6) or 6))))
         leaders = sorted(
@@ -2329,6 +2780,22 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "adaptive_threshold_replay_target_entries": int(replay_target_entries),
             "adaptive_threshold_replay_reason": str(replay_reason),
             "adaptive_threshold_replay_enabled": bool(replay_enabled),
+            "news_event_state": str(news_event_context.get("state", "") or ""),
+            "news_event_state_code": str(news_event_context.get("state_code", "") or ""),
+            "news_event_symbols": int(
+                len(
+                    dict(news_event_context.get("symbols", {}))
+                    if isinstance(news_event_context.get("symbols", {}), dict)
+                    else {}
+                )
+            ),
+            "news_event_errors": int(
+                len(
+                    dict(news_event_context.get("errors", {}))
+                    if isinstance(news_event_context.get("errors", {}), dict)
+                    else {}
+                )
+            ),
         },
     )
     hints = _market_hints_from_rejects(
@@ -2341,6 +2808,8 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     for h in quality_hints(quality_report):
         if h not in hints:
             hints.append(h)
+    if not market_open:
+        hints.append("Off-hours scan mode: spread/cooldown gates relaxed until market open.")
     if bool(rotation_info.get("active", False)):
         hints.append(
             "Stock universe rotation active: "
@@ -2352,6 +2821,18 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             f"Adaptive threshold {volatility_threshold:.3f} -> {adaptive_threshold:.3f} "
             f"(replay target {int(replay_target_entries)})."
         )
+    opening_plan = _persist_opening_plan(
+        settings,
+        hub_dir,
+        leaders=[dict(row) for row in leaders[:10] if isinstance(row, dict)],
+        all_scores=[dict(row) for row in scored[:40] if isinstance(row, dict)],
+        adaptive_threshold=float(adaptive_threshold),
+        ts_now=ts_now,
+        market_clock=clock_status,
+        market_open=bool(market_open),
+        msg=str(msg),
+        fallback_cached=False,
+    )
 
     return {
         "state": "READY",
@@ -2375,6 +2856,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "adaptive_threshold_replay_enabled": bool(replay_enabled),
         "updated_at": ts_now,
         "market_open": market_open,
+        "market_clock": dict(clock_status),
         "rejected": rejected[:30],
         "reject_summary": reject_summary,
         "feed_order": list(feed_order),
@@ -2388,6 +2870,8 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "window_policy": dict(window_policy),
         "window_policy_hits": int(window_policy_hits),
         "universe_quality": quality_report,
+        "news_event_context": news_event_context,
+        "opening_plan": dict(opening_plan),
         "health": {"data_ok": True, "broker_ok": True, "orders_ok": True, "drift_warning": drift_warning},
         "pdt_note": "Paper mode can still simulate PDT protections; live day-trading may be limited under $25k.",
     }

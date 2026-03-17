@@ -228,6 +228,7 @@ import logging
 import json
 import uuid
 from app.credential_utils import get_robinhood_creds_from_env, get_robinhood_creds_from_files
+from app.news_event_provider import blend_score_with_news, build_unified_news_event_context
 from app.path_utils import resolve_runtime_paths, resolve_settings_path, read_settings_file, log_once, log_throttled
 
 from nacl.signing import SigningKey
@@ -708,13 +709,74 @@ def _dynamic_coin_manager() -> None:
 		rotation_cooldown_s = max(30.0, float(settings.get("crypto_dynamic_rotation_cooldown_s", 900.0) or 900.0))
 	except Exception:
 		rotation_cooldown_s = 900.0
+	try:
+		news_weight = max(0.0, min(1.0, float(settings.get("crypto_news_event_weight", 0.12) or 0.12)))
+	except Exception:
+		news_weight = 0.12
+
+	news_event_context = {
+		"enabled": bool(settings.get("news_event_enabled", True)),
+		"market": "crypto",
+		"state": "disabled",
+		"state_code": "disabled",
+		"symbols": {},
+		"errors": {},
+	}
+	try:
+		news_event_context = build_unified_news_event_context(
+			hub_dir=HUB_DIR,
+			settings=settings,
+			market="crypto",
+			symbols=pool,
+			now_ts=int(now),
+		)
+	except Exception as exc:
+		news_event_context = {
+			"enabled": bool(settings.get("news_event_enabled", True)),
+			"market": "crypto",
+			"state": "unavailable",
+			"state_code": "provider_error",
+			"symbols": {},
+			"errors": {"provider": f"{type(exc).__name__}: {exc}"},
+		}
+	news_symbols = (
+		dict(news_event_context.get("symbols", {}))
+		if isinstance(news_event_context.get("symbols", {}), dict)
+		else {}
+	)
 
 	ranked = []
 	rejected = []
 	for sym in pool:
 		try:
-			score = _score_coin_projection(sym)
-			ranked.append({"symbol": sym, "score": round(score, 6), "trained": bool(_coin_is_trained(sym))})
+			base_score = _score_coin_projection(sym)
+			n_row = news_symbols.get(sym, {}) if isinstance(news_symbols.get(sym, {}), dict) else {}
+			news_score = float(n_row.get("score", 0.0) or 0.0)
+			news_conf = float(n_row.get("confidence", 0.0) or 0.0)
+			news_impact = float(n_row.get("impact", 0.0) or 0.0)
+			score = blend_score_with_news(
+				base_score=base_score,
+				news_score=news_score,
+				confidence=news_conf,
+				impact=news_impact,
+				weight=news_weight,
+			)
+			ranked.append(
+				{
+					"symbol": sym,
+					"score": round(score, 6),
+					"score_base": round(base_score, 6),
+					"trained": bool(_coin_is_trained(sym)),
+					"news_score": round(news_score, 6),
+					"news_confidence": round(news_conf, 4),
+					"news_impact": round(news_impact, 4),
+					"news_weight": round(news_weight, 4),
+					"news_bias": str(n_row.get("bias", "neutral") or "neutral"),
+					"news_headline_count": int(n_row.get("headline_count", 0) or 0),
+					"news_event_risk": bool(n_row.get("event_risk", False)),
+					"news_top_headline": str(n_row.get("top_headline", "") or ""),
+				}
+			)
 		except Exception as exc:
 			rejected.append({"symbol": sym, "reason": f"{type(exc).__name__}"})
 	ranked.sort(key=lambda r: float(r.get("score", -9999.0) or -9999.0), reverse=True)
@@ -784,15 +846,16 @@ def _dynamic_coin_manager() -> None:
 			"enabled": True,
 			"current_coins": current_coins,
 			"target_coins": target,
-			"changed": bool(changed),
-			"held": sorted(list(held)),
-			"ranked": ranked[:20],
-			"rejected": rejected[:20],
-			"started_trainers": started_trainers,
-			"active_trainers": sorted(list(_dynamic_trainer_procs.keys())),
-			"min_projected_edge_pct": min_edge,
-		},
-	)
+				"changed": bool(changed),
+				"held": sorted(list(held)),
+				"ranked": ranked[:20],
+				"rejected": rejected[:20],
+				"started_trainers": started_trainers,
+				"active_trainers": sorted(list(_dynamic_trainer_procs.keys())),
+				"min_projected_edge_pct": min_edge,
+				"news_event_context": news_event_context,
+			},
+		)
 
 
 # Ensure folders exist for the current configured coins

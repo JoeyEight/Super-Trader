@@ -33,6 +33,14 @@ class TestSettingsSanitize(unittest.TestCase):
             "market_fallback_snapshot_max_age_s": "999999",
             "kucoin_unsupported_cooldown_s": "2",
             "crypto_price_error_log_cooldown_s": "99999",
+            "news_event_enabled": "0",
+            "news_event_refresh_s": "10",
+            "news_event_stale_max_s": "30",
+            "news_event_timeout_s": "999",
+            "news_event_max_symbols_per_market": "9999",
+            "news_event_max_headlines_per_symbol": "0",
+            "stock_news_event_weight": "9",
+            "crypto_news_event_weight": "-1",
             "stock_scan_watch_leaders_count": "999",
             "stock_leader_stability_margin_pct": "999",
             "forex_leader_stability_margin_pct": "-4",
@@ -97,6 +105,14 @@ class TestSettingsSanitize(unittest.TestCase):
         self.assertEqual(float(out["market_fallback_scan_max_age_s"]), 86400.0)
         self.assertEqual(float(out["kucoin_unsupported_cooldown_s"]), 300.0)
         self.assertEqual(float(out["crypto_price_error_log_cooldown_s"]), 3600.0)
+        self.assertFalse(bool(out["news_event_enabled"]))
+        self.assertEqual(float(out["news_event_refresh_s"]), 60.0)
+        self.assertEqual(float(out["news_event_stale_max_s"]), 60.0)
+        self.assertEqual(float(out["news_event_timeout_s"]), 30.0)
+        self.assertEqual(int(out["news_event_max_symbols_per_market"]), 200)
+        self.assertEqual(int(out["news_event_max_headlines_per_symbol"]), 1)
+        self.assertEqual(float(out["stock_news_event_weight"]), 1.0)
+        self.assertEqual(float(out["crypto_news_event_weight"]), 0.0)
         self.assertEqual(int(out["stock_scan_watch_leaders_count"]), 20)
         self.assertEqual(float(out["stock_leader_stability_margin_pct"]), 100.0)
         self.assertEqual(float(out["forex_leader_stability_margin_pct"]), 0.0)
@@ -145,21 +161,50 @@ class TestSettingsSanitize(unittest.TestCase):
         self.assertEqual(int(out.get("stock_symbol_cooldown_minutes", 0) or 0), 15)
         self.assertEqual(int(out.get("stock_symbol_cooldown_min_hits", 0) or 0), 3)
         self.assertEqual(str(out.get("stock_symbol_cooldown_reject_reasons", "")), "data_quality,insufficient_bars")
+        self.assertTrue(bool(out.get("news_event_enabled", False)))
+        self.assertGreaterEqual(
+            float(out.get("news_event_stale_max_s", 0.0) or 0.0),
+            float(out.get("news_event_refresh_s", 0.0) or 0.0),
+        )
 
     def test_market_profile_overrides_are_account_aware(self) -> None:
         overrides = recommend_market_profile_overrides(
             "performance",
             settings={"stock_scan_max_symbols": 240},
+            crypto_status={
+                "equity": "102.78",
+                "buying_power": "84.90",
+                "market_value": "17.88",
+                "open_positions": "0",
+            },
+            crypto_trader={
+                "account": {
+                    "total_account_value": 102.78,
+                    "buying_power": 84.90,
+                    "holdings_sell_value": 17.88,
+                },
+                "positions": [],
+            },
             stock_status={"buying_power": "199748.68", "equity": "99998.68", "open_positions": "2"},
             stock_trader={"account_value_usd": 99998.72, "open_positions": 2},
             forex_status={"buying_power": "97.3632 USD", "nav": 99.956, "open_positions": "1"},
             forex_trader={"account_value_usd": 99.956, "open_positions": 1},
         )
+        self.assertEqual(int(overrides["trade_start_level"]), 2)
+        self.assertGreater(float(overrides["start_allocation_pct"]), 1.0)
+        self.assertGreaterEqual(float(overrides["max_total_exposure_pct"]), 50.0)
+        self.assertGreaterEqual(int(overrides["crypto_dynamic_target_count"]), 9)
+        self.assertLessEqual(float(overrides["crypto_dynamic_scan_interval_s"]), 120.0)
+        self.assertLess(float(overrides["crypto_dynamic_min_projected_edge_pct"]), 0.20)
         self.assertEqual(int(overrides["stock_max_open_positions"]), 8)
         self.assertGreater(float(overrides["stock_trade_notional_usd"]), 200.0)
         self.assertEqual(int(overrides["forex_trade_units"]), 25)
         self.assertEqual(float(overrides["market_max_total_exposure_pct"]), 0.0)
         self.assertEqual(float(overrides["market_bg_stocks_interval_s"]), 20.0)
+        self.assertEqual(int(overrides["stock_max_day_trades"]), 1)
+        self.assertGreater(float(overrides["stock_profit_target_pct"]), 1.0)
+        self.assertTrue(bool(overrides["stock_opening_plan_enabled"]))
+        self.assertLessEqual(float(overrides["forex_score_threshold"]), 0.10)
 
 
 if __name__ == "__main__":

@@ -42,6 +42,14 @@ SANITIZER_DEFAULTS: Dict[str, Any] = {
     "crypto_dynamic_max_new_per_scan": 1,
     "crypto_dynamic_max_trainers": 1,
     "crypto_dynamic_rotation_cooldown_s": 900.0,
+    "news_event_enabled": True,
+    "news_event_refresh_s": 900.0,
+    "news_event_stale_max_s": 21600.0,
+    "news_event_timeout_s": 8.0,
+    "news_event_max_symbols_per_market": 20,
+    "news_event_max_headlines_per_symbol": 6,
+    "stock_news_event_weight": 0.12,
+    "crypto_news_event_weight": 0.12,
     "market_chart_cache_symbols": 8,
     "market_chart_cache_bars": 120,
     "market_fallback_scan_max_age_s": 7200.0,
@@ -52,7 +60,16 @@ SANITIZER_DEFAULTS: Dict[str, Any] = {
     "market_intelligence_interval_s": 180.0,
     "stock_trader_step_interval_s": 18.0,
     "forex_trader_step_interval_s": 12.0,
+    "strategy_lab_hold_steps": 12,
+    "strategy_lab_fee_bps": 2.0,
+    "strategy_lab_monte_carlo_sims": 300,
+    "strategy_lab_seed": 42,
+    "api_bridge_enabled": False,
+    "api_bridge_host": "127.0.0.1",
+    "api_bridge_port": 8787,
+    "api_bridge_webhook_secret": "",
     "runner_crash_lockout_s": 180.0,
+    "runner_prevent_system_sleep": True,
     "stock_scan_max_symbols": 160,
     "stock_min_price": 5.0,
     "stock_max_price": 500.0,
@@ -68,6 +85,9 @@ SANITIZER_DEFAULTS: Dict[str, Any] = {
     "stock_scan_close_score_mult": 0.90,
     "stock_scan_publish_watch_leaders": True,
     "stock_scan_watch_leaders_count": 6,
+    "stock_opening_plan_enabled": True,
+    "stock_opening_plan_minutes": 45,
+    "stock_opening_plan_max_symbols": 8,
     "stock_leader_stability_margin_pct": 10.0,
     "stock_trade_notional_usd": 100.0,
     "stock_max_open_positions": 1,
@@ -169,6 +189,7 @@ SANITIZER_DEFAULTS: Dict[str, Any] = {
     "runtime_alert_market_loop_stale_s": 90.0,
     "runtime_alert_exposure_concentration_warn_pct": 55.0,
     "runtime_alert_exposure_concentration_crit_pct": 75.0,
+    "runtime_alert_exposure_concentration_min_value_usd": 25.0,
     "runtime_api_quota_warn_15m": 4,
     "runtime_api_quota_crit_15m": 10,
     "runtime_incidents_max_lines": 25000,
@@ -208,6 +229,7 @@ SANITIZER_DEFAULTS: Dict[str, Any] = {
     "script_trader": "engines/pt_trader.py",
     "script_markets_runner": "runtime/pt_markets.py",
     "script_autopilot": "runtime/pt_autopilot.py",
+    "script_api_bridge": "runtime/pt_api_bridge.py",
 }
 
 _REMOVED_LEGACY_KEYS = {
@@ -233,12 +255,14 @@ _BOOL_KEYS = {
     "auto_start_trading_when_all_trained",
     "crypto_dynamic_enabled",
     "crypto_dynamic_auto_train",
+    "news_event_enabled",
     "alpaca_paper_mode",
     "oanda_practice_mode",
     "stock_gate_market_hours_scan",
     "stock_scan_use_daily_when_closed",
     "stock_show_rejected_rows",
     "stock_scan_publish_watch_leaders",
+    "stock_opening_plan_enabled",
     "stock_block_entries_on_cached_scan",
     "stock_require_data_quality_ok_for_entries",
     "stock_auto_trade_enabled",
@@ -255,6 +279,8 @@ _BOOL_KEYS = {
     "market_panel_compact_mode",
     "global_drawdown_auto_resume_enabled",
     "global_drawdown_require_manual_ack",
+    "runner_prevent_system_sleep",
+    "api_bridge_enabled",
 }
 
 _FLOAT_BOUNDS: Dict[str, Tuple[float, float, float]] = {
@@ -272,6 +298,11 @@ _FLOAT_BOUNDS: Dict[str, Tuple[float, float, float]] = {
     "crypto_dynamic_scan_interval_s": (300.0, 30.0, 3600.0),
     "crypto_dynamic_min_projected_edge_pct": (0.25, 0.0, 20.0),
     "crypto_dynamic_rotation_cooldown_s": (900.0, 30.0, 86400.0),
+    "news_event_refresh_s": (900.0, 60.0, 86400.0),
+    "news_event_stale_max_s": (21600.0, 60.0, 604800.0),
+    "news_event_timeout_s": (8.0, 3.0, 30.0),
+    "stock_news_event_weight": (0.12, 0.0, 1.0),
+    "crypto_news_event_weight": (0.12, 0.0, 1.0),
     "market_bg_snapshot_interval_s": (15.0, 5.0, 300.0),
     "market_bg_stocks_interval_s": (15.0, 8.0, 300.0),
     "market_bg_forex_interval_s": (10.0, 6.0, 300.0),
@@ -282,6 +313,7 @@ _FLOAT_BOUNDS: Dict[str, Tuple[float, float, float]] = {
     "market_settings_reload_interval_s": (8.0, 1.0, 120.0),
     "stock_trader_step_interval_s": (18.0, 8.0, 300.0),
     "forex_trader_step_interval_s": (12.0, 6.0, 300.0),
+    "strategy_lab_fee_bps": (2.0, 0.0, 500.0),
     "runner_crash_lockout_s": (180.0, 30.0, 3600.0),
     "stock_min_price": (5.0, 0.0, 10000.0),
     "stock_max_price": (500.0, 0.0, 20000.0),
@@ -350,6 +382,7 @@ _FLOAT_BOUNDS: Dict[str, Tuple[float, float, float]] = {
     "runtime_alert_market_loop_stale_s": (90.0, 10.0, 3600.0),
     "runtime_alert_exposure_concentration_warn_pct": (55.0, 0.0, 100.0),
     "runtime_alert_exposure_concentration_crit_pct": (75.0, 0.0, 100.0),
+    "runtime_alert_exposure_concentration_min_value_usd": (25.0, 0.0, 1_000_000_000.0),
     "data_cache_max_age_days": (14.0, 1.0, 365.0),
     "scanner_quality_max_age_days": (14.0, 1.0, 365.0),
     "global_max_drawdown_pct": (0.0, 0.0, 100.0),
@@ -365,12 +398,20 @@ _INT_BOUNDS: Dict[str, Tuple[int, int, int]] = {
     "crypto_dynamic_target_count": (8, 1, 64),
     "crypto_dynamic_max_new_per_scan": (1, 1, 16),
     "crypto_dynamic_max_trainers": (1, 1, 8),
+    "news_event_max_symbols_per_market": (20, 1, 200),
+    "news_event_max_headlines_per_symbol": (6, 1, 20),
     "market_chart_cache_symbols": (8, 2, 32),
     "market_chart_cache_bars": (120, 40, 400),
+    "strategy_lab_hold_steps": (12, 1, 400),
+    "strategy_lab_monte_carlo_sims": (300, 20, 5000),
+    "strategy_lab_seed": (42, 0, 1_000_000_000),
+    "api_bridge_port": (8787, 1, 65535),
     "stock_scan_max_symbols": (160, 8, 2000),
     "stock_scan_open_cooldown_minutes": (15, 0, 120),
     "stock_scan_close_cooldown_minutes": (15, 0, 120),
     "stock_scan_watch_leaders_count": (6, 1, 20),
+    "stock_opening_plan_minutes": (45, 5, 240),
+    "stock_opening_plan_max_symbols": (8, 1, 20),
     "stock_min_bars_required": (24, 8, 10000),
     "stock_max_open_positions": (1, 0, 500),
     "stock_cached_scan_hard_block_age_s": (1800, 30, 172800),
@@ -467,8 +508,11 @@ def _round_to_step(value: float, step: int, minimum: int = 1) -> int:
 def _market_account_metrics(status: Dict[str, Any] | None, trader: Dict[str, Any] | None) -> Dict[str, float]:
     status_row = status if isinstance(status, dict) else {}
     trader_row = trader if isinstance(trader, dict) else {}
+    account_row = trader_row.get("account", {}) if isinstance(trader_row.get("account", {}), dict) else {}
+    trader_positions = trader_row.get("positions", []) if isinstance(trader_row.get("positions", []), list) else []
     account_value = max(
         _as_number(trader_row.get("account_value_usd"), 0.0),
+        _as_number(account_row.get("total_account_value"), 0.0),
         _as_number(status_row.get("equity"), 0.0),
         _as_number(status_row.get("nav"), 0.0),
         _as_number(status_row.get("account_balance"), 0.0),
@@ -476,9 +520,13 @@ def _market_account_metrics(status: Dict[str, Any] | None, trader: Dict[str, Any
     exposure = max(
         0.0,
         _as_number(trader_row.get("exposure_usd"), 0.0),
+        _as_number(account_row.get("holdings_sell_value"), 0.0),
+        _as_number(account_row.get("holdings_buy_value"), 0.0),
         _as_number(status_row.get("market_value"), 0.0),
     )
     buying_power = max(
+        _as_number(trader_row.get("buying_power_usd"), 0.0),
+        _as_number(account_row.get("buying_power"), 0.0),
         _as_number(status_row.get("buying_power"), 0.0),
         _as_number(status_row.get("margin_available"), 0.0),
         _as_number(status_row.get("cash"), 0.0),
@@ -488,6 +536,7 @@ def _market_account_metrics(status: Dict[str, Any] | None, trader: Dict[str, Any
     open_positions = max(
         int(_as_number(status_row.get("open_positions"), 0.0)),
         int(_as_number(trader_row.get("open_positions"), 0.0)),
+        int(len([row for row in trader_positions if isinstance(row, dict)])),
     )
     return {
         "account_value_usd": float(account_value),
@@ -495,6 +544,112 @@ def _market_account_metrics(status: Dict[str, Any] | None, trader: Dict[str, Any
         "exposure_usd": float(exposure),
         "open_positions": int(open_positions),
     }
+
+
+def _recommended_crypto_start_allocation_pct(
+    profile_key: str,
+    account_value_usd: float,
+    buying_power_usd: float,
+    current_open_positions: int,
+) -> float:
+    acct = max(0.0, float(account_value_usd))
+    bp = max(0.0, float(buying_power_usd))
+    cur = max(0, int(current_open_positions))
+    if profile_key == "guarded":
+        if acct >= 10_000.0:
+            base = 0.45
+        elif acct >= 2_500.0:
+            base = 0.55
+        elif acct >= 500.0:
+            base = 0.65
+        else:
+            base = 0.75
+    elif profile_key == "performance":
+        if acct >= 10_000.0:
+            base = 0.95
+        elif acct >= 2_500.0:
+            base = 1.10
+        elif acct >= 500.0:
+            base = 1.25
+        else:
+            base = 1.40
+    else:
+        if acct >= 10_000.0:
+            base = 0.75
+        elif acct >= 2_500.0:
+            base = 0.85
+        elif acct >= 500.0:
+            base = 1.00
+        else:
+            base = 1.15
+    if cur >= 4:
+        base *= 0.90
+    if acct > 0.0 and bp > 0.0 and (bp / acct) < 0.10:
+        base *= 0.75
+    return float(round(max(0.25, min(2.50, base)), 2))
+
+
+def _recommended_crypto_max_total_exposure_pct(
+    profile_key: str,
+    account_value_usd: float,
+    current_open_positions: int,
+) -> float:
+    acct = max(0.0, float(account_value_usd))
+    cur = max(0, int(current_open_positions))
+    if profile_key == "guarded":
+        if acct >= 10_000.0:
+            base = 32.0
+        elif acct >= 2_500.0:
+            base = 36.0
+        else:
+            base = 40.0
+    elif profile_key == "performance":
+        if acct >= 10_000.0:
+            base = 70.0
+        elif acct >= 2_500.0:
+            base = 65.0
+        elif acct >= 500.0:
+            base = 60.0
+        else:
+            base = 55.0
+    else:
+        if acct >= 10_000.0:
+            base = 58.0
+        elif acct >= 2_500.0:
+            base = 52.0
+        else:
+            base = 48.0
+    if cur >= 4:
+        base = min(85.0, base + 5.0)
+    return float(round(max(10.0, min(90.0, base)), 2))
+
+
+def _recommended_crypto_dynamic_target_count(profile_key: str, account_value_usd: float, current_open_positions: int) -> int:
+    acct = max(0.0, float(account_value_usd))
+    cur = max(0, int(current_open_positions))
+    if profile_key == "guarded":
+        base = 6 if acct < 1_000.0 else 7
+    elif profile_key == "performance":
+        if acct >= 10_000.0:
+            base = 14
+        elif acct >= 2_500.0:
+            base = 12
+        elif acct >= 500.0:
+            base = 10
+        else:
+            base = 9
+    else:
+        if acct >= 10_000.0:
+            base = 11
+        elif acct >= 2_500.0:
+            base = 10
+        elif acct >= 500.0:
+            base = 9
+        else:
+            base = 8
+    if cur > 0:
+        base = max(base, cur + 6)
+    return max(4, min(20, int(base)))
 
 
 def _recommended_stock_open_positions(profile_key: str, account_value_usd: float, current_open_positions: int) -> int:
@@ -550,22 +705,31 @@ def _recommended_stock_notional_usd(
     max_pos = max(1, int(max_open_positions))
     cur = max(0, int(current_open_positions))
     pct = {
-        "guarded": 0.0040,
-        "balanced": 0.0080,
-        "performance": 0.0125,
-    }.get(profile_key, 0.0080)
+        "guarded": 0.0075,
+        "balanced": 0.0150,
+        "performance": 0.0300,
+    }.get(profile_key, 0.0150)
     base = acct * pct
     remaining_slots = max(1, max_pos - cur)
     room_per_slot = bp / remaining_slots if bp > 0.0 else acct / max_pos if acct > 0.0 else 0.0
     room_cap_mult = {
         "guarded": 0.20,
-        "balanced": 0.28,
-        "performance": 0.35,
-    }.get(profile_key, 0.28)
+        "balanced": 0.35,
+        "performance": 0.55,
+    }.get(profile_key, 0.35)
     room_cap = room_per_slot * room_cap_mult if room_per_slot > 0.0 else base
-    floor = 25.0 if acct >= 500.0 else 5.0
+    if acct >= 5_000.0:
+        floor = {"guarded": 50.0, "balanced": 75.0, "performance": 100.0}.get(profile_key, 75.0)
+    elif acct >= 1_000.0:
+        floor = {"guarded": 25.0, "balanced": 40.0, "performance": 60.0}.get(profile_key, 40.0)
+    elif acct >= 250.0:
+        floor = {"guarded": 10.0, "balanced": 20.0, "performance": 30.0}.get(profile_key, 20.0)
+    else:
+        floor = {"guarded": 5.0, "balanced": 10.0, "performance": 15.0}.get(profile_key, 10.0)
     raw = max(floor, min(max(base, floor), max(floor, room_cap)))
-    step = 25 if raw >= 250.0 else 10 if raw >= 100.0 else 5
+    if bp > 0.0:
+        raw = min(raw, max(1.0, bp * 0.90))
+    step = 50 if raw >= 500.0 else 25 if raw >= 250.0 else 10 if raw >= 100.0 else 5
     return float(_round_to_step(raw, step, minimum=max(1, step)))
 
 
@@ -629,6 +793,8 @@ def _recommended_forex_trade_units(
 def recommend_market_profile_overrides(
     profile_key: str,
     settings: Dict[str, Any] | None = None,
+    crypto_status: Dict[str, Any] | None = None,
+    crypto_trader: Dict[str, Any] | None = None,
     stock_status: Dict[str, Any] | None = None,
     stock_trader: Dict[str, Any] | None = None,
     forex_status: Dict[str, Any] | None = None,
@@ -638,8 +804,14 @@ def recommend_market_profile_overrides(
     if pkey not in {"guarded", "balanced", "performance"}:
         pkey = "balanced"
     cfg = settings if isinstance(settings, dict) else {}
+    crypto_metrics = _market_account_metrics(crypto_status, crypto_trader)
     stock_metrics = _market_account_metrics(stock_status, stock_trader)
     forex_metrics = _market_account_metrics(forex_status, forex_trader)
+    crypto_dynamic_target_count = _recommended_crypto_dynamic_target_count(
+        pkey,
+        crypto_metrics.get("account_value_usd", 0.0),
+        int(crypto_metrics.get("open_positions", 0) or 0),
+    )
     stock_max_open = _recommended_stock_open_positions(
         pkey,
         stock_metrics.get("account_value_usd", 0.0),
@@ -672,6 +844,28 @@ def recommend_market_profile_overrides(
         stocks_scan_interval_s = max(stocks_scan_interval_s, min_interval_min, min_interval_day, 60.0)
     forex_scan_interval_s = 12.0 if pkey == "guarded" else 10.0 if pkey == "balanced" else 8.0
     overrides: Dict[str, Any] = {
+        "trade_start_level": 4 if pkey == "guarded" else 3 if pkey == "balanced" else 2,
+        "start_allocation_pct": _recommended_crypto_start_allocation_pct(
+            pkey,
+            crypto_metrics.get("account_value_usd", 0.0),
+            crypto_metrics.get("buying_power_usd", 0.0),
+            int(crypto_metrics.get("open_positions", 0) or 0),
+        ),
+        "max_total_exposure_pct": _recommended_crypto_max_total_exposure_pct(
+            pkey,
+            crypto_metrics.get("account_value_usd", 0.0),
+            int(crypto_metrics.get("open_positions", 0) or 0),
+        ),
+        "max_dca_buys_per_24h": 1 if pkey == "guarded" else 2 if pkey == "balanced" else 4,
+        "dca_multiplier": 1.8 if pkey == "guarded" else 2.3 if pkey == "balanced" else 2.9,
+        "trailing_gap_pct": 0.35 if pkey == "guarded" else 0.50 if pkey == "balanced" else 0.75,
+        "crypto_dynamic_scan_interval_s": 300.0 if pkey == "guarded" else 180.0 if pkey == "balanced" else 120.0,
+        "crypto_dynamic_target_count": int(crypto_dynamic_target_count),
+        "crypto_dynamic_min_projected_edge_pct": 0.35 if pkey == "guarded" else 0.25 if pkey == "balanced" else 0.18,
+        "crypto_dynamic_max_new_per_scan": 1 if pkey != "performance" else 2,
+        "crypto_dynamic_max_trainers": 1 if pkey == "guarded" else 2,
+        "crypto_dynamic_rotation_cooldown_s": 1200.0 if pkey == "guarded" else 900.0 if pkey == "balanced" else 600.0,
+        "market_intelligence_interval_s": 240.0 if pkey == "guarded" else 180.0 if pkey == "balanced" else 120.0,
         "stock_trade_notional_usd": _recommended_stock_notional_usd(
             pkey,
             stock_metrics.get("account_value_usd", 0.0),
@@ -696,6 +890,125 @@ def recommend_market_profile_overrides(
     }
     if provider == "twelvedata":
         overrides["stock_scan_max_symbols"] = int(stock_scan_max)
+    if pkey == "guarded":
+        overrides.update(
+            {
+                "stock_auto_trade_enabled": False,
+                "stock_min_bars_required": 32,
+                "stock_min_valid_bars_ratio": 0.82,
+                "stock_scan_open_cooldown_minutes": 20,
+                "stock_scan_close_cooldown_minutes": 20,
+                "stock_scan_open_score_mult": 0.90,
+                "stock_scan_close_score_mult": 0.92,
+                "stock_opening_plan_enabled": True,
+                "stock_opening_plan_minutes": 60,
+                "stock_opening_plan_max_symbols": 6,
+                "stock_score_threshold": 0.30,
+                "stock_replay_adaptive_weight": 0.25,
+                "stock_replay_adaptive_step_cap_pct": 25.0,
+                "stock_max_day_trades": 1,
+                "stock_profit_target_pct": 0.60,
+                "stock_trailing_gap_pct": 0.22,
+                "stock_block_new_entries_near_close": True,
+                "stock_no_new_entries_mins_to_close": 30,
+                "stock_max_signal_age_seconds": 600,
+                "stock_leader_stability_margin_pct": 18.0,
+                "forex_auto_trade_enabled": False,
+                "forex_score_threshold": 0.30,
+                "forex_replay_adaptive_weight": 0.25,
+                "forex_replay_adaptive_step_cap_pct": 25.0,
+                "forex_profit_target_pct": 0.30,
+                "forex_trailing_gap_pct": 0.12,
+                "forex_min_bars_required": 32,
+                "forex_min_valid_bars_ratio": 0.82,
+                "forex_live_guarded_score_mult": 1.25,
+                "forex_min_samples_live_guarded": 12,
+            }
+        )
+    elif pkey == "balanced":
+        overrides.update(
+            {
+                "stock_auto_trade_enabled": True,
+                "stock_min_bars_required": 36,
+                "stock_min_valid_bars_ratio": 0.75,
+                "stock_scan_open_cooldown_minutes": 20,
+                "stock_scan_close_cooldown_minutes": 20,
+                "stock_scan_open_score_mult": 0.90,
+                "stock_scan_close_score_mult": 0.93,
+                "stock_opening_plan_enabled": True,
+                "stock_opening_plan_minutes": 50,
+                "stock_opening_plan_max_symbols": 8,
+                "stock_score_threshold": 0.22,
+                "stock_replay_adaptive_weight": 0.40,
+                "stock_replay_adaptive_step_cap_pct": 35.0,
+                "stock_max_day_trades": 2,
+                "stock_profit_target_pct": 1.00,
+                "stock_trailing_gap_pct": 0.45,
+                "stock_block_new_entries_near_close": True,
+                "stock_no_new_entries_mins_to_close": 35,
+                "stock_max_signal_age_seconds": 1200,
+                "stock_leader_stability_margin_pct": 12.0,
+                "forex_auto_trade_enabled": True,
+                "forex_score_threshold": 0.18,
+                "forex_replay_adaptive_weight": 0.40,
+                "forex_replay_adaptive_step_cap_pct": 40.0,
+                "forex_profit_target_pct": 0.24,
+                "forex_trailing_gap_pct": 0.16,
+                "forex_min_bars_required": 24,
+                "forex_min_valid_bars_ratio": 0.72,
+                "forex_live_guarded_score_mult": 1.12,
+                "forex_min_samples_live_guarded": 8,
+                "replay_target_entries_stocks": 3,
+                "replay_target_entries_forex": 4,
+            }
+        )
+    else:  # performance
+        overrides.update(
+            {
+                "stock_auto_trade_enabled": True,
+                "stock_min_bars_required": 48,
+                "stock_min_valid_bars_ratio": 0.80,
+                "stock_max_stale_hours": 18.0,
+                "stock_scan_open_cooldown_minutes": 25,
+                "stock_scan_close_cooldown_minutes": 30,
+                "stock_scan_open_score_mult": 0.92,
+                "stock_scan_close_score_mult": 0.95,
+                "stock_opening_plan_enabled": True,
+                "stock_opening_plan_minutes": 60,
+                "stock_opening_plan_max_symbols": 10,
+                "stock_score_threshold": 0.26,
+                "stock_replay_adaptive_weight": 0.45,
+                "stock_replay_adaptive_step_cap_pct": 30.0,
+                "stock_max_day_trades": 1,
+                "stock_profit_target_pct": 1.80,
+                "stock_trailing_gap_pct": 0.70,
+                "stock_live_guarded_score_mult": 1.15,
+                "stock_min_calib_prob_live_guarded": 0.56,
+                "stock_min_samples_live_guarded": 8,
+                "stock_max_slippage_bps": 30.0,
+                "stock_block_new_entries_near_close": True,
+                "stock_no_new_entries_mins_to_close": 45,
+                "stock_max_signal_age_seconds": 2700,
+                "stock_leader_stability_margin_pct": 14.0,
+                "forex_auto_trade_enabled": True,
+                "forex_score_threshold": 0.10,
+                "forex_replay_adaptive_weight": 0.60,
+                "forex_replay_adaptive_step_cap_pct": 60.0,
+                "forex_profit_target_pct": 0.18,
+                "forex_trailing_gap_pct": 0.14,
+                "forex_min_bars_required": 16,
+                "forex_min_valid_bars_ratio": 0.62,
+                "forex_max_stale_hours": 10.0,
+                "forex_live_guarded_score_mult": 1.02,
+                "forex_min_calib_prob_live_guarded": 0.48,
+                "forex_min_samples_live_guarded": 4,
+                "forex_max_slippage_bps": 8.0,
+                "forex_leader_stability_margin_pct": 8.0,
+                "forex_cached_scan_entry_size_mult": 0.85,
+                "replay_target_entries_stocks": 2,
+                "replay_target_entries_forex": 6,
+            }
+        )
     if pkey == "performance":
         overrides["market_max_total_exposure_pct"] = 0.0
     return overrides
@@ -808,7 +1121,16 @@ def sanitize_settings(raw: Dict[str, Any] | None, defaults: Dict[str, Any] | Non
         overrides_seq = [str(p).strip() for p in raw_overrides if str(p).strip()]
     else:
         overrides_seq = []
-    allowed_overrides = {"stock_max_open_positions", "forex_max_open_positions"}
+    allowed_overrides = {
+        "stock_max_open_positions",
+        "forex_max_open_positions",
+        "stock_trade_notional_usd",
+        "forex_trade_units",
+        "stock_score_threshold",
+        "forex_score_threshold",
+        "stock_min_samples_live_guarded",
+        "forex_min_samples_live_guarded",
+    }
     out["profile_manual_overrides"] = sorted({k for k in overrides_seq if k in allowed_overrides})
 
     for key in _BOOL_KEYS:
@@ -839,6 +1161,7 @@ def sanitize_settings(raw: Dict[str, Any] | None, defaults: Dict[str, Any] | Non
         "script_trader": str(base.get("script_trader", "engines/pt_trader.py")),
         "script_markets_runner": str(base.get("script_markets_runner", "runtime/pt_markets.py")),
         "script_autopilot": str(base.get("script_autopilot", "runtime/pt_autopilot.py")),
+        "script_api_bridge": str(base.get("script_api_bridge", "runtime/pt_api_bridge.py")),
     }
     for key, dval in script_defaults.items():
         out[key] = _sanitize_script(out.get(key), dval)
@@ -849,6 +1172,10 @@ def sanitize_settings(raw: Dict[str, Any] | None, defaults: Dict[str, Any] | Non
     out["forex_event_cache_stale_max_s"] = max(
         float(out["forex_event_cache_stale_max_s"]),
         float(out["forex_event_cache_refresh_s"]),
+    )
+    out["news_event_stale_max_s"] = max(
+        float(out["news_event_stale_max_s"]),
+        float(out["news_event_refresh_s"]),
     )
     out["runtime_alert_cadence_late_crit_pct"] = max(
         float(out["runtime_alert_cadence_late_crit_pct"]),

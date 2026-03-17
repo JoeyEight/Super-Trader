@@ -19,7 +19,7 @@ import re
 import hashlib
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 if __package__ in (None, ""):
     _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -37,6 +37,7 @@ from matplotlib.transforms import blended_transform_factory
 from app.path_utils import resolve_runtime_paths, resolve_settings_path, read_settings_file, log_once
 from app.runtime_logging import append_jsonl, runtime_event
 from app.rejection_replay import build_rejection_replay_report
+from app.strategy_lab import run_strategy_lab_suite
 from app.operator_notes import (
     append_operator_note_entry,
     ensure_operator_notes_files,
@@ -451,6 +452,14 @@ DEFAULT_SETTINGS = {
     "crypto_dynamic_auto_train": True,
     "crypto_dynamic_max_trainers": 1,
     "crypto_dynamic_rotation_cooldown_s": 900,
+    "news_event_enabled": True,
+    "news_event_refresh_s": 900.0,
+    "news_event_stale_max_s": 21600.0,
+    "news_event_timeout_s": 8.0,
+    "news_event_max_symbols_per_market": 20,
+    "news_event_max_headlines_per_symbol": 6,
+    "stock_news_event_weight": 0.12,
+    "crypto_news_event_weight": 0.12,
     "market_chart_cache_symbols": 8,
     "market_chart_cache_bars": 120,
     "market_table_column_widths": {},
@@ -492,6 +501,9 @@ DEFAULT_SETTINGS = {
     "stock_scan_close_score_mult": 0.90,
     "stock_scan_publish_watch_leaders": True,
     "stock_scan_watch_leaders_count": 6,
+    "stock_opening_plan_enabled": True,
+    "stock_opening_plan_minutes": 45,
+    "stock_opening_plan_max_symbols": 8,
     "stock_leader_stability_margin_pct": 10.0,
     "stock_show_rejected_rows": False,
     "stock_auto_trade_enabled": False,
@@ -1218,7 +1230,37 @@ class CandleChart(ttk.Frame):
         except Exception:
             pass
 
+    def _can_show_legend_tooltip(self) -> bool:
+        try:
+            canvas_w = self.canvas.get_tk_widget()
+        except Exception:
+            return False
+        try:
+            if hasattr(canvas_w, "winfo_ismapped"):
+                if not bool(canvas_w.winfo_ismapped()):
+                    return False
+        except Exception:
+            pass
+        try:
+            if hasattr(canvas_w, "winfo_toplevel"):
+                top = canvas_w.winfo_toplevel()
+            else:
+                top = None
+            if top is not None:
+                if hasattr(top, "state"):
+                    state = str(top.state() or "").strip().lower()
+                    if state in {"iconic", "withdrawn"}:
+                        return False
+                if hasattr(top, "winfo_viewable"):
+                    if not bool(top.winfo_viewable()):
+                        return False
+        except Exception:
+            pass
+        return True
+
     def _schedule_restore_legend_hover(self) -> None:
+        if not self._can_show_legend_tooltip():
+            return
         try:
             if self._legend_hover_restore_after_id:
                 self.after_cancel(self._legend_hover_restore_after_id)
@@ -1234,6 +1276,8 @@ class CandleChart(ttk.Frame):
         self._legend_hover_restore_after_id = None
         handler = getattr(self, "_legend_hover_motion_handler", None)
         if not callable(handler):
+            return
+        if not self._can_show_legend_tooltip():
             return
         try:
             canvas_w = self.canvas.get_tk_widget()
@@ -1364,6 +1408,9 @@ class CandleChart(ttk.Frame):
                         self._legend_hover_last_canvas_xy = None
 
                 def _show_legend_tooltip(x_root: int, y_root: int, text: str):
+                    if not self._can_show_legend_tooltip():
+                        _hide_legend_tooltip(preserve_pointer=True)
+                        return
                     try:
                         tw = getattr(self, "_legend_tooltip_win", None)
                         lbl = getattr(self, "_legend_tooltip_label", None)
@@ -2160,7 +2207,78 @@ class CandleChart(ttk.Frame):
 
 
 # -----------------------------
-# Account Value chart widget
+# Account overview chart widget (canvas renderer)
+# -----------------------------
+
+class CanvasAccountOverviewChart(ttk.Frame):
+    def __init__(
+        self,
+        parent: tk.Widget,
+        render_callback: Callable[[tk.Canvas, int, int], None],
+        export_callback: Optional[Callable[[str], bool]] = None,
+    ):
+        super().__init__(parent)
+        self._render_callback = render_callback
+        self._export_callback = export_callback
+        self._last_size: Tuple[int, int] = (0, 0)
+        self._resize_after_id = None
+
+        self.canvas = tk.Canvas(
+            self,
+            background=DARK_PANEL2,
+            highlightthickness=0,
+            bd=0,
+        )
+        self.canvas.pack(fill="both", expand=True, padx=0, pady=(0, 6))
+        self.canvas.bind("<Configure>", self._on_canvas_configure, add="+")
+
+    def _on_canvas_configure(self, event: tk.Event) -> None:
+        try:
+            w = int(getattr(event, "width", 0) or 0)
+            h = int(getattr(event, "height", 0) or 0)
+            if w <= 1 or h <= 1:
+                return
+            if (w, h) == self._last_size:
+                return
+            self._last_size = (w, h)
+            if self._resize_after_id:
+                try:
+                    self.after_cancel(self._resize_after_id)
+                except Exception:
+                    pass
+            self._resize_after_id = self.after_idle(self.refresh)
+        except Exception:
+            pass
+
+    def refresh(self) -> None:
+        try:
+            if self._resize_after_id:
+                self._resize_after_id = None
+        except Exception:
+            pass
+        try:
+            width = max(320, int(self.canvas.winfo_width() or 0))
+            height = max(220, int(self.canvas.winfo_height() or 0))
+        except Exception:
+            width, height = 720, 320
+        try:
+            self.canvas.delete("all")
+            self.canvas.create_rectangle(0, 0, width, height, fill=DARK_PANEL2, outline=DARK_BORDER)
+            self._render_callback(self.canvas, width, height)
+        except Exception:
+            pass
+
+    def export_png(self, path: str) -> bool:
+        if callable(self._export_callback):
+            try:
+                return bool(self._export_callback(path))
+            except Exception:
+                return False
+        return False
+
+
+# -----------------------------
+# Account Value chart widget (legacy matplotlib renderer)
 # -----------------------------
 
 class AccountValueChart(ttk.Frame):
@@ -2619,6 +2737,13 @@ class PowerTraderHub(tk.Tk):
         self.rejection_replay_path = os.path.join(self.hub_dir, "rejection_replay.json")
         self.runtime_state_path = os.path.join(self.hub_dir, "runtime_state.json")
         self.ui_layout_state_path = os.path.join(self.hub_dir, "ui_layout_state.json")
+        self.strategy_lab_root = os.path.join(self.hub_dir, "strategy_lab")
+        _ensure_dir(self.strategy_lab_root)
+        self.strategy_lab_summary_paths = {
+            "stocks": os.path.join(self.strategy_lab_root, "stocks", "strategy_lab_summary.json"),
+            "forex": os.path.join(self.strategy_lab_root, "forex", "strategy_lab_summary.json"),
+        }
+        self.api_bridge_status_path = os.path.join(self.hub_dir, "api_bridge_status.json")
         self.runner_logs_dir = os.path.join(self.hub_dir, "logs")
         _ensure_dir(self.runner_logs_dir)
         ensure_operator_notes_files(self.hub_dir)
@@ -2668,6 +2793,8 @@ class PowerTraderHub(tk.Tk):
         self._last_market_account_history_value: Dict[str, float] = {}
         self._market_line_caches: Dict[str, Dict[str, Any]] = {}
         self._market_chart_redraw_after: Dict[str, str] = {}
+        self._market_watchlist_last_nonempty: Dict[str, List[Dict[str, Any]]] = {}
+        self._market_thinker_last_good: Dict[str, Dict[str, Any]] = {}
 
         # file written by pt_thinker.py (runner readiness gate used for Start All)
         self.runner_ready_path = os.path.join(self.hub_dir, "runner_ready.json")
@@ -2682,12 +2809,16 @@ class PowerTraderHub(tk.Tk):
         if not isinstance(self._while_you_were_gone_previous, dict):
             self._while_you_were_gone_previous = {}
         self._while_you_were_gone_shown = False
+        self._while_you_were_gone_pending_summary = ""
         self._settings_win: Optional[tk.Toplevel] = None
         self._operator_notes_win: Optional[tk.Toplevel] = None
         self._operator_notes_ui: Dict[str, Any] = {}
         self._replay_win: Optional[tk.Toplevel] = None
         self._replay_ui: Dict[str, Any] = {}
         self._replay_busy = False
+        self._strategy_lab_win: Optional[tk.Toplevel] = None
+        self._strategy_lab_ui: Dict[str, Any] = {}
+        self._strategy_lab_busy = False
         self._manual_order_queue_win: Optional[tk.Toplevel] = None
         self._manual_order_queue_ui: Dict[str, Any] = {}
         self._invalid_credentials_route_done = False
@@ -2772,6 +2903,8 @@ class PowerTraderHub(tk.Tk):
     # ---- forced dark mode ----
 
     def _maybe_show_onboarding_wizard(self) -> None:
+        if not self._is_main_window_visible():
+            return
         try:
             st = _safe_read_json(self.onboarding_state_path) or {}
             if bool(st.get("completed", False)):
@@ -2813,6 +2946,8 @@ class PowerTraderHub(tk.Tk):
         if bool(getattr(self, "_invalid_credentials_route_done", False)):
             return
         self._invalid_credentials_route_done = True
+        if not self._is_main_window_visible():
+            return
         target = self._startup_invalid_credentials_target()
         if not target:
             return
@@ -3159,7 +3294,27 @@ class PowerTraderHub(tk.Tk):
         _safe_write_json(settings_path, self.settings)
 
     def _profile_market_snapshots(self) -> Dict[str, Dict[str, Any]]:
+        crypto_raw = _safe_read_json(getattr(self, "trader_data_path", "")) or {}
+        crypto_account = crypto_raw.get("account", {}) if isinstance(crypto_raw.get("account", {}), dict) else {}
+        crypto_positions = crypto_raw.get("positions", []) if isinstance(crypto_raw.get("positions", []), list) else []
+        crypto_open_positions = int(len([row for row in crypto_positions if isinstance(row, dict)]))
+        crypto_status = {
+            "equity": crypto_account.get("total_account_value", 0.0),
+            "buying_power": crypto_account.get("buying_power", 0.0),
+            "market_value": crypto_account.get("holdings_sell_value", crypto_account.get("holdings_buy_value", 0.0)),
+            "open_positions": crypto_open_positions,
+        }
+        crypto_trader = {
+            "account_value_usd": crypto_account.get("total_account_value", 0.0),
+            "buying_power_usd": crypto_account.get("buying_power", 0.0),
+            "exposure_usd": crypto_account.get("holdings_sell_value", crypto_account.get("holdings_buy_value", 0.0)),
+            "open_positions": crypto_open_positions,
+            "account": crypto_account,
+            "positions": crypto_positions,
+        }
         return {
+            "crypto_status": crypto_status,
+            "crypto_trader": crypto_trader,
             "stock_status": _safe_read_json(self.market_status_paths.get("stocks", "")) or {},
             "stock_trader": _safe_read_json(self.market_trader_paths.get("stocks", "")) or {},
             "forex_status": _safe_read_json(self.market_status_paths.get("forex", "")) or {},
@@ -3178,6 +3333,8 @@ class PowerTraderHub(tk.Tk):
             tuned = recommend_market_profile_overrides(
                 profile_key,
                 settings=settings_source if isinstance(settings_source, dict) else self.settings,
+                crypto_status=snap.get("crypto_status", {}),
+                crypto_trader=snap.get("crypto_trader", {}),
                 stock_status=snap.get("stock_status", {}),
                 stock_trader=snap.get("stock_trader", {}),
                 forex_status=snap.get("forex_status", {}),
@@ -3272,7 +3429,17 @@ class PowerTraderHub(tk.Tk):
             seq = [str(p).strip() for p in raw if str(p).strip()]
         else:
             seq = []
-        return {k for k in seq if k in {"stock_max_open_positions", "forex_max_open_positions"}}
+        allowed = {
+            "stock_max_open_positions",
+            "forex_max_open_positions",
+            "stock_trade_notional_usd",
+            "forex_trade_units",
+            "stock_score_threshold",
+            "forex_score_threshold",
+            "stock_min_samples_live_guarded",
+            "forex_min_samples_live_guarded",
+        }
+        return {k for k in seq if k in allowed}
 
     def _sync_market_max_open_positions_editor(
         self,
@@ -3642,6 +3809,18 @@ class PowerTraderHub(tk.Tk):
         fmt = "%Y-%m-%d %H:%M:%S" if include_date else "%H:%M:%S"
         return time.strftime(fmt, st)
 
+    def _is_main_window_visible(self) -> bool:
+        try:
+            state = str(self.state() or "").strip().lower()
+        except Exception:
+            state = ""
+        if state in {"iconic", "withdrawn"}:
+            return False
+        try:
+            return bool(self.winfo_viewable())
+        except Exception:
+            return True
+
     def _audit_operator_action(self, action: str, details: Optional[Dict[str, Any]] = None) -> None:
         path = str(getattr(self, "operator_audit_path", "") or "").strip()
         if not path:
@@ -3774,6 +3953,7 @@ class PowerTraderHub(tk.Tk):
             ("open_diagnostics", "Run Quick Diagnostics"),
             ("run_rejection_replay", "Run Rejection Replay"),
             ("open_rejection_replay", "Open Rejection Replay Report"),
+            ("open_strategy_lab", "Open Strategy Lab"),
             ("export_snapshot", "Export Snapshot"),
             ("export_runtime", "Export Runtime Summary"),
             ("export_profile", "Export Settings Profile"),
@@ -3843,6 +4023,8 @@ class PowerTraderHub(tk.Tk):
                     self._run_rejection_replay("both")
                 elif cmd == "open_rejection_replay":
                     self._open_rejection_replay_report()
+                elif cmd == "open_strategy_lab":
+                    self._open_strategy_lab_window(self._active_market_key())
                 elif cmd == "export_snapshot":
                     self._export_market_status_snapshot_json()
                 elif cmd == "export_runtime":
@@ -4273,6 +4455,155 @@ class PowerTraderHub(tk.Tk):
         nc = runtime_snapshot.get("notification_center", {}) if isinstance(runtime_snapshot.get("notification_center", {}), dict) else {}
         return nc if isinstance(nc, dict) else {}
 
+    def _notification_action_from_row(self, row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        src = row if isinstance(row, dict) else {}
+        action = src.get("action", {}) if isinstance(src.get("action", {}), dict) else {}
+        setting_key = str(action.get("setting_key", "") or "").strip()
+        kind = str(action.get("kind", "") or "").strip().lower()
+        if not setting_key or kind not in {
+            "int_step_down",
+            "int_scale_down",
+            "int_scale_up",
+            "float_scale_down",
+            "float_scale_up",
+            "bool_set",
+        }:
+            return {}
+        label = str(action.get("label", "") or "").strip() or "Auto-adjust setting"
+        return {
+            "id": str(action.get("id", "") or "").strip(),
+            "label": label,
+            "kind": kind,
+            "setting_key": setting_key,
+            "min": action.get("min"),
+            "step": action.get("step"),
+            "factor": action.get("factor"),
+            "precision": action.get("precision"),
+            "max": action.get("max"),
+            "value": action.get("value"),
+            "reason": str(action.get("reason", "") or "").strip(),
+        }
+
+    def _apply_notification_quick_action(self, row: Optional[Dict[str, Any]]) -> Tuple[bool, str]:
+        action = self._notification_action_from_row(row)
+        if not action:
+            return False, "No safe auto-adjust action is available for the selected notification."
+
+        key = str(action.get("setting_key", "") or "").strip()
+        if not key:
+            return False, "No setting key is attached to this notification action."
+
+        current_raw = self.settings.get(key, DEFAULT_SETTINGS.get(key, 0))
+        minimum_raw = action.get("min", 0)
+        maximum_raw = action.get("max", 0)
+        try:
+            cur = float(current_raw)
+        except Exception:
+            try:
+                cur = float(DEFAULT_SETTINGS.get(key, minimum_raw) or minimum_raw)
+            except Exception:
+                cur = float(minimum_raw or 0.0)
+        try:
+            minimum = float(minimum_raw)
+        except Exception:
+            minimum = 0.0
+        try:
+            maximum = float(maximum_raw)
+        except Exception:
+            maximum = 0.0
+        kind = str(action.get("kind", "") or "").strip().lower()
+        new_value: Any = cur
+
+        if kind == "int_step_down":
+            try:
+                step = max(1, int(float(action.get("step", 1) or 1)))
+            except Exception:
+                step = 1
+            cur_i = max(int(round(minimum)), int(round(cur)))
+            new_i = max(int(round(minimum)), cur_i - step)
+            if new_i >= cur_i:
+                return False, f"{key} is already at the safe minimum ({cur_i})."
+            new_value = int(new_i)
+        elif kind == "int_scale_down":
+            try:
+                factor = float(action.get("factor", 0.9) or 0.9)
+            except Exception:
+                factor = 0.9
+            factor = max(0.1, min(0.99, factor))
+            cur_i = max(int(round(minimum)), int(round(cur)))
+            new_i = max(int(round(minimum)), int(round(cur_i * factor)))
+            if new_i >= cur_i:
+                new_i = max(int(round(minimum)), cur_i - 1)
+            if new_i >= cur_i:
+                return False, f"{key} is already at the safe minimum ({cur_i})."
+            new_value = int(new_i)
+        elif kind == "int_scale_up":
+            try:
+                factor = float(action.get("factor", 1.1) or 1.1)
+            except Exception:
+                factor = 1.1
+            factor = max(1.01, min(5.0, factor))
+            cur_i = int(round(cur))
+            max_i = int(round(maximum)) if maximum > 0 else max(cur_i + 1, int(round(cur_i * factor)))
+            new_i = int(round(cur_i * factor))
+            new_i = max(cur_i + 1, min(max_i, new_i))
+            if new_i <= cur_i:
+                return False, f"{key} is already at the configured maximum ({cur_i})."
+            new_value = int(new_i)
+        elif kind == "float_scale_down":
+            try:
+                factor = float(action.get("factor", 0.9) or 0.9)
+            except Exception:
+                factor = 0.9
+            factor = max(0.1, min(0.99, factor))
+            try:
+                precision = max(0, min(6, int(float(action.get("precision", 4) or 4))))
+            except Exception:
+                precision = 4
+            cur_f = max(minimum, float(cur))
+            new_f = max(minimum, cur_f * factor)
+            new_f = round(new_f, precision)
+            if abs(new_f - cur_f) < (10 ** (-max(1, precision))):
+                step_down = round(10 ** (-max(1, precision)), precision)
+                new_f = round(max(minimum, cur_f - step_down), precision)
+            if new_f >= cur_f:
+                return False, f"{key} is already at the safe minimum ({cur_f:.{precision}f})."
+            new_value = float(new_f)
+        elif kind == "float_scale_up":
+            try:
+                factor = float(action.get("factor", 1.1) or 1.1)
+            except Exception:
+                factor = 1.1
+            factor = max(1.01, min(5.0, factor))
+            try:
+                precision = max(0, min(6, int(float(action.get("precision", 4) or 4))))
+            except Exception:
+                precision = 4
+            cur_f = float(cur)
+            max_f = float(maximum) if maximum > 0 else max(cur_f + (10 ** (-max(1, precision))), cur_f * factor)
+            new_f = round(min(max_f, cur_f * factor), precision)
+            if new_f <= cur_f:
+                return False, f"{key} is already at the configured maximum ({cur_f:.{precision}f})."
+            new_value = float(new_f)
+        elif kind == "bool_set":
+            requested = bool(action.get("value", False))
+            current_bool = bool(current_raw)
+            if current_bool == requested:
+                return False, f"{key} is already set to {requested}."
+            new_value = bool(requested)
+        else:
+            return False, "Unsupported notification action type."
+
+        self.settings[key] = new_value
+        overrides = self._profile_manual_override_keys()
+        overrides.add(key)
+        self.settings["profile_manual_overrides"] = sorted(overrides)
+        try:
+            self._save_settings()
+        except Exception as exc:
+            return False, f"Failed to save adjusted setting ({key}): {type(exc).__name__}: {exc}"
+        return True, f"{key} auto-adjusted from {current_raw} to {new_value}."
+
     def open_notification_center(self, initial_market: Optional[str] = None) -> None:
         requested_initial_market = initial_market if initial_market is not None else "all"
         resolved_initial_market = self._resolve_notification_market_filter(requested_initial_market)
@@ -4329,6 +4660,8 @@ class PowerTraderHub(tk.Tk):
         ttk.Checkbutton(top, text="Auto refresh", variable=auto_var).pack(side="left", padx=(8, 0))
         status_var = tk.StringVar(value="Loading notifications...")
         ttk.Label(top, textvariable=status_var, style="Subtle.TLabel").pack(side="right")
+        action_btn = ttk.Button(top, text="No auto-adjust available", state="disabled")
+        action_btn.pack(side="right", padx=(0, 8))
         ttk.Button(top, text="Refresh", command=lambda: _refresh(False)).pack(side="right", padx=(0, 8))
 
         mid = ttk.Frame(win)
@@ -4356,6 +4689,8 @@ class PowerTraderHub(tk.Tk):
         ui["market_var"] = market_var
         ui["severity_var"] = severity_var
         ui["auto_var"] = auto_var
+        ui["action_btn"] = action_btn
+        rows_by_iid: Dict[str, Dict[str, Any]] = {}
 
         def _set_detail(text: str) -> None:
             try:
@@ -4363,6 +4698,19 @@ class PowerTraderHub(tk.Tk):
                 detail.delete("1.0", "end")
                 detail.insert("end", text)
                 detail.configure(state="disabled")
+            except Exception:
+                pass
+
+        def _set_action_button(row: Optional[Dict[str, Any]]) -> None:
+            action = self._notification_action_from_row(row if isinstance(row, dict) else None)
+            if action:
+                try:
+                    action_btn.configure(text=str(action.get("label", "Auto-adjust setting") or "Auto-adjust setting"), state="normal")
+                except Exception:
+                    pass
+                return
+            try:
+                action_btn.configure(text="No auto-adjust available", state="disabled")
             except Exception:
                 pass
 
@@ -4375,6 +4723,7 @@ class PowerTraderHub(tk.Tk):
                 resolved_market = self._resolve_notification_market_filter(market_filter)
                 items = self._filtered_notification_items(runtime_snapshot, payload, market_filter, severity_filter)
                 tree.delete(*tree.get_children())
+                rows_by_iid.clear()
                 kept = 0
                 for row in items:
                     if not isinstance(row, dict):
@@ -4392,13 +4741,16 @@ class PowerTraderHub(tk.Tk):
                         str(row.get("message", "") or ""),
                     )
                     # Use a UI-local iid so stale payload ids never break refresh.
-                    tree.insert("", "end", iid=f"note_{kept}", values=values)
+                    iid = f"note_{kept}"
+                    tree.insert("", "end", iid=iid, values=values)
+                    rows_by_iid[iid] = row
                     kept += 1
                     if kept >= 300:
                         break
                 status_scope = "All" if resolved_market == "all" else self._market_display_name(resolved_market)
                 status_var.set(f"{kept} notifications shown ({status_scope})")
                 if kept <= 0:
+                    _set_action_button(None)
                     _set_detail(self._notification_empty_state_text(runtime_snapshot, market_filter, severity_filter))
                     return
                 children = tree.get_children()
@@ -4411,6 +4763,7 @@ class PowerTraderHub(tk.Tk):
                     except Exception:
                         pass
             except Exception as exc:
+                _set_action_button(None)
                 status_var.set(f"Notification refresh failed ({type(exc).__name__})")
                 _set_detail(f"Notification refresh failed.\n\n{type(exc).__name__}: {exc}")
 
@@ -4419,11 +4772,15 @@ class PowerTraderHub(tk.Tk):
         def _on_select(_event: Optional[tk.Event] = None) -> None:
             sel = tree.selection()
             if not sel:
+                _set_action_button(None)
                 return
             item = tree.item(sel[0]) if sel else {}
             values = item.get("values", []) if isinstance(item, dict) else []
             if not isinstance(values, (list, tuple)) or len(values) < 6:
+                _set_action_button(None)
                 return
+            selected_row = rows_by_iid.get(str(sel[0]), {})
+            _set_action_button(selected_row)
             msg = (
                 f"Time: {values[0]}\\n"
                 f"Market: {values[1]}\\n"
@@ -4432,7 +4789,34 @@ class PowerTraderHub(tk.Tk):
                 f"Title: {values[4]}\\n\\n"
                 f"{values[5]}"
             )
+            action = self._notification_action_from_row(selected_row)
+            if action:
+                msg += f"\\n\\nAuto-adjust available: {str(action.get('label', 'Auto-adjust setting') or 'Auto-adjust setting')}"
             _set_detail(msg)
+
+        def _apply_selected_action() -> None:
+            sel = tree.selection()
+            if not sel:
+                _set_action_button(None)
+                return
+            row = rows_by_iid.get(str(sel[0]), {})
+            ok, msg = self._apply_notification_quick_action(row)
+            status_var.set(msg)
+            if ok:
+                action = self._notification_action_from_row(row)
+                self._audit_operator_action(
+                    "notification_quick_action_applied",
+                    {
+                        "id": str(action.get("id", "") or ""),
+                        "setting_key": str(action.get("setting_key", "") or ""),
+                        "market": str((row or {}).get("market", "") or ""),
+                    },
+                )
+                _refresh(False)
+            else:
+                _set_detail(msg)
+
+        action_btn.configure(command=_apply_selected_action)
 
         def _tick() -> None:
             try:
@@ -4522,6 +4906,12 @@ class PowerTraderHub(tk.Tk):
             text="Replay",
             style="Compact.TButton",
             command=lambda: self._run_rejection_replay("both"),
+        ).pack(side="right", padx=(8, 0))
+        ttk.Button(
+            right,
+            text="Strategy Lab",
+            style="Compact.TButton",
+            command=lambda: self._open_strategy_lab_window(self._active_market_key()),
         ).pack(side="right", padx=(8, 0))
         ttk.Button(
             right,
@@ -4740,6 +5130,7 @@ class PowerTraderHub(tk.Tk):
         m_file.add_command(label="Run Quick Diagnostics", command=self._run_quick_diagnostics)
         m_file.add_command(label="Run Rejection Replay", command=lambda: self._run_rejection_replay("both"))
         m_file.add_command(label="Open Rejection Replay Report", command=self._open_rejection_replay_report)
+        m_file.add_command(label="Open Strategy Lab", command=lambda: self._open_strategy_lab_window(self._active_market_key()))
         m_file.add_command(label="Export Trade History CSV", command=self._export_trade_history_csv)
         m_file.add_command(label="Export Diagnostics Bundle", command=self._export_diagnostics_bundle)
         m_file.add_separator()
@@ -4800,6 +5191,9 @@ class PowerTraderHub(tk.Tk):
                 os.path.join(self.hub_dir, "walkforward_report.json"),
                 os.path.join(self.hub_dir, "confidence_calibration.json"),
                 os.path.join(self.hub_dir, "shadow_deployment_scorecards.json"),
+                os.path.join(self.hub_dir, "api_bridge_status.json"),
+                os.path.join(self.hub_dir, "strategy_lab", "stocks", "strategy_lab_summary.json"),
+                os.path.join(self.hub_dir, "strategy_lab", "forex", "strategy_lab_summary.json"),
                 os.path.join(self.hub_dir, "notification_center.json"),
                 os.path.join(self.hub_dir, "rejection_replay.json"),
                 os.path.join(self.hub_dir, "rejection_replay_stocks.json"),
@@ -5207,6 +5601,281 @@ class PowerTraderHub(tk.Tk):
         def _close() -> None:
             self._replay_ui = {}
             self._replay_win = None
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        win.protocol("WM_DELETE_WINDOW", _close)
+
+    def _open_in_file_manager(self, path: str) -> None:
+        p = os.path.abspath(str(path or "").strip() or self.project_dir)
+        target = p if os.path.isdir(p) else os.path.dirname(p)
+        if not target:
+            target = self.project_dir
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(target)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", target])
+            else:
+                subprocess.Popen(["xdg-open", target])
+        except Exception as exc:
+            messagebox.showerror("Open failed", f"Could not open:\n{target}\n\n{type(exc).__name__}: {exc}")
+
+    def _load_strategy_lab_summary(self, market: str) -> Dict[str, Any]:
+        m = str(market or "").strip().lower()
+        path = self.strategy_lab_summary_paths.get(m, "")
+        if not path:
+            return {}
+        row = _safe_read_json(path) or {}
+        return row if isinstance(row, dict) else {}
+
+    def _format_strategy_lab_summary_text(self, payload: Dict[str, Any]) -> str:
+        row = payload if isinstance(payload, dict) else {}
+        if not row:
+            return "No Strategy Lab report was found yet."
+        state = str(row.get("state", "N/A") or "N/A").upper()
+        market = str(row.get("market", "n/a") or "n/a").upper()
+        ts = self._format_ui_timestamp(int(row.get("ts", 0) or 0), include_date=True)
+        lines = [f"Strategy Lab [{market}] {state}", f"Updated: {ts}", ""]
+        msg = str(row.get("msg", "") or "").strip()
+        if msg:
+            lines.append(msg)
+            lines.append("")
+        cfg = row.get("config", {}) if isinstance(row.get("config", {}), dict) else {}
+        if cfg:
+            lines.append(
+                "Config: "
+                + f"samples={int(cfg.get('samples', 0) or 0)} "
+                + f"threshold={float(cfg.get('score_threshold', 0.0) or 0.0):.4f} "
+                + f"notional={float(cfg.get('trade_notional', 0.0) or 0.0):.2f} "
+                + f"max_open={int(cfg.get('max_open_positions', 0) or 0)}"
+            )
+        back = row.get("backtest", {}) if isinstance(row.get("backtest", {}), dict) else {}
+        back_metrics = back.get("metrics", {}) if isinstance(back.get("metrics", {}), dict) else {}
+        if back_metrics:
+            lines.append(
+                "Backtest: "
+                + f"ret={float(back_metrics.get('cumulative_return_pct', 0.0) or 0.0):+.2f}% "
+                + f"dd={float(back_metrics.get('max_drawdown_pct', 0.0) or 0.0):+.2f}% "
+                + f"trades={int(back_metrics.get('closed_trades', 0) or 0)} "
+                + f"win={float(back_metrics.get('win_rate_pct', 0.0) or 0.0):.1f}%"
+            )
+        lookahead = back.get("lookahead", {}) if isinstance(back.get("lookahead", {}), dict) else {}
+        if lookahead:
+            lines.append(
+                "No-lookahead: "
+                + f"ok={'YES' if bool(lookahead.get('ok', False)) else 'NO'} "
+                + f"violations={int(lookahead.get('violations', 0) or 0)} "
+                + f"max_future_s={int(lookahead.get('max_future_data_s', 0) or 0)}"
+            )
+        walk = row.get("walkforward", {}) if isinstance(row.get("walkforward", {}), dict) else {}
+        walk_summary = walk.get("summary", {}) if isinstance(walk.get("summary", {}), dict) else {}
+        if walk_summary:
+            lines.append(
+                "Walk-forward: "
+                + f"windows={int(walk.get('windows', 0) or 0)} "
+                + f"avg_ret={float(walk_summary.get('avg_return_pct', 0.0) or 0.0):+.2f}% "
+                + f"avg_win={float(walk_summary.get('avg_win_rate_pct', 0.0) or 0.0):.1f}%"
+            )
+        sweep = row.get("sweep", {}) if isinstance(row.get("sweep", {}), dict) else {}
+        top10 = list(sweep.get("top10", []) or []) if isinstance(sweep.get("top10", []), list) else []
+        if top10 and isinstance(top10[0], dict):
+            best = top10[0]
+            lines.append(
+                "Sweep best: "
+                + f"thr={float(best.get('threshold', 0.0) or 0.0):.4f} "
+                + f"ret={float(best.get('cumulative_return_pct', 0.0) or 0.0):+.2f}% "
+                + f"win={float(best.get('win_rate_pct', 0.0) or 0.0):.1f}%"
+            )
+        mc = row.get("monte_carlo", {}) if isinstance(row.get("monte_carlo", {}), dict) else {}
+        mc_summary = mc.get("summary", {}) if isinstance(mc.get("summary", {}), dict) else {}
+        if mc_summary:
+            lines.append(
+                "Monte Carlo: "
+                + f"sims={int(mc_summary.get('simulations', 0) or 0)} "
+                + f"p05={float(mc_summary.get('p05_final_equity_mult', 0.0) or 0.0):.3f} "
+                + f"p50={float(mc_summary.get('p50_final_equity_mult', 0.0) or 0.0):.3f} "
+                + f"p95={float(mc_summary.get('p95_final_equity_mult', 0.0) or 0.0):.3f}"
+            )
+        artifacts = row.get("artifacts", {}) if isinstance(row.get("artifacts", {}), dict) else {}
+        if artifacts:
+            lines.append("")
+            lines.append("Artifacts:")
+            for key in ("summary", "events", "equity_curve", "walkforward_csv", "sweep_csv", "monte_paths"):
+                val = str(artifacts.get(key, "") or "").strip()
+                if val:
+                    lines.append(f"- {key}: {val}")
+        return "\n".join(lines).strip()
+
+    def _run_strategy_lab(self, market: str = "both", notify: bool = True) -> None:
+        if bool(getattr(self, "_strategy_lab_busy", False)):
+            if notify:
+                messagebox.showinfo("Strategy Lab", "Strategy Lab is already running.")
+            return
+        market_norm = str(market or "both").strip().lower()
+        if market_norm not in {"both", "stocks", "forex"}:
+            market_norm = "both"
+        self._strategy_lab_busy = True
+        self._audit_operator_action("strategy_lab_requested", {"market": market_norm})
+
+        ui = getattr(self, "_strategy_lab_ui", {}) if isinstance(getattr(self, "_strategy_lab_ui", {}), dict) else {}
+        busy_label = ui.get("busy_var")
+        if hasattr(busy_label, "set"):
+            try:
+                busy_label.set("Running Strategy Lab...")
+            except Exception:
+                pass
+        run_btn = ui.get("run_btn")
+        if run_btn is not None:
+            try:
+                run_btn.configure(state="disabled", text="Running...")
+            except Exception:
+                pass
+
+        def _worker() -> None:
+            ok = True
+            err = ""
+            results: Dict[str, Any] = {}
+            targets = ("stocks", "forex") if market_norm == "both" else (market_norm,)
+            try:
+                for mk in targets:
+                    results[mk] = run_strategy_lab_suite(self.hub_dir, mk, settings=self.settings)
+            except Exception as exc:
+                ok = False
+                err = f"{type(exc).__name__}: {exc}"
+
+            def _finish() -> None:
+                self._strategy_lab_busy = False
+                ui_now = getattr(self, "_strategy_lab_ui", {}) if isinstance(getattr(self, "_strategy_lab_ui", {}), dict) else {}
+                run_btn_now = ui_now.get("run_btn")
+                if run_btn_now is not None:
+                    try:
+                        run_btn_now.configure(state="normal", text="Run Strategy Lab")
+                    except Exception:
+                        pass
+                busy_now = ui_now.get("busy_var")
+                if hasattr(busy_now, "set"):
+                    try:
+                        if ok:
+                            busy_now.set(f"Completed {self._format_ui_timestamp(time.time())}")
+                        else:
+                            busy_now.set(f"Failed: {err}")
+                    except Exception:
+                        pass
+                render_fn = ui_now.get("render")
+                if callable(render_fn):
+                    try:
+                        render_fn()
+                    except Exception:
+                        pass
+                if ok:
+                    self._audit_operator_action("strategy_lab_result", {"ok": True, "market": market_norm})
+                    if notify:
+                        messagebox.showinfo(
+                            "Strategy Lab Complete",
+                            "Strategy Lab artifacts were updated.\n\n"
+                            + "\n".join(
+                                [
+                                    str((results.get("stocks", {}) if isinstance(results.get("stocks", {}), dict) else {}).get("artifacts", {}).get("summary", "") or "").strip(),
+                                    str((results.get("forex", {}) if isinstance(results.get("forex", {}), dict) else {}).get("artifacts", {}).get("summary", "") or "").strip(),
+                                ]
+                            ).strip(),
+                        )
+                else:
+                    self._audit_operator_action("strategy_lab_result", {"ok": False, "market": market_norm, "error": err[:200]})
+                    if notify:
+                        messagebox.showerror("Strategy Lab Failed", err or "Unknown Strategy Lab error.")
+
+            try:
+                self.after(0, _finish)
+            except Exception:
+                self._strategy_lab_busy = False
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _open_strategy_lab_window(self, initial_market: str = "stocks") -> None:
+        existing = getattr(self, "_strategy_lab_win", None)
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    existing.deiconify()
+                    existing.lift()
+                    existing.focus_force()
+                    return
+            except Exception:
+                pass
+
+        win = tk.Toplevel(self)
+        self._strategy_lab_win = win
+        win.title("Strategy Lab")
+        win.geometry("980x700")
+        win.minsize(760, 520)
+        win.transient(self)
+
+        top = ttk.Frame(win)
+        top.pack(fill="x", padx=10, pady=(10, 6))
+        ttk.Label(top, text="Market:", foreground=DARK_MUTED).pack(side="left")
+        market_var = tk.StringVar(value=("forex" if str(initial_market).strip().lower() == "forex" else "stocks"))
+        market_combo = ttk.Combobox(top, textvariable=market_var, values=["stocks", "forex"], width=12, state="readonly")
+        market_combo.pack(side="left", padx=(6, 8))
+        busy_var = tk.StringVar(value="Ready")
+        ttk.Label(top, textvariable=busy_var, foreground=DARK_MUTED).pack(side="left", padx=(4, 10), fill="x", expand=True)
+        run_btn = ttk.Button(top, text="Run Strategy Lab", command=lambda: self._run_strategy_lab(str(market_var.get() or "stocks"), notify=False))
+        run_btn.pack(side="right")
+        ttk.Button(top, text="Run Both", command=lambda: self._run_strategy_lab("both", notify=False)).pack(side="right", padx=(0, 8))
+        ttk.Button(
+            top,
+            text="Open Artifacts Folder",
+            command=lambda: self._open_in_file_manager(os.path.join(self.strategy_lab_root, str(market_var.get() or "stocks"))),
+        ).pack(side="right", padx=(0, 8))
+
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        txt = tk.Text(
+            frame,
+            bg=DARK_PANEL,
+            fg=DARK_FG,
+            insertbackground=DARK_FG,
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=DARK_BORDER,
+            highlightcolor=DARK_ACCENT,
+            wrap="word",
+        )
+        ys = ttk.Scrollbar(frame, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=ys.set)
+        txt.grid(row=0, column=0, sticky="nsew")
+        ys.grid(row=0, column=1, sticky="ns")
+
+        def _render() -> None:
+            payload = self._load_strategy_lab_summary(str(market_var.get() or "stocks"))
+            text = self._format_strategy_lab_summary_text(payload)
+            try:
+                txt.configure(state="normal")
+                txt.delete("1.0", "end")
+                txt.insert("1.0", text)
+                txt.configure(state="disabled")
+            except Exception:
+                pass
+
+        market_combo.bind("<<ComboboxSelected>>", lambda _e: _render(), add="+")
+        self._strategy_lab_ui = {
+            "text": txt,
+            "market_var": market_var,
+            "busy_var": busy_var,
+            "run_btn": run_btn,
+            "render": _render,
+        }
+        _render()
+
+        def _close() -> None:
+            self._strategy_lab_ui = {}
+            self._strategy_lab_win = None
             try:
                 win.destroy()
             except Exception:
@@ -5675,6 +6344,13 @@ class PowerTraderHub(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Export failed", f"Could not export {market_key} chart PNG:\n{exc}")
 
+    def _build_crypto_account_chart_widget(self, parent: tk.Widget) -> None:
+        self.account_chart = CanvasAccountOverviewChart(
+            parent,
+            render_callback=self._render_crypto_account_overview,
+            export_callback=self._export_crypto_account_chart_png,
+        )
+        self.account_chart.pack(fill="both", expand=True)
 
     def _build_layout(self) -> None:
         self._build_global_command_bar()
@@ -6781,12 +7457,7 @@ class PowerTraderHub(tk.Tk):
         acct_page = ttk.Frame(self.chart_pages_container)
         self.chart_pages["ACCOUNT"] = acct_page
 
-        self.account_chart = AccountValueChart(
-            acct_page,
-            self.account_value_history_path,
-            self.trade_history_path,
-        )
-        self.account_chart.pack(fill="both", expand=True)
+        self._build_crypto_account_chart_widget(acct_page)
 
         # Coin pages
         self.charts: Dict[str, CandleChart] = {}
@@ -9289,7 +9960,31 @@ class PowerTraderHub(tk.Tk):
             profit_target_pct = float(self.settings.get(profit_key, 0.0) or 0.0)
         except Exception:
             profit_target_pct = 0.0
-        for idx, row in enumerate(list(thinker.get("leaders", []) or [])[: max(1, int(limit or 20))], start=1):
+        scan_rows: List[Dict[str, Any]] = []
+        seen_idents: set[str] = set()
+        take_n = max(1, int(limit or 20))
+        for payload_key in ("leaders", "all_scores"):
+            payload_rows = thinker.get(payload_key, [])
+            if not isinstance(payload_rows, list):
+                continue
+            for row in payload_rows:
+                if not isinstance(row, dict):
+                    continue
+                ident = str(row.get("pair") or row.get("symbol") or "").strip().upper()
+                if (not ident) or (ident in seen_idents):
+                    continue
+                seen_idents.add(ident)
+                scan_rows.append(row)
+                if len(scan_rows) >= take_n:
+                    break
+            if len(scan_rows) >= take_n:
+                break
+        if (not scan_rows) and isinstance(thinker.get("top_pick", {}), dict):
+            top_row = dict(thinker.get("top_pick", {}) or {})
+            ident = str(top_row.get("pair") or top_row.get("symbol") or "").strip().upper()
+            if ident:
+                scan_rows.append(top_row)
+        for idx, row in enumerate(scan_rows[:take_n], start=1):
             if not isinstance(row, dict):
                 continue
             ident = str(row.get("pair") or row.get("symbol") or "").strip().upper()
@@ -10719,8 +11414,20 @@ class PowerTraderHub(tk.Tk):
         meta_var = panel.get("watch_meta_var")
         if canvas is None or meta_var is None:
             return
+        mk = str(market_key or "").strip().lower()
         rows = self._market_watchlist_rows(market_key, thinker_data=thinker_data, limit=20)
-        panel["watch_rows"] = list(rows)
+        using_cached_rows = False
+        if rows:
+            panel["watch_rows"] = list(rows)
+            self._market_watchlist_last_nonempty[mk] = list(rows)
+        else:
+            cached_rows = list(self._market_watchlist_last_nonempty.get(mk, []) or [])
+            if cached_rows:
+                panel["watch_rows"] = list(cached_rows)
+                rows = list(cached_rows)
+                using_cached_rows = True
+            else:
+                panel["watch_rows"] = []
         thinker = thinker_data if isinstance(thinker_data, dict) else {}
         updated_at = thinker.get("updated_at")
         updated_txt = ""
@@ -10734,6 +11441,7 @@ class PowerTraderHub(tk.Tk):
                 (
                     f"Leaders {len(rows)}"
                     + (f" | updated {updated_txt}" if updated_txt else "")
+                    + (" | holding previous watchlist while scanner refreshes" if using_cached_rows else "")
                     + (" | double-click a row to focus the chart" if rows else "")
                 )
                 if rows
@@ -11408,9 +12116,19 @@ class PowerTraderHub(tk.Tk):
         )
 
     def _read_market_thinker_status(self, market_key: str) -> Dict[str, Any]:
-        path = self.market_thinker_paths.get(market_key, "")
+        mk = str(market_key or "").strip().lower()
+        path = self.market_thinker_paths.get(mk, "")
         data = _safe_read_json(path) if path else None
-        return data if isinstance(data, dict) else {}
+        if isinstance(data, dict) and data:
+            try:
+                self._market_thinker_last_good[mk] = dict(data)
+            except Exception:
+                pass
+            return data
+        cached = self._market_thinker_last_good.get(mk, {})
+        if isinstance(cached, dict) and cached:
+            return dict(cached)
+        return {}
 
     def _write_market_thinker_status(self, market_key: str, payload: Dict[str, Any]) -> None:
         path = self.market_thinker_paths.get(market_key, "")
@@ -11421,29 +12139,154 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             pass
 
-    def _render_market_account_overview(
+    def _read_crypto_account_history(self, max_points: int = 250) -> List[Tuple[float, float]]:
+        points: List[Tuple[float, float]] = []
+        path = str(getattr(self, "account_value_history_path", "") or "").strip()
+        if path and os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    for ln in f:
+                        try:
+                            row = json.loads(str(ln or "").strip())
+                        except Exception:
+                            continue
+                        if not isinstance(row, dict):
+                            continue
+                        try:
+                            ts_f = float(row.get("ts", 0.0) or 0.0)
+                            val_f = float(row.get("total_account_value", 0.0) or 0.0)
+                        except Exception:
+                            continue
+                        if (not math.isfinite(ts_f)) or (not math.isfinite(val_f)) or val_f <= 0.0:
+                            continue
+                        points.append((ts_f, val_f))
+            except Exception:
+                points = []
+
+        if points:
+            points.sort(key=lambda row: row[0])
+            dedup: List[Tuple[float, float]] = []
+            for ts_f, val_f in points:
+                if dedup and ts_f == dedup[-1][0]:
+                    dedup[-1] = (ts_f, val_f)
+                else:
+                    dedup.append((ts_f, val_f))
+            points = dedup
+
+        detail = _safe_read_json(self.trader_data_path) or {}
+        acct = detail.get("account", {}) if isinstance(detail.get("account", {}), dict) else {}
+        current_value = self._coerce_float_value(acct.get("total_account_value"))
+        if current_value is not None and current_value > 0.0:
+            current_ts = 0.0
+            for key in ("timestamp", "ts", "updated_at"):
+                try:
+                    cand = float(detail.get(key, 0.0) or 0.0)
+                except Exception:
+                    cand = 0.0
+                if cand > 0.0:
+                    current_ts = cand
+                    break
+            if current_ts <= 0.0:
+                current_ts = float(time.time())
+            if (not points) or (abs(points[-1][0] - current_ts) > 1e-9) or (abs(points[-1][1] - float(current_value)) > 1e-9):
+                points.append((float(current_ts), float(current_value)))
+
+        keep = max(2, min(int(max_points or 250), 250))
+        if len(points) <= keep:
+            return points
+        first_pt = points[0]
+        last_pt = points[-1]
+        mid_points = points[1:-1]
+        keep_mid = max(1, keep - 2)
+        if len(mid_points) <= keep_mid:
+            return [first_pt] + mid_points + [last_pt]
+        bucket_size = len(mid_points) / float(keep_mid)
+        new_mid: List[Tuple[float, float]] = []
+        for idx in range(keep_mid):
+            start = int(idx * bucket_size)
+            end = int((idx + 1) * bucket_size)
+            if end <= start:
+                end = start + 1
+            if start >= len(mid_points):
+                break
+            if end > len(mid_points):
+                end = len(mid_points)
+            bucket = mid_points[start:end]
+            if not bucket:
+                continue
+            avg_ts = sum(row[0] for row in bucket) / float(len(bucket))
+            avg_val = sum(row[1] for row in bucket) / float(len(bucket))
+            new_mid.append((avg_ts, avg_val))
+        return [first_pt] + new_mid + [last_pt]
+
+    def _crypto_portfolio_snapshot(self) -> Dict[str, str]:
+        detail = _safe_read_json(self.trader_data_path) or {}
+        acct = detail.get("account", {}) if isinstance(detail.get("account", {}), dict) else {}
+        positions = detail.get("positions", {}) if isinstance(detail.get("positions", {}), dict) else {}
+        pnl_data = _safe_read_json(self.pnl_ledger_path) or {}
+
+        open_positions = 0
+        for row in positions.values():
+            if not isinstance(row, dict):
+                continue
+            try:
+                qty_f = float(row.get("quantity", 0.0) or 0.0)
+            except Exception:
+                qty_f = 0.0
+            if qty_f > 0.0:
+                open_positions += 1
+
+        total_txt = _fmt_money(acct.get("total_account_value", None))
+        buying_txt = _fmt_money(acct.get("buying_power", None))
+        pit_txt = "N/A"
+        try:
+            pit_txt = f"{float(acct.get('percent_in_trade', 0.0) or 0.0):.2f}%"
+        except Exception:
+            pit_txt = "N/A"
+        realized_txt = _fmt_money(pnl_data.get("total_realized_profit_usd", None))
+
+        return {
+            "total_account_value": total_txt if total_txt != "N/A" else "Pending account link",
+            "buying_power": buying_txt if buying_txt != "N/A" else "Pending account link",
+            "open_positions": str(open_positions),
+            "percent_in_trade": pit_txt,
+            "realized_pnl": realized_txt,
+        }
+
+    def _read_crypto_account_markers(self, limit: int = 200) -> List[Tuple[float, str, str]]:
+        rows: List[Tuple[float, str, str]] = []
+        try:
+            trades = _read_trade_history_jsonl(self.trade_history_path) if self.trade_history_path else []
+        except Exception:
+            trades = []
+        for tr in list(trades or [])[-max(1, int(limit or 200)) :]:
+            if not isinstance(tr, dict):
+                continue
+            side = str(tr.get("side", "") or "").strip().lower()
+            if side not in {"buy", "sell"}:
+                continue
+            try:
+                ts_f = float(tr.get("ts", 0.0) or 0.0)
+            except Exception:
+                ts_f = 0.0
+            if ts_f <= 0.0:
+                continue
+            symbol = str(tr.get("symbol", "") or "").strip().upper()
+            ident = symbol.split("-")[0].split("/")[0].strip() if symbol else ""
+            rows.append((ts_f, ("entry" if side == "buy" else "exit"), ident))
+        return rows
+
+    def _draw_account_overview_canvas(
         self,
-        market_key: str,
         canvas: tk.Canvas,
         width: int,
         height: int,
         *,
-        status_data: Optional[Dict[str, Any]] = None,
-        trader_data: Optional[Dict[str, Any]] = None,
+        points: List[Tuple[float, float]],
+        portfolio: Dict[str, str],
+        marker_rows: Optional[List[Tuple[float, str, str]]] = None,
+        hover_store: Optional[Dict[str, Any]] = None,
     ) -> None:
-        status = status_data if isinstance(status_data, dict) else {}
-        trader = trader_data if isinstance(trader_data, dict) else {}
-        points = self._read_market_account_history(
-            market_key,
-            status_data=status,
-            trader_data=trader,
-            max_points=250,
-        )
-        portfolio = self._market_portfolio_snapshot(
-            market_key,
-            status_data=status,
-            trader_data=trader,
-        )
         canvas.create_text(
             18,
             16,
@@ -11560,42 +12403,17 @@ class PowerTraderHub(tk.Tk):
         if len(pts) >= 4:
             canvas.create_line(*pts, fill=DARK_ACCENT2, width=2, smooth=True)
 
-        marker_rows: List[Tuple[float, str, str]] = []
-        audit_path = os.path.join(self.market_state_dirs.get(market_key, self.hub_dir), "execution_audit.jsonl")
-        try:
-            with open(audit_path, "r", encoding="utf-8") as f:
-                audit_lines = [ln.strip() for ln in f if ln.strip()]
-            for ln in audit_lines[-200:]:
-                try:
-                    row = json.loads(ln)
-                except Exception:
-                    continue
-                event = str(row.get("event", "") or "").strip().lower()
-                if event not in {"entry", "exit"}:
-                    continue
-                try:
-                    ts_f = float(row.get("ts", 0.0) or 0.0)
-                except Exception:
-                    ts_f = 0.0
-                if ts_f <= 0.0:
-                    continue
-                ident = str(row.get("symbol", "") or row.get("instrument", "") or "").strip().upper()
-                marker_rows.append((ts_f, event, ident))
-        except Exception:
-            marker_rows = []
-
         plotted_markers: List[Tuple[float, str, float, float, str]] = []
-        if marker_rows and tss:
-            for ts_f, event, ident in marker_rows:
-                if ts_f < tss[0] or ts_f > tss[-1]:
-                    continue
-                idx = min(range(len(tss)), key=lambda i: abs(float(tss[i]) - ts_f))
-                x = _x_for(idx)
-                y = _y_for(values[idx])
-                color = DARK_ACCENT if event == "entry" else "#FFB347"
-                canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill=color, outline=color)
-                label = f"{ident} {'BUY' if event == 'entry' else 'EXIT'}".strip()
-                plotted_markers.append((ts_f, label, x, y, color))
+        for ts_f, event, ident in list(marker_rows or []):
+            if ts_f < tss[0] or ts_f > tss[-1]:
+                continue
+            idx = min(range(len(tss)), key=lambda i: abs(float(tss[i]) - ts_f))
+            x = _x_for(idx)
+            y = _y_for(values[idx])
+            color = DARK_ACCENT if event == "entry" else "#FFB347"
+            canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill=color, outline=color)
+            label = f"{ident} {'BUY' if event == 'entry' else 'EXIT'}".strip()
+            plotted_markers.append((ts_f, label, x, y, color))
         for _ts_f, label, x, y, color in plotted_markers[-3:]:
             canvas.create_text(
                 x,
@@ -11620,23 +12438,133 @@ class PowerTraderHub(tk.Tk):
                     font=(self._live_log_font.cget("family"), max(8, int(self._live_log_font.cget("size")))),
                 )
 
+        if isinstance(hover_store, dict):
+            hover_store["chart_hover_data"] = {
+                "mode": "account",
+                "plot_left": float(plot_left),
+                "plot_right": float(plot_right),
+                "plot_top": float(plot_top),
+                "plot_bot": float(plot_bot),
+                "x_points": [_x_for(i) for i in range(n)],
+                "rows": [
+                    {
+                        "t": self._format_ui_timestamp(ts_f, include_date=(n > 20)),
+                        "value": float(val_f),
+                    }
+                    for ts_f, val_f in points
+                ],
+                "line_targets": [],
+            }
+
+    def _render_crypto_account_overview(self, canvas: tk.Canvas, width: int, height: int) -> None:
+        points = self._read_crypto_account_history(max_points=250)
+        portfolio = self._crypto_portfolio_snapshot()
+        markers = self._read_crypto_account_markers(limit=220)
+        self._draw_account_overview_canvas(
+            canvas,
+            width,
+            height,
+            points=points,
+            portfolio=portfolio,
+            marker_rows=markers,
+            hover_store=None,
+        )
+
+    def _export_crypto_account_chart_png(self, out_path: str) -> bool:
+        points = self._read_crypto_account_history(max_points=250)
+        if len(points) < 2:
+            return False
+        try:
+            fig = Figure(figsize=(11.0, 5.2), dpi=110)
+            fig.patch.set_facecolor(DARK_BG)
+            ax = fig.add_subplot(111)
+            ax.set_facecolor(DARK_PANEL)
+            ax.tick_params(colors=DARK_FG)
+            for sp in ax.spines.values():
+                sp.set_color(DARK_BORDER)
+            ax.grid(True, color=DARK_BORDER, linewidth=0.7, alpha=0.35)
+
+            values = [round(float(val), 2) for _, val in points]
+            xs = list(range(len(points)))
+            ax.plot(xs, values, linewidth=2.0, color=DARK_ACCENT2)
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _pos: f"${y:,.2f}"))
+
+            n = len(points)
+            tick_idxs = sorted(set([0, int((n - 1) * 0.33), int((n - 1) * 0.66), n - 1]))
+            tick_x = [xs[i] for i in tick_idxs]
+            tick_lbl = [self._format_ui_timestamp(points[i][0], include_date=(n > 20)) for i in tick_idxs]
+            ax.set_xticks(tick_x)
+            ax.set_xticklabels(tick_lbl, fontsize=8, color=DARK_FG)
+
+            portfolio = self._crypto_portfolio_snapshot()
+            ax.set_title(
+                (
+                    f"Account Value | Value {portfolio.get('total_account_value', 'N/A')} | "
+                    f"Buying power {portfolio.get('buying_power', 'N/A')} | Open {portfolio.get('open_positions', '0')}"
+                ),
+                color=DARK_FG,
+            )
+            fig.savefig(out_path, dpi=160, facecolor=fig.get_facecolor())
+            return True
+        except Exception:
+            return False
+
+    def _render_market_account_overview(
+        self,
+        market_key: str,
+        canvas: tk.Canvas,
+        width: int,
+        height: int,
+        *,
+        status_data: Optional[Dict[str, Any]] = None,
+        trader_data: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        status = status_data if isinstance(status_data, dict) else {}
+        trader = trader_data if isinstance(trader_data, dict) else {}
+        points = self._read_market_account_history(
+            market_key,
+            status_data=status,
+            trader_data=trader,
+            max_points=250,
+        )
+        portfolio = self._market_portfolio_snapshot(
+            market_key,
+            status_data=status,
+            trader_data=trader,
+        )
+        marker_rows: List[Tuple[float, str, str]] = []
+        audit_path = os.path.join(self.market_state_dirs.get(market_key, self.hub_dir), "execution_audit.jsonl")
+        try:
+            with open(audit_path, "r", encoding="utf-8") as f:
+                audit_lines = [ln.strip() for ln in f if ln.strip()]
+            for ln in audit_lines[-200:]:
+                try:
+                    row = json.loads(ln)
+                except Exception:
+                    continue
+                event = str(row.get("event", "") or "").strip().lower()
+                if event not in {"entry", "exit"}:
+                    continue
+                try:
+                    ts_f = float(row.get("ts", 0.0) or 0.0)
+                except Exception:
+                    ts_f = 0.0
+                if ts_f <= 0.0:
+                    continue
+                ident = str(row.get("symbol", "") or row.get("instrument", "") or "").strip().upper()
+                marker_rows.append((ts_f, event, ident))
+        except Exception:
+            marker_rows = []
         panel = self.market_panels.get(market_key, {})
-        panel["chart_hover_data"] = {
-            "mode": "account",
-            "plot_left": float(plot_left),
-            "plot_right": float(plot_right),
-            "plot_top": float(plot_top),
-            "plot_bot": float(plot_bot),
-            "x_points": [_x_for(i) for i in range(n)],
-            "rows": [
-                {
-                    "t": self._format_ui_timestamp(ts_f, include_date=(n > 20)),
-                    "value": float(val_f),
-                }
-                for ts_f, val_f in points
-            ],
-            "line_targets": [],
-        }
+        self._draw_account_overview_canvas(
+            canvas,
+            width,
+            height,
+            points=points,
+            portfolio=portfolio,
+            marker_rows=marker_rows,
+            hover_store=panel if isinstance(panel, dict) else None,
+        )
 
     def _render_market_canvas(
         self,
@@ -12869,6 +13797,36 @@ class PowerTraderHub(tk.Tk):
                         f"Session bias: {sess_name} {sess_bias} ({str(fx.get('volatility', 'MED'))})"
                         + (f" | next in {max(1, fx_eta_s // 60)}m" if fx_eta_s > 0 else "")
                     )
+                    event_ctx = thinker_data.get("event_context", {}) if isinstance(thinker_data.get("event_context", {}), dict) else {}
+                    if not event_ctx and isinstance(diag_data.get("event_context", {}), dict):
+                        event_ctx = dict(diag_data.get("event_context", {}) or {})
+                    if event_ctx:
+                        ev_state = str(event_ctx.get("state", "disabled") or "disabled").strip().lower()
+                        ev_code = str(event_ctx.get("state_code", "") or "").strip().lower()
+                        ev_high = int(float(event_ctx.get("upcoming_high", 0) or 0))
+                        ev_med = int(float(event_ctx.get("upcoming_medium", 0) or 0))
+                        ev_next = event_ctx.get("next_event", {}) if isinstance(event_ctx.get("next_event", {}), dict) else {}
+                        ev_next_delta = int(float(ev_next.get("delta_min", 0) or 0)) if ev_next else 0
+                        ev_next_ccy = str(ev_next.get("currency", "") or "").strip().upper() if ev_next else ""
+                        ev_next_impact = str(ev_next.get("impact", "") or "").strip().upper() if ev_next else ""
+                        ev_parts: List[str] = []
+                        if ev_state in {"unavailable", "cooldown", "cached_stale"} or ev_code in {
+                            "html_blocked",
+                            "schema_mismatch",
+                            "http_403_forbidden",
+                            "http_429_rate_limited",
+                        }:
+                            ev_parts.append(f"Event feed: {ev_state.upper()}/{(ev_code or 'n/a').upper()}")
+                        else:
+                            ev_parts.append(f"Event feed: {ev_state.upper()}")
+                        ev_parts.append(f"H={ev_high} M={ev_med}")
+                        if ev_next and ev_next_delta > 0:
+                            ev_parts.append(
+                                f"Next {ev_next_ccy or 'EVT'} {ev_next_impact or ''} in {ev_next_delta}m"
+                            )
+                        ev_line = " | ".join([part for part in ev_parts if str(part or "").strip()])
+                        if ev_line:
+                            sig_txt = (sig_txt + " | " if sig_txt else "") + ev_line
                 if panel.get("signal_var") is not None:
                     panel["signal_var"].set(sig_txt)
             except Exception:
@@ -15241,6 +16199,11 @@ class PowerTraderHub(tk.Tk):
         self._refresh_trade_history()
         self._refresh_manual_sell_feedback()
 
+        try:
+            self._flush_pending_while_you_were_gone_popup()
+        except Exception:
+            pass
+
         # One-time relaunch summary popup: compare current P/L snapshot vs last session.
         try:
             self._maybe_show_while_you_were_gone_popup()
@@ -15490,6 +16453,18 @@ class PowerTraderHub(tk.Tk):
         if self._snapshot_has_values(snap):
             _safe_write_json(self.while_you_were_gone_snapshot_path, snap)
 
+    def _flush_pending_while_you_were_gone_popup(self) -> None:
+        summary = str(getattr(self, "_while_you_were_gone_pending_summary", "") or "").strip()
+        if not summary:
+            return
+        if not self._is_main_window_visible():
+            return
+        self._while_you_were_gone_pending_summary = ""
+        try:
+            messagebox.showinfo("While You Were Gone", summary)
+        except Exception:
+            pass
+
     def _maybe_show_while_you_were_gone_popup(self) -> None:
         if bool(getattr(self, "_while_you_were_gone_shown", False)):
             return
@@ -15504,7 +16479,10 @@ class PowerTraderHub(tk.Tk):
         if self._snapshot_has_values(previous):
             summary = self._format_while_you_were_gone_summary(previous, current)
             if summary:
-                messagebox.showinfo("While You Were Gone", summary)
+                if self._is_main_window_visible():
+                    messagebox.showinfo("While You Were Gone", summary)
+                else:
+                    self._while_you_were_gone_pending_summary = summary
         self._while_you_were_gone_previous = current
         self._persist_while_you_were_gone_snapshot()
 
@@ -17668,12 +18646,7 @@ class PowerTraderHub(tk.Tk):
         acct_page = ttk.Frame(self.chart_pages_container)
         self.chart_pages["ACCOUNT"] = acct_page
 
-        self.account_chart = AccountValueChart(
-            acct_page,
-            self.account_value_history_path,
-            self.trade_history_path,
-        )
-        self.account_chart.pack(fill="both", expand=True)
+        self._build_crypto_account_chart_widget(acct_page)
 
         # Coin pages
         self.charts = {}
@@ -18658,70 +19631,77 @@ class PowerTraderHub(tk.Tk):
                 "candles_limit": 180,
                 "auto_start_scripts": True,
                 "stock_universe_mode": "all_tradable_filtered",
-                "stock_scan_max_symbols": 240,
-                "stock_min_price": 2.0,
+                "stock_scan_max_symbols": 200,
+                "stock_min_price": 3.0,
                 "stock_max_price": 700.0,
-                "stock_min_dollar_volume": 2500000.0,
-                "stock_max_spread_bps": 60.0,
-                "stock_min_bars_required": 16,
-                "stock_min_valid_bars_ratio": 0.6,
-                "stock_max_stale_hours": 10.0,
+                "stock_min_dollar_volume": 5000000.0,
+                "stock_max_spread_bps": 45.0,
+                "stock_min_bars_required": 48,
+                "stock_min_valid_bars_ratio": 0.8,
+                "stock_max_stale_hours": 18.0,
+                "stock_scan_open_cooldown_minutes": 25,
+                "stock_scan_close_cooldown_minutes": 30,
+                "stock_scan_open_score_mult": 0.92,
+                "stock_scan_close_score_mult": 0.95,
                 "stock_show_rejected_rows": False,
-                "stock_scan_watch_leaders_count": 8,
-                "stock_leader_stability_margin_pct": 6.0,
+                "stock_scan_watch_leaders_count": 10,
+                "stock_opening_plan_enabled": True,
+                "stock_opening_plan_minutes": 60,
+                "stock_opening_plan_max_symbols": 10,
+                "stock_leader_stability_margin_pct": 14.0,
                 "stock_auto_trade_enabled": True,
-                "stock_cached_scan_hard_block_age_s": 900,
-                "stock_cached_scan_entry_size_mult": 0.80,
-                "stock_require_reject_rate_max_pct": 96.0,
-                "stock_trade_notional_usd": 200.0,
-                "stock_max_open_positions": 3,
-                "stock_score_threshold": 0.12,
+                "stock_cached_scan_hard_block_age_s": 1800,
+                "stock_cached_scan_entry_size_mult": 0.70,
+                "stock_require_reject_rate_max_pct": 95.0,
+                "stock_trade_notional_usd": 250.0,
+                "stock_max_open_positions": 4,
+                "stock_score_threshold": 0.26,
                 "stock_replay_adaptive_enabled": True,
-                "stock_replay_adaptive_weight": 0.55,
-                "stock_replay_adaptive_step_cap_pct": 60.0,
-                "stock_profit_target_pct": 0.25,
-                "stock_trailing_gap_pct": 0.28,
-                "stock_max_day_trades": 6,
+                "stock_replay_adaptive_weight": 0.45,
+                "stock_replay_adaptive_step_cap_pct": 30.0,
+                "stock_profit_target_pct": 1.80,
+                "stock_trailing_gap_pct": 0.70,
+                "stock_max_day_trades": 1,
                 "stock_max_total_exposure_pct": 55.0,
-                "stock_live_guarded_score_mult": 1.05,
-                "stock_min_calib_prob_live_guarded": 0.50,
-                "stock_max_slippage_bps": 45.0,
+                "stock_live_guarded_score_mult": 1.15,
+                "stock_min_calib_prob_live_guarded": 0.56,
+                "stock_max_slippage_bps": 30.0,
                 "stock_order_retry_count": 3,
-                "stock_max_loss_streak": 5,
-                "stock_loss_streak_size_step_pct": 0.12,
+                "stock_max_loss_streak": 3,
+                "stock_loss_streak_size_step_pct": 0.10,
                 "stock_loss_streak_size_floor_pct": 0.50,
-                "stock_loss_cooldown_seconds": 900,
+                "stock_loss_cooldown_seconds": 2400,
                 "stock_max_daily_loss_usd": 0.0,
                 "stock_max_daily_loss_pct": 0.0,
-                "stock_min_samples_live_guarded": 4,
-                "stock_max_signal_age_seconds": 420,
+                "stock_min_samples_live_guarded": 8,
+                "stock_max_signal_age_seconds": 2700,
                 "stock_reject_drift_warn_pct": 75.0,
-                "stock_block_new_entries_near_close": False,
-                "stock_no_new_entries_mins_to_close": 5,
+                "stock_block_new_entries_near_close": True,
+                "stock_no_new_entries_mins_to_close": 45,
                 "forex_universe_pairs": "",
                 "forex_scan_max_pairs": 36,
                 "forex_max_spread_bps": 12.0,
                 "forex_min_volatility_pct": 0.005,
                 "forex_min_bars_required": 16,
-                "forex_min_valid_bars_ratio": 0.6,
-                "forex_max_stale_hours": 12.0,
+                "forex_min_valid_bars_ratio": 0.62,
+                "forex_max_stale_hours": 10.0,
                 "forex_show_rejected_rows": False,
-                "forex_leader_stability_margin_pct": 6.0,
+                "forex_leader_stability_margin_pct": 8.0,
                 "forex_auto_trade_enabled": True,
                 "forex_cached_scan_hard_block_age_s": 900,
                 "forex_cached_scan_entry_size_mult": 0.85,
                 "forex_require_reject_rate_max_pct": 96.0,
                 "forex_trade_units": 2000,
                 "forex_max_open_positions": 3,
-                "forex_score_threshold": 0.12,
+                "forex_score_threshold": 0.10,
                 "forex_replay_adaptive_enabled": True,
-                "forex_replay_adaptive_weight": 0.55,
+                "forex_replay_adaptive_weight": 0.60,
                 "forex_replay_adaptive_step_cap_pct": 60.0,
-                "forex_profit_target_pct": 0.20,
-                "forex_trailing_gap_pct": 0.18,
+                "forex_profit_target_pct": 0.18,
+                "forex_trailing_gap_pct": 0.14,
                 "forex_max_total_exposure_pct": 55.0,
                 "forex_session_mode": "all",
-                "forex_live_guarded_score_mult": 1.05,
+                "forex_live_guarded_score_mult": 1.02,
                 "forex_min_calib_prob_live_guarded": 0.48,
                 "forex_max_slippage_bps": 8.0,
                 "forex_order_retry_count": 3,
@@ -18734,7 +19714,7 @@ class PowerTraderHub(tk.Tk):
                 "forex_min_samples_live_guarded": 4,
                 "forex_max_signal_age_seconds": 420,
                 "forex_reject_drift_warn_pct": 75.0,
-                "market_max_total_exposure_pct": 60.0,
+                "market_max_total_exposure_pct": 0.0,
                 "market_chart_cache_symbols": 12,
                 "market_chart_cache_bars": 180,
                 "market_fallback_scan_max_age_s": 5400.0,
