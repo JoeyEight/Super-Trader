@@ -153,6 +153,7 @@ class OandaBrokerClient:
             nav_f = self._as_float(nav, 0.0)
             pl_f = self._as_float(pl, 0.0)
             margin_available_f = self._as_float(acct.get("marginAvailable", 0.0), 0.0)
+            margin_rate_f = self._as_float(acct.get("marginRate", 0.0), 0.0)
             return {
                 "state": "READY",
                 "ai_state": "Broker linked",
@@ -166,6 +167,7 @@ class OandaBrokerClient:
                 "nav": nav_f,
                 "pl_value": pl_f,
                 "margin_available": margin_available_f,
+                "margin_rate": margin_rate_f,
                 "currency": currency,
             }
         except urllib.error.HTTPError as exc:
@@ -182,6 +184,7 @@ class OandaBrokerClient:
                 "nav": 0.0,
                 "pl_value": 0.0,
                 "margin_available": 0.0,
+                "margin_rate": 0.0,
                 "currency": "",
             }
         except urllib.error.URLError as exc:
@@ -198,6 +201,7 @@ class OandaBrokerClient:
                 "nav": 0.0,
                 "pl_value": 0.0,
                 "margin_available": 0.0,
+                "margin_rate": 0.0,
                 "currency": "",
             }
         except Exception as exc:
@@ -214,6 +218,7 @@ class OandaBrokerClient:
                 "nav": 0.0,
                 "pl_value": 0.0,
                 "margin_available": 0.0,
+                "margin_rate": 0.0,
                 "currency": "",
             }
 

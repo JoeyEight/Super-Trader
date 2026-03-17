@@ -521,6 +521,15 @@ DEFAULT_SETTINGS = {
     "stock_profit_target_pct": 0.35,
     "stock_trailing_gap_pct": 0.2,
     "stock_max_day_trades": 3,
+    "stock_min_hold_minutes": 1440,
+    "stock_same_day_exit_exception_enabled": True,
+    "stock_same_day_exception_min_hold_minutes": 120,
+    "stock_same_day_exception_min_pnl_pct": 2.5,
+    "stock_same_day_exception_min_pullback_pct": 0.9,
+    "stock_same_day_exception_require_score_flip": True,
+    "stock_same_day_exception_score_floor_mult": 0.75,
+    "stock_pdt_equity_threshold_usd": 25_000.0,
+    "stock_pdt_max_day_trades_rolling_5d": 3,
     "stock_max_position_usd_per_symbol": 0.0,
     "stock_max_total_exposure_pct": 0.0,
     "stock_block_new_entries_near_close": True,
@@ -3512,6 +3521,7 @@ class PowerTraderHub(tk.Tk):
         holdings_value = self._coerce_float_value(status.get("market_value"))
         margin_available_value = self._coerce_float_value(status.get("margin_available"))
         margin_used_value: Optional[float] = None
+        notional_exposure_value: Optional[float] = None
         if mk == "forex":
             raw_positions = list(status.get("raw_positions", []) or []) if isinstance(status.get("raw_positions", []), list) else []
             margin_used_total = 0.0
@@ -3528,7 +3538,28 @@ class PowerTraderHub(tk.Tk):
                 margin_used_value = float(margin_used_total)
             if margin_used_value is None and account_value is not None and margin_available_value is not None:
                 margin_used_value = max(0.0, float(account_value - margin_available_value))
-            holdings_value = margin_used_value
+            notional_exposure_value = self._coerce_float_value(trader.get("exposure_usd"))
+            if notional_exposure_value is None:
+                raw_value_map = trader.get("position_values_usd", {})
+                if isinstance(raw_value_map, dict):
+                    total_notional = 0.0
+                    seen_notional = False
+                    for raw_val in raw_value_map.values():
+                        try:
+                            v = float(raw_val or 0.0)
+                        except Exception:
+                            v = 0.0
+                        if v > 0.0:
+                            total_notional += v
+                            seen_notional = True
+                    if seen_notional:
+                        notional_exposure_value = total_notional
+            if notional_exposure_value is None:
+                notional_exposure_value = margin_used_value
+            # Forex "invested" in broker terms is margin collateral, not notional.
+            # Keep notional as context in percent_in_trade while surfacing margin used
+            # to match OANDA account-level reconciliation.
+            holdings_value = margin_used_value if margin_used_value is not None else notional_exposure_value
         if holdings_value is None:
             holdings_value = self._coerce_float_value(trader.get("exposure_usd"))
         if holdings_value is None and mk == "stocks":
@@ -3589,13 +3620,31 @@ class PowerTraderHub(tk.Tk):
         percent_in_trade_text = "N/A"
         if account_value is not None:
             if mk == "forex":
-                exposure_value = margin_used_value if margin_used_value is not None else holdings_value
+                margin_pct: Optional[float] = None
+                notional_pct: Optional[float] = None
+                if margin_used_value is not None and float(account_value) > 0.0:
+                    margin_pct = (float(margin_used_value) / float(account_value)) * 100.0
+                exposure_value = (
+                    notional_exposure_value
+                    if notional_exposure_value is not None
+                    else (holdings_value if holdings_value is not None else self._coerce_float_value(trader.get("exposure_usd")))
+                )
+                if exposure_value is not None and float(account_value) > 0.0:
+                    notional_pct = (float(exposure_value) / float(account_value)) * 100.0
+                if margin_pct is not None:
+                    percent_in_trade_text = f"{margin_pct:.2f}%"
+                    if notional_pct is not None and abs(float(notional_pct) - float(margin_pct)) >= 0.01:
+                        percent_in_trade_text = f"{percent_in_trade_text} (notional {notional_pct:.2f}%)"
+                elif notional_pct is not None:
+                    percent_in_trade_text = f"{notional_pct:.2f}%"
+                else:
+                    percent_in_trade_text = "0.00%"
             else:
                 exposure_value = holdings_value if holdings_value is not None else self._coerce_float_value(trader.get("exposure_usd"))
-            if exposure_value is not None and float(account_value) > 0.0:
-                percent_in_trade_text = f"{(float(exposure_value) / float(account_value)) * 100.0:.2f}%"
-            else:
-                percent_in_trade_text = "0.00%"
+                if exposure_value is not None and float(account_value) > 0.0:
+                    percent_in_trade_text = f"{(float(exposure_value) / float(account_value)) * 100.0:.2f}%"
+                else:
+                    percent_in_trade_text = "0.00%"
 
         realized_raw = trader.get("realized_pnl")
         if realized_raw in (None, "", "N/A"):
@@ -3849,6 +3898,15 @@ class PowerTraderHub(tk.Tk):
             "stock_replay_adaptive_step_cap_pct": 40.0,
             "stock_profit_target_pct": 0.35,
             "stock_trailing_gap_pct": 0.20,
+            "stock_min_hold_minutes": 2880,
+            "stock_same_day_exit_exception_enabled": True,
+            "stock_same_day_exception_min_hold_minutes": 180,
+            "stock_same_day_exception_min_pnl_pct": 3.0,
+            "stock_same_day_exception_min_pullback_pct": 1.0,
+            "stock_same_day_exception_require_score_flip": True,
+            "stock_same_day_exception_score_floor_mult": 0.90,
+            "stock_pdt_equity_threshold_usd": 25000.0,
+            "stock_pdt_max_day_trades_rolling_5d": 3,
             "stock_max_total_exposure_pct": 0.0,
             "forex_trade_units": 1000,
             "forex_max_open_positions": 1,
@@ -9172,6 +9230,7 @@ class PowerTraderHub(tk.Tk):
                 "side",
                 "units",
                 "value",
+                "notional_usd",
                 "unrealized_usd",
                 "realized_usd",
                 "avg_cost",
@@ -9185,6 +9244,7 @@ class PowerTraderHub(tk.Tk):
                 "side": "Side",
                 "units": "Units",
                 "value": "Value",
+                "notional_usd": "Notional $",
                 "unrealized_usd": "Unrlzd $",
                 "realized_usd": "Rlz $",
                 "avg_cost": "Avg Cost",
@@ -9198,6 +9258,7 @@ class PowerTraderHub(tk.Tk):
                 "side": 78,
                 "units": 88,
                 "value": 112,
+                "notional_usd": 112,
                 "unrealized_usd": 112,
                 "realized_usd": 104,
                 "avg_cost": 100,
@@ -9206,7 +9267,7 @@ class PowerTraderHub(tk.Tk):
                 "financing": 112,
                 "trades": 82,
             },
-            "numeric_cols": {"units", "value", "unrealized_usd", "realized_usd", "avg_cost", "ask_price", "margin", "financing", "trades"},
+            "numeric_cols": {"units", "value", "notional_usd", "unrealized_usd", "realized_usd", "avg_cost", "ask_price", "margin", "financing", "trades"},
             "center_cols": {"side"},
         }
 
@@ -9281,10 +9342,12 @@ class PowerTraderHub(tk.Tk):
         market_key: str,
         raw_positions: Optional[List[Dict[str, Any]]] = None,
         status_data: Optional[Dict[str, Any]] = None,
+        trader_data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         mk = str(market_key or "").strip().lower()
         rows = list(raw_positions or [])
         status = status_data if isinstance(status_data, dict) else {}
+        trader = trader_data if isinstance(trader_data, dict) else {}
         schema = self._market_position_schema(mk)
         quote_map = self._market_quote_map(mk)
         display_rows: List[Dict[str, str]] = []
@@ -9372,8 +9435,44 @@ class PowerTraderHub(tk.Tk):
                 summary = "No open positions."
         else:
             total_margin = 0.0
+            total_value_usd = 0.0
             total_upl = 0.0
             acct_ccy = str(status.get("currency", "USD") or "USD").strip().upper() or "USD"
+            raw_position_values = trader.get("position_values_usd", {}) if isinstance(trader.get("position_values_usd", {}), dict) else {}
+            position_values_usd: Dict[str, float] = {}
+            for raw_key, raw_val in raw_position_values.items():
+                pair_key = str(raw_key or "").strip().upper()
+                if not pair_key:
+                    continue
+                try:
+                    notional_val = float(raw_val or 0.0)
+                except Exception:
+                    notional_val = 0.0
+                if notional_val > 0.0:
+                    position_values_usd[pair_key] = notional_val
+
+            def _quote_to_acct_rate(quote_ccy: str) -> float:
+                qc = str(quote_ccy or "").strip().upper()
+                if not qc:
+                    return 0.0
+                if qc == acct_ccy:
+                    return 1.0
+                direct = quote_map.get(f"{qc}_{acct_ccy}", {}) if isinstance(quote_map.get(f"{qc}_{acct_ccy}", {}), dict) else {}
+                inverse = quote_map.get(f"{acct_ccy}_{qc}", {}) if isinstance(quote_map.get(f"{acct_ccy}_{qc}", {}), dict) else {}
+                try:
+                    direct_last = float(direct.get("last", 0.0) or 0.0)
+                except Exception:
+                    direct_last = 0.0
+                if direct_last > 0.0:
+                    return direct_last
+                try:
+                    inverse_last = float(inverse.get("last", 0.0) or 0.0)
+                except Exception:
+                    inverse_last = 0.0
+                if inverse_last > 0.0:
+                    return 1.0 / inverse_last
+                return 0.0
+
             for raw_row in rows:
                 if not isinstance(raw_row, dict):
                     continue
@@ -9402,9 +9501,14 @@ class PowerTraderHub(tk.Tk):
                 except Exception:
                     realized_f = 0.0
                 trade_ids = list((leg or {}).get("tradeIDs", []) or []) if isinstance((leg or {}).get("tradeIDs", []), list) else []
+                base_ccy = ""
                 quote_ccy = ""
                 if "_" in pair:
-                    quote_ccy = str(pair.split("_", 1)[1] or "").strip().upper()
+                    try:
+                        base_ccy, quote_ccy = [str(part or "").strip().upper() for part in pair.split("_", 1)]
+                    except Exception:
+                        base_ccy = ""
+                        quote_ccy = ""
                 quote_row = quote_map.get(pair, {}) if isinstance(quote_map.get(pair, {}), dict) else {}
                 try:
                     last_price_f = float(quote_row.get("last", 0.0) or 0.0)
@@ -9414,16 +9518,34 @@ class PowerTraderHub(tk.Tk):
                 total_margin += float(margin_f)
                 total_upl += float(upl_f)
                 mark_price_f = last_price_f if last_price_f > 0.0 else avg_price_f
-                notional_f = abs(units_f) * mark_price_f if (units_f > 0.0 and mark_price_f > 0.0) else 0.0
-                value_txt = self._market_fmt_num(notional_f, 4)
-                if quote_ccy:
-                    value_txt = f"{value_txt} {quote_ccy}"
+                quote_notional_f = abs(units_f) * mark_price_f if (units_f > 0.0 and mark_price_f > 0.0) else 0.0
+                notional_usd_f = float(position_values_usd.get(pair, 0.0) or 0.0)
+                if notional_usd_f <= 0.0:
+                    if base_ccy == acct_ccy and units_f > 0.0:
+                        notional_usd_f = abs(units_f)
+                    elif quote_notional_f > 0.0:
+                        if quote_ccy == acct_ccy:
+                            notional_usd_f = quote_notional_f
+                        else:
+                            conv_rate = _quote_to_acct_rate(quote_ccy)
+                            if conv_rate > 0.0:
+                                notional_usd_f = quote_notional_f * conv_rate
+                if notional_usd_f <= 0.0:
+                    notional_usd_f = quote_notional_f
+                total_value_usd += max(0.0, float(notional_usd_f))
+                value_txt = self._market_money_text(margin_f, currency=acct_ccy, signed=False) if margin_f > 0.0 else "N/A"
+                notional_txt = (
+                    self._market_money_text(notional_usd_f, currency=acct_ccy, signed=False)
+                    if notional_usd_f > 0.0
+                    else "N/A"
+                )
                 display_rows.append(
                     {
                         "pair": pair,
                         "side": side,
                         "units": self._market_fmt_num(units_f, 0),
                         "value": value_txt,
+                        "notional_usd": notional_txt,
                         "unrealized_usd": f"{self._market_fmt_signed_money(upl_f, 4)} {acct_ccy}".strip(),
                         "realized_usd": f"{self._market_fmt_signed_money(realized_f, 4)} {acct_ccy}".strip(),
                         "avg_cost": _fmt_price(avg_price_f),
@@ -9437,7 +9559,8 @@ class PowerTraderHub(tk.Tk):
             if total_rows > 0:
                 summary = (
                     f"Open trades: {total_rows}"
-                    f" | Margin {self._market_fmt_num(total_margin, 4)} {acct_ccy}"
+                    f" | Value {self._market_money_text(total_margin, currency=acct_ccy, signed=False)}"
+                    f" | Notional {self._market_money_text(total_value_usd, currency=acct_ccy, signed=False)}"
                     f" | uPnL {self._market_fmt_signed_money(total_upl, 4)} {acct_ccy}"
                 )
             else:
@@ -11540,6 +11663,7 @@ class PowerTraderHub(tk.Tk):
         lines: List[str],
         raw_positions: Optional[List[Dict[str, Any]]] = None,
         status_data: Optional[Dict[str, Any]] = None,
+        trader_data: Optional[Dict[str, Any]] = None,
     ) -> None:
         panel = self.market_panels.get(market_key, {})
         tree = panel.get("positions_tree")
@@ -11547,7 +11671,12 @@ class PowerTraderHub(tk.Tk):
         summary_var = panel.get("positions_summary_var")
         if (tree is None) and (canvas is None):
             return
-        payload = self._market_position_rows(market_key, raw_positions=raw_positions, status_data=status_data)
+        payload = self._market_position_rows(
+            market_key,
+            raw_positions=raw_positions,
+            status_data=status_data,
+            trader_data=trader_data,
+        )
         rows = list(payload.get("rows", []) or [])
         schema = payload.get("schema", {}) if isinstance(payload.get("schema", {}), dict) else {}
         cols = tuple(schema.get("columns", ()) or panel.get("positions_columns", ()) or ())
@@ -11610,6 +11739,31 @@ class PowerTraderHub(tk.Tk):
     def _market_history_display_rows(self, market_key: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         mk = str(market_key or "").strip().lower()
         out: List[Dict[str, Any]] = []
+
+        def _entry_action(side: str) -> str:
+            s = str(side or "").strip().lower()
+            if s in {"buy", "long"}:
+                return "BUY"
+            if s in {"sell", "short"}:
+                return "SELL"
+            return "BUY"
+
+        def _close_action(side: str) -> str:
+            s = str(side or "").strip().lower()
+            # Stocks audit exits typically log order-side (sell to close long).
+            if mk == "stocks":
+                if s in {"sell", "long"}:
+                    return "SELL"
+                if s in {"buy", "short"}:
+                    return "BUY"
+                return "SELL"
+            # Forex exits typically log position-side (long/short).
+            if s in {"buy", "long"}:
+                return "SELL"
+            if s in {"sell", "short"}:
+                return "BUY"
+            return "SELL"
+
         for row in reversed(list(rows or [])[-250:]):
             if not isinstance(row, dict):
                 continue
@@ -11620,10 +11774,10 @@ class PowerTraderHub(tk.Tk):
                 continue
             side_txt = str(row.get("side", "") or "").strip().lower()
             if event == "entry":
-                action = "BUY" if side_txt in {"buy", "long"} else "SELL"
+                action = _entry_action(side_txt)
                 phase = "OPEN"
             else:
-                action = "SELL" if side_txt in {"buy", "long"} else "BUY"
+                action = _close_action(side_txt)
                 phase = "CLOSE"
             ident = str(row.get("symbol", "") or row.get("instrument", "") or row.get("pair", "") or "").strip().upper() or "N/A"
             try:
@@ -12895,6 +13049,7 @@ class PowerTraderHub(tk.Tk):
                 market_key,
                 raw_positions=list(status_data.get("raw_positions", []) or []),
                 status_data=status_data,
+                trader_data=trader_data,
             )
             schema = payload.get("schema", {}) if isinstance(payload.get("schema", {}), dict) else {}
             cols = tuple(schema.get("columns", ()) or ())
@@ -13974,6 +14129,7 @@ class PowerTraderHub(tk.Tk):
                 list(status_data.get("positions_preview", []) or []),
                 raw_positions=list(status_data.get("raw_positions", []) or []),
                 status_data=status_data,
+                trader_data=trader_data,
             )
 
             history_lines = self._market_history_display_rows(
@@ -14457,6 +14613,7 @@ class PowerTraderHub(tk.Tk):
                         list(status_data.get("positions_preview", []) or []),
                         raw_positions=list(status_data.get("raw_positions", []) or []),
                         status_data=status_data,
+                        trader_data=trader_data,
                     )
                 except Exception:
                     pass

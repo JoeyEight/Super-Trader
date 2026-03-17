@@ -771,7 +771,7 @@ class TestTraderQualityGates(unittest.TestCase):
             self.assertIn("entry placed", str(out.get("msg", "")).lower())
             self.assertIn("risk-cap-size", str(out.get("msg", "")).lower())
             self.assertLess(float(out.get("risk_cap_size_scale", 1.0) or 1.0), 1.0)
-            self.assertIn("units=44", " | ".join([str(x) for x in list(out.get("actions", []) or [])]))
+            self.assertIn("units=891", " | ".join([str(x) for x in list(out.get("actions", []) or [])]))
 
     def test_forex_non_usd_quote_pair_uses_home_conversion_for_risk_caps(self) -> None:
         with tempfile.TemporaryDirectory() as td:

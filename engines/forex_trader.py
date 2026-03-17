@@ -256,8 +256,11 @@ def _forex_unit_notional_usd(instrument: str, mid: float, pricing_row: Dict[str,
 def _risk_capped_units(
     desired_units: int,
     unit_notional_usd: float,
+    unit_margin_usd: float,
     nav: float,
     total_exposure_usd: float,
+    total_margin_used_usd: float,
+    margin_available_usd: float,
     crypto_exposure_usd: float,
     stocks_exposure_usd: float,
     max_total_exposure_pct: float,
@@ -270,23 +273,31 @@ def _risk_capped_units(
     unit_notional = abs(float(unit_notional_usd or 0.0))
     if unit_notional <= 0.0:
         return int(desired_units or 0), 1.0
-    desired_notional = float(units_abs) * unit_notional
-    allowed_notional = float(desired_notional)
+    unit_margin = abs(float(unit_margin_usd or 0.0))
+    if unit_margin <= 0.0:
+        unit_margin = unit_notional * 0.05
+    max_units = int(units_abs)
     if max_pos_usd > 0.0:
-        allowed_notional = min(allowed_notional, max(0.0, float(max_pos_usd)))
+        max_units = min(max_units, max(0, int(max(0.0, float(max_pos_usd)) / unit_notional)))
+    margin_allowance = max(0.0, float(margin_available_usd or 0.0))
     if max_total_exposure_pct > 0.0 and nav > 0.0:
-        allowed_forex_notional = max(0.0, (float(nav) * float(max_total_exposure_pct) / 100.0) - float(total_exposure_usd))
-        allowed_notional = min(allowed_notional, allowed_forex_notional)
+        margin_util_allowance = max(
+            0.0,
+            (float(nav) * float(max_total_exposure_pct) / 100.0) - float(total_margin_used_usd),
+        )
+        margin_allowance = min(margin_allowance, margin_util_allowance)
+    if unit_margin > 0.0:
+        max_units = min(max_units, max(0, int(margin_allowance / unit_margin)))
     if global_cap_pct > 0.0 and nav > 0.0:
         allowed_global_notional = max(
             0.0,
             (float(nav) * float(global_cap_pct) / 100.0)
             - (float(total_exposure_usd) + float(crypto_exposure_usd) + float(stocks_exposure_usd)),
         )
-        allowed_notional = min(allowed_notional, allowed_global_notional)
-    if allowed_notional >= desired_notional:
+        max_units = min(max_units, max(0, int(allowed_global_notional / unit_notional)))
+    if max_units >= units_abs:
         return int(desired_units or 0), 1.0
-    capped_units = max(0, int(allowed_notional / unit_notional))
+    capped_units = max(0, int(max_units))
     if capped_units <= 0:
         return 0, 0.0
     capped_units = min(units_abs, capped_units)
@@ -523,6 +534,15 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             nav = 0.0
 
     total_exposure_usd = 0.0
+    total_margin_used_usd = 0.0
+    position_values_usd: Dict[str, float] = {}
+    for raw_row in raw_positions:
+        if not isinstance(raw_row, dict):
+            continue
+        try:
+            total_margin_used_usd += abs(float(raw_row.get("marginUsed", 0.0) or 0.0))
+        except Exception:
+            continue
     for inst, pos in positions.items():
         mid_px = float(prices.get(inst, 0.0) or 0.0)
         if mid_px <= 0:
@@ -531,7 +551,25 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         lu = abs(float(pos.get("long_units", 0.0) or 0.0))
         su = abs(float(pos.get("short_units", 0.0) or 0.0))
         unit_notional_usd = _forex_unit_notional_usd(inst, mid_px, pricing_row)
-        total_exposure_usd += (lu + su) * unit_notional_usd
+        inst_notional_usd = (lu + su) * unit_notional_usd
+        total_exposure_usd += inst_notional_usd
+        if inst_notional_usd > 0.0:
+            position_values_usd[str(inst).strip().upper()] = round(float(inst_notional_usd), 6)
+    margin_available = _safe_float_from_dict(
+        broker_snap if isinstance(broker_snap, dict) else {},
+        ["margin_available", "marginAvailable"],
+    )
+    if margin_available <= 0.0 and nav > 0.0:
+        margin_available = max(0.0, float(nav) - float(total_margin_used_usd))
+    margin_rate_est = _safe_float_from_dict(
+        broker_snap if isinstance(broker_snap, dict) else {},
+        ["margin_rate", "marginRate"],
+    )
+    if margin_rate_est <= 0.0 and total_exposure_usd > 0.0 and total_margin_used_usd > 0.0:
+        margin_rate_est = float(total_margin_used_usd) / float(total_exposure_usd)
+    if margin_rate_est <= 0.0:
+        margin_rate_est = 0.05
+    margin_rate_est = max(0.001, min(1.0, float(margin_rate_est)))
 
     today = time.strftime("%Y-%m-%d", time.localtime(now_ts))
     if pending:
@@ -682,8 +720,11 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 units, pair_risk_cap_size_scale = _risk_capped_units(
                     units,
                     unit_notional_usd=unit_notional_usd,
+                    unit_margin_usd=(unit_notional_usd * margin_rate_est),
                     nav=nav,
                     total_exposure_usd=total_exposure_usd,
+                    total_margin_used_usd=total_margin_used_usd,
+                    margin_available_usd=margin_available,
                     crypto_exposure_usd=crypto_exposure_usd,
                     stocks_exposure_usd=stocks_exposure_usd,
                     max_total_exposure_pct=(max_total_exposure_pct if enable_risk_caps else 0.0),
@@ -691,6 +732,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                     global_cap_pct=global_cap_pct,
                 )
                 est_entry_notional = abs(float(units)) * unit_notional_usd
+                est_entry_margin = abs(float(units)) * (unit_notional_usd * margin_rate_est)
                 fail = ""
                 if bars_count > 0 and bars_count < min_bars_required:
                     fail = f"Bars preflight failed for {pair} ({bars_count} < {min_bars_required})"
@@ -705,7 +747,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 elif mid <= 0.0:
                     fail = f"Quote preflight failed for {pair}"
                 elif abs(int(units)) <= 0:
-                    fail = f"Risk cap: no tradable size fits current NAV/exposure for {pair}"
+                    fail = f"Risk cap: no tradable size fits current margin/exposure for {pair}"
                 elif live_guarded and sample_count < min_samples_guarded:
                     fail = f"Calibration sample gate for {pair} ({sample_count} < {min_samples_guarded})"
                 elif live_guarded and calib_prob < float(settings.get("forex_min_calib_prob_live_guarded", 0.56) or 0.56):
@@ -724,9 +766,9 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 elif enable_risk_caps and max_pos_usd > 0.0 and pair not in positions and est_entry_notional > max_pos_usd:
                     fail = f"Risk cap: projected pair notional exceeds ${max_pos_usd:.2f}"
                 elif enable_risk_caps and max_total_exposure_pct > 0.0 and nav > 0.0 and pair not in positions:
-                    projected_pct = ((total_exposure_usd + max(0.0, est_entry_notional)) / nav) * 100.0
-                    if projected_pct > max_total_exposure_pct:
-                        fail = f"Risk cap: projected exposure exceeds {max_total_exposure_pct:.2f}%"
+                    projected_margin_pct = ((total_margin_used_usd + max(0.0, est_entry_margin)) / nav) * 100.0
+                    if projected_margin_pct > max_total_exposure_pct:
+                        fail = f"Risk cap: projected margin utilization exceeds {max_total_exposure_pct:.2f}%"
                 elif global_cap_pct > 0.0 and nav > 0.0:
                     projected_global_exposure = total_exposure_usd + max(0.0, est_entry_notional) + crypto_exposure_usd + stocks_exposure_usd
                     if ((projected_global_exposure / nav) * 100.0) > global_cap_pct:
@@ -951,6 +993,10 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "entry_size_scale": round(float(entry_size_scale), 4),
         "risk_cap_size_scale": round(float(risk_cap_size_scale), 4),
         "exposure_usd": round(total_exposure_usd, 4),
+        "margin_used_usd": round(total_margin_used_usd, 4),
+        "margin_available_usd": round(margin_available, 4),
+        "margin_rate_est": round(margin_rate_est, 6),
+        "position_values_usd": dict(position_values_usd),
         "crypto_exposure_usd": round(crypto_exposure_usd, 4) if auto_enabled else round(_crypto_holdings_usd(hub_dir), 4),
         "other_market_exposure_usd": round(stocks_exposure_usd, 4) if auto_enabled else round(_market_status_exposure_usd(hub_dir, "stocks"), 4),
         "account_value_usd": round(nav, 4),

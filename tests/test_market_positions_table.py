@@ -272,6 +272,7 @@ class MarketPositionsTableTests(unittest.TestCase):
                 }
             ],
             status_data={"currency": "USD"},
+            trader_data={"position_values_usd": {"AUD_HKD": 1.4199}},
         )
 
         row = payload["rows"][0]
@@ -279,7 +280,8 @@ class MarketPositionsTableTests(unittest.TestCase):
         self.assertEqual(row["pair"], "AUD_HKD")
         self.assertEqual(row["side"], "SHORT")
         self.assertEqual(row["units"], "2")
-        self.assertEqual(row["value"], "11.0970 HKD")
+        self.assertEqual(row["value"], "$0.14")
+        self.assertEqual(row["notional_usd"], "$1.42")
         self.assertEqual(row["unrealized_usd"], "+0.0005 USD")
         self.assertEqual(row["realized_usd"], "+0.0000 USD")
         self.assertEqual(row["avg_cost"], "$5.5494")
@@ -287,7 +289,8 @@ class MarketPositionsTableTests(unittest.TestCase):
         self.assertEqual(row["margin"], "0.1417 USD")
         self.assertEqual(row["financing"], "+0.0000 USD")
         self.assertEqual(row["trades"], "1")
-        self.assertIn("Margin 0.1417 USD", payload["summary"])
+        self.assertIn("Value $0.14", payload["summary"])
+        self.assertIn("Notional $1.42", payload["summary"])
 
     def test_forex_portfolio_snapshot_uses_margin_math(self) -> None:
         hub = self._hub()
@@ -318,7 +321,7 @@ class MarketPositionsTableTests(unittest.TestCase):
         self.assertEqual(snapshot["total_account_value"], "$100.01")
         self.assertEqual(snapshot["holdings_value"], "$2.60")
         self.assertEqual(snapshot["buying_power"], "$97.42")
-        self.assertEqual(snapshot["percent_in_trade"], "2.60%")
+        self.assertEqual(snapshot["percent_in_trade"], "2.60% (notional 54.74%)")
         self.assertEqual(snapshot["open_positions"], "4")
         self.assertEqual(snapshot["realized_pnl"], "+0.00")
 
@@ -812,7 +815,7 @@ class MarketPositionsTableTests(unittest.TestCase):
         stock_rows = PowerTraderHub._market_history_display_rows(
             hub,
             "stocks",
-            [{"event": "exit", "symbol": "O", "side": "buy", "qty": 2.0, "price": 66.0, "pnl_usd": 1.23, "ok": True, "ts": 1}],
+            [{"event": "exit", "symbol": "O", "side": "sell", "qty": 2.0, "price": 66.0, "pnl_usd": 1.23, "ok": True, "ts": 1}],
         )
         self.assertEqual(len(stock_rows), 1)
         self.assertIn("SELL/CLOSE", stock_rows[0]["text"])
