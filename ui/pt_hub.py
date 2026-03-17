@@ -14140,7 +14140,10 @@ class PowerTraderHub(tk.Tk):
                     status_data=status_data,
                 ),
             )
-            history_sig = tuple(str((row.get("text") if isinstance(row, dict) else row) or "") for row in history_lines[-40:])
+            history_sig = (
+                int(len(history_lines)),
+                *tuple(str((row.get("text") if isinstance(row, dict) else row) or "") for row in history_lines[:40]),
+            )
             if panel.get("last_history_sig") != history_sig:
                 panel["last_history_sig"] = history_sig
                 panel["history_lines"] = list(history_lines[-120:])
