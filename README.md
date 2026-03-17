@@ -41,8 +41,14 @@ Runtime packages currently used by the app code:
 
 ## Run
 ### Hub UI
+macOS / Linux:
 ```bash
 ./launch_super_trader.command
+```
+
+Windows (Command Prompt / PowerShell):
+```bat
+launch_super_trader.bat
 ```
 
 Alternative:
@@ -55,6 +61,28 @@ Important runtime behavior:
 - Closing the hub window does not stop trading by itself.
 - Use `Stop Trades` first if you want crypto, stocks, and forex runtime activity to stop cleanly.
 - If the computer goes to sleep, the Python processes pause and do not keep trading until the machine wakes again.
+
+## Desktop App Install (Icon + Applications/Programs)
+### macOS (`/Applications`)
+```bash
+./venv/bin/python packaging/install_macos_app.py
+```
+
+This installs `/Applications/Super Trader.app` with an icon and launches the repo's `launch_super_trader.command`.
+
+### Windows (Start Menu / Programs)
+```powershell
+powershell -ExecutionPolicy Bypass -File .\packaging\install_windows_shortcut.ps1
+```
+
+Optional desktop icon:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\packaging\install_windows_shortcut.ps1 -DesktopShortcut
+```
+
+This creates:
+- `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Super Trader\Super Trader.lnk`
+- `%LOCALAPPDATA%\Programs\Super Trader\launch_super_trader.bat`
 
 ### Runner (all background services)
 ```bash

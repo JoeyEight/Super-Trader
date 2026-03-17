@@ -11660,15 +11660,12 @@ class PowerTraderHub(tk.Tk):
                 px_txt = _fmt_price(float(row.get("price", 0.0) or 0.0))
             except Exception:
                 px_txt = "N/A"
-            realized_val = None
-            for key in ("realized_pnl", "realized_pl", "pl"):
+            realized_val: Optional[float] = None
+            for key in ("realized_pnl", "realized_pl", "realized_profit_usd", "pnl_usd", "pl", "realized"):
                 raw = row.get(key, None)
                 if raw in (None, ""):
                     continue
-                try:
-                    realized_val = float(raw)
-                except Exception:
-                    realized_val = None
+                realized_val = self._coerce_float_value(raw)
                 if realized_val is not None:
                     break
             parts = [when, f"{action}/{phase:5s}", f"{ident:7s}"]
@@ -11678,12 +11675,18 @@ class PowerTraderHub(tk.Tk):
                 parts.append(f"px={px_txt}")
             if bool(row.get("_synthetic")):
                 parts.append("source=broker snapshot")
-            if (realized_val is not None) and event == "exit":
+            if (realized_val is not None) and phase == "CLOSE":
                 parts.append(f"realized={realized_val:+.2f}")
+            if action == "SELL":
+                history_fg = DARK_ACCENT
+            elif action == "BUY":
+                history_fg = DARK_ACCENT2
+            else:
+                history_fg = "#FFB347"
             out.append(
                 {
                     "text": " | ".join(parts),
-                    "fg": (DARK_ACCENT if event == "exit" else (DARK_ACCENT2 if action == "BUY" else "#FFB347")),
+                    "fg": history_fg,
                 }
             )
         return out
@@ -15141,15 +15144,20 @@ class PowerTraderHub(tk.Tk):
             env["POWERTRADER_PROJECT_DIR"] = self.project_dir
             prev_pp = str(env.get("PYTHONPATH", "") or "").strip()
             env["PYTHONPATH"] = self.project_dir if not prev_pp else (self.project_dir + os.pathsep + prev_pp)
-            subprocess.Popen(
-                [sys.executable, "-u", self.proc_runner.path],
-                cwd=self.project_dir,
-                env=env,
-                stdout=log_f,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-                text=True,
-            )
+            popen_kwargs: Dict[str, Any] = {
+                "cwd": self.project_dir,
+                "env": env,
+                "stdout": log_f,
+                "stderr": subprocess.STDOUT,
+                "text": True,
+            }
+            if os.name == "nt":
+                flags = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)) | int(getattr(subprocess, "DETACHED_PROCESS", 0))
+                if flags:
+                    popen_kwargs["creationflags"] = flags
+            else:
+                popen_kwargs["start_new_session"] = True
+            subprocess.Popen([sys.executable, "-u", self.proc_runner.path], **popen_kwargs)
             try:
                 self.runner_log_q.put("[RUNNER] Started background supervisor\n")
             except Exception:
@@ -15182,6 +15190,33 @@ class PowerTraderHub(tk.Tk):
 
         pid = self._read_runner_pid()
         if not self._pid_is_alive(pid):
+            return
+        if os.name == "nt":
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(int(pid)), "/T"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                self.runner_log_q.put(f"[RUNNER] Sent taskkill /T to supervisor pid={pid}\n")
+            except Exception:
+                pass
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                if not self._pid_is_alive(pid):
+                    return
+                time.sleep(0.2)
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                self.runner_log_q.put(f"[RUNNER] Sent taskkill /T /F to supervisor pid={pid}\n")
+            except Exception:
+                pass
             return
         try:
             os.kill(int(pid), signal.SIGTERM)

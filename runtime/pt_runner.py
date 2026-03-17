@@ -88,6 +88,13 @@ RUNTIME_STATE_SCHEMA_VERSION = 3
 RUNTIME_STATE_MIN_READER_VERSION = 1
 
 
+def _detached_subprocess_kwargs() -> Dict[str, Any]:
+    if os.name == "nt":
+        flags = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)) | int(getattr(subprocess, "DETACHED_PROCESS", 0))
+        return {"creationflags": flags} if flags else {}
+    return {"start_new_session": True}
+
+
 def _rotate_log_file(path: str, max_bytes: int = LOG_ROTATE_MAX_BYTES, keep: int = LOG_ROTATE_KEEP) -> None:
     try:
         if not os.path.isfile(path):
@@ -1373,8 +1380,8 @@ class Runner:
                 env=env,
                 stdout=log_f,
                 stderr=subprocess.STDOUT,
-                start_new_session=True,
                 text=True,
+                **_detached_subprocess_kwargs(),
             )
             child.proc = proc
             child.next_restart_at = 0.0

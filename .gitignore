@@ -52,3 +52,9 @@ AAVE/
 DOT/
 ATOM/
 MATIC/
+
+# Packaging outputs
+build/
+dist/
+packaging/icons/
+*.app/

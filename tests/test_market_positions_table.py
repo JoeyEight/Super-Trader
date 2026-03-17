@@ -803,6 +803,32 @@ class MarketPositionsTableTests(unittest.TestCase):
         self.assertIn("O", rows[0]["text"])
         self.assertIn("qty=$200.00", rows[0]["text"])
 
+    def test_market_history_display_rows_use_action_colors_and_show_realized_on_closes(self) -> None:
+        hub = self._hub()
+        hub._format_ui_timestamp = lambda ts, include_date=False: "2026-03-12 17:27:08"
+        hub._market_fmt_num = lambda value, digits=6: f"{float(value):.{int(digits)}f}"
+        hub._market_fmt_money = lambda value, digits=2: f"${float(value):,.{int(digits)}f}"
+
+        stock_rows = PowerTraderHub._market_history_display_rows(
+            hub,
+            "stocks",
+            [{"event": "exit", "symbol": "O", "side": "buy", "qty": 2.0, "price": 66.0, "pnl_usd": 1.23, "ok": True, "ts": 1}],
+        )
+        self.assertEqual(len(stock_rows), 1)
+        self.assertIn("SELL/CLOSE", stock_rows[0]["text"])
+        self.assertIn("realized=+1.23", stock_rows[0]["text"])
+        self.assertEqual(stock_rows[0]["fg"], "#00FF66")
+
+        forex_rows = PowerTraderHub._market_history_display_rows(
+            hub,
+            "forex",
+            [{"event": "exit", "instrument": "AUD_USD", "side": "short", "units": 2, "price": 0.6500, "pnl_usd": -0.12, "ok": True, "ts": 2}],
+        )
+        self.assertEqual(len(forex_rows), 1)
+        self.assertIn("BUY/CLOSE", forex_rows[0]["text"])
+        self.assertIn("realized=-0.12", forex_rows[0]["text"])
+        self.assertEqual(forex_rows[0]["fg"], "#00E5FF")
+
     def test_resolved_market_history_rows_backfills_missing_open_stock_entry(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             stocks_dir = os.path.join(td, "stocks")
