@@ -1233,6 +1233,24 @@ class CandleChart(ttk.Frame):
         self._legend_hover_motion_handler = None
         self._legend_hover_last_canvas_xy: Optional[Tuple[float, float]] = None
         self._legend_hover_restore_after_id = None
+        self._legend_bbox_after_id = None
+
+        def _hide_tip_event(_e=None):
+            try:
+                self.hide_legend_tooltip(clear_pointer=False)
+            except Exception:
+                pass
+
+        try:
+            canvas_w.bind("<Leave>", _hide_tip_event, add="+")
+            canvas_w.bind("<Unmap>", _hide_tip_event, add="+")
+            canvas_w.bind("<Destroy>", _hide_tip_event, add="+")
+            top = canvas_w.winfo_toplevel()
+            if top is not None:
+                top.bind("<Unmap>", _hide_tip_event, add="+")
+                top.bind("<FocusOut>", _hide_tip_event, add="+")
+        except Exception:
+            pass
 
 
     def _apply_dark_chart_style(self) -> None:
@@ -1246,6 +1264,44 @@ class CandleChart(ttk.Frame):
             self.ax.grid(True, color=DARK_BORDER, linewidth=0.6, alpha=0.35)
         except Exception:
             pass
+
+    def hide_legend_tooltip(self, *, clear_pointer: bool = True) -> None:
+        try:
+            aid = getattr(self, "_legend_hover_restore_after_id", None)
+            if aid:
+                self.after_cancel(aid)
+        except Exception:
+            pass
+        self._legend_hover_restore_after_id = None
+        try:
+            aid = getattr(self, "_legend_bbox_after_id", None)
+            if aid:
+                self.after_cancel(aid)
+        except Exception:
+            pass
+        self._legend_bbox_after_id = None
+        try:
+            for item in getattr(self, "_line_hover_targets", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                artist = item.get("artist")
+                if artist is None:
+                    continue
+                artist.set_linewidth(float(item.get("line_width", 1.0)))
+                artist.set_alpha(float(item.get("alpha", 0.9)))
+        except Exception:
+            pass
+        self._active_hover_line = None
+        try:
+            tw = getattr(self, "_legend_tooltip_win", None)
+            if tw is not None and bool(tw.winfo_exists()):
+                tw.destroy()
+        except Exception:
+            pass
+        self._legend_tooltip_win = None
+        self._legend_tooltip_label = None
+        if clear_pointer:
+            self._legend_hover_last_canvas_xy = None
 
     def _can_show_legend_tooltip(self) -> bool:
         try:
@@ -1413,16 +1469,7 @@ class CandleChart(ttk.Frame):
 
                 def _hide_legend_tooltip(_e=None, preserve_pointer: bool = False):
                     _reset_hover_lines()
-                    try:
-                        tw = getattr(self, "_legend_tooltip_win", None)
-                        if tw is not None and tw.winfo_exists():
-                            tw.destroy()
-                    except Exception:
-                        pass
-                    self._legend_tooltip_win = None
-                    self._legend_tooltip_label = None
-                    if not preserve_pointer:
-                        self._legend_hover_last_canvas_xy = None
+                    self.hide_legend_tooltip(clear_pointer=(not preserve_pointer))
 
                 def _show_legend_tooltip(x_root: int, y_root: int, text: str):
                     if not self._can_show_legend_tooltip():
@@ -2188,11 +2235,7 @@ class CandleChart(ttk.Frame):
                 self._legend_bbox_after_id = self.after_idle(_refresh_legend_bbox)
             else:
                 self._hover_regions_px = []
-                tw = getattr(self, "_legend_tooltip_win", None)
-                if tw is not None and tw.winfo_exists():
-                    tw.destroy()
-                    self._legend_tooltip_win = None
-                    self._legend_tooltip_label = None
+                self.hide_legend_tooltip(clear_pointer=False)
             self._schedule_restore_legend_hover()
         except Exception:
             pass
@@ -2904,6 +2947,11 @@ class PowerTraderHub(tk.Tk):
 
         # Refresh charts immediately when a timeframe is changed (don't wait for the 10s throttle).
         self.bind_all("<<TimeframeChanged>>", self._on_timeframe_changed)
+        try:
+            self.bind("<Unmap>", lambda _e: self._hide_floating_tooltips(), add="+")
+            self.bind("<FocusOut>", lambda _e: self._hide_floating_tooltips(), add="+")
+        except Exception:
+            pass
 
         self._last_chart_refresh = 0.0
 
@@ -3881,6 +3929,39 @@ class PowerTraderHub(tk.Tk):
             self.bind_all("<Control-1>", lambda _e: self._select_market_tab("crypto"))
             self.bind_all("<Control-2>", lambda _e: self._select_market_tab("stocks"))
             self.bind_all("<Control-3>", lambda _e: self._select_market_tab("forex"))
+        except Exception:
+            pass
+
+    def _hide_floating_tooltips(self) -> None:
+        try:
+            tw = getattr(self, "_toolbar_tip_win", None)
+            if tw is not None and bool(tw.winfo_exists()):
+                tw.destroy()
+        except Exception:
+            pass
+        self._toolbar_tip_win = None
+        self._toolbar_tip_label = None
+
+        try:
+            charts = getattr(self, "charts", {})
+            if isinstance(charts, dict):
+                for chart in list(charts.values()):
+                    if hasattr(chart, "hide_legend_tooltip"):
+                        try:
+                            chart.hide_legend_tooltip(clear_pointer=False)
+                        except Exception:
+                            continue
+        except Exception:
+            pass
+
+        try:
+            panels = getattr(self, "market_panels", {})
+            if isinstance(panels, dict):
+                for mk in list(panels.keys()):
+                    try:
+                        self._hide_market_table_tooltip(str(mk))
+                    except Exception:
+                        continue
         except Exception:
             pass
 
@@ -7947,6 +8028,11 @@ class PowerTraderHub(tk.Tk):
         watch_canvas.bind("<Configure>", lambda _e: self.after_idle(self._draw_crypto_watchlist_table), add="+")
         watch_canvas.bind("<Button-1>", self._on_crypto_watchlist_click, add="+")
         watch_canvas.bind("<Double-Button-1>", self._activate_crypto_watchlist_selection, add="+")
+        self._bind_scroll_wheel(
+            watch_canvas,
+            y_scroll=lambda units, cv=watch_canvas: cv.yview_scroll(int(units), "units"),
+            x_scroll=lambda units, cv=watch_canvas: cv.xview_scroll(int(units), "units"),
+        )
         self.crypto_watchlist_tree = None
         self.crypto_watchlist_canvas = watch_canvas
         self.crypto_watchlist_cols = watch_cols
@@ -8130,6 +8216,11 @@ class PowerTraderHub(tk.Tk):
         xsb.grid(row=1, column=0, sticky="ew")
 
         self.trades_canvas.bind("<Configure>", lambda e: self.after_idle(self._draw_trades_table))
+        self._bind_scroll_wheel(
+            self.trades_canvas,
+            y_scroll=lambda units, cv=self.trades_canvas: cv.yview_scroll(int(units), "units"),
+            x_scroll=lambda units, cv=self.trades_canvas: cv.xview_scroll(int(units), "units"),
+        )
 
 
         # Trade history (bottom)
@@ -8157,6 +8248,11 @@ class PowerTraderHub(tk.Tk):
         self.hist_list.pack(side="left", fill="both", expand=True)
         ysb2.pack(side="right", fill="y")
         xsb2.pack(side="bottom", fill="x")
+        self._bind_scroll_wheel(
+            self.hist_list,
+            y_scroll=lambda units, lb=self.hist_list: lb.yview_scroll(int(units), "units"),
+            x_scroll=lambda units, lb=self.hist_list: lb.xview_scroll(int(units), "units"),
+        )
 
 
         # Assemble right side
@@ -8987,6 +9083,11 @@ class PowerTraderHub(tk.Tk):
         watch_canvas.bind("<Configure>", lambda _e, mk=market_key: self._draw_market_watchlist_table(mk), add="+")
         watch_canvas.bind("<Button-1>", lambda e, mk=market_key: self._on_market_watchlist_click(mk, e), add="+")
         watch_canvas.bind("<Double-Button-1>", lambda e, mk=market_key: self._activate_market_watchlist_selection(mk, event=e), add="+")
+        self._bind_scroll_wheel(
+            watch_canvas,
+            y_scroll=lambda units, cv=watch_canvas: cv.yview_scroll(int(units), "units"),
+            x_scroll=lambda units, cv=watch_canvas: cv.xview_scroll(int(units), "units"),
+        )
         watch_box.pack(fill="x", padx=6, pady=(0, 6))
         watch_box.pack_forget()
 
@@ -9046,6 +9147,11 @@ class PowerTraderHub(tk.Tk):
         positions_scroll_y.grid(row=0, column=1, sticky="ns")
         positions_scroll_x.grid(row=1, column=0, sticky="ew")
         positions_canvas.bind("<Configure>", lambda _e, mk=market_key: self._draw_market_positions_table(mk), add="+")
+        self._bind_scroll_wheel(
+            positions_canvas,
+            y_scroll=lambda units, cv=positions_canvas: cv.yview_scroll(int(units), "units"),
+            x_scroll=lambda units, cv=positions_canvas: cv.xview_scroll(int(units), "units"),
+        )
 
         history_logs_row = ttk.Frame(lower)
         history_logs_row.columnconfigure(0, weight=1)
@@ -9081,6 +9187,12 @@ class PowerTraderHub(tk.Tk):
         history_scroll_y.pack(side="right", fill="y")
         history_scroll_x.pack(side="bottom", fill="x")
         history_list.insert("end", "(no completed trades yet)")
+        self._bind_scroll_wheel(
+            history_list,
+            y_scroll=lambda units, lb=history_list: lb.yview_scroll(int(units), "units"),
+            x_scroll=lambda units, lb=history_list: lb.xview_scroll(int(units), "units"),
+            on_scroll=lambda var=history_autoscroll_var: var.set(False),
+        )
 
         self.market_panels[market_key] = {
             "market_name": market_name,
@@ -10017,6 +10129,120 @@ class PowerTraderHub(tk.Tk):
         return "\n".join(out_lines)
 
     @staticmethod
+    def _mousewheel_units(event: Any) -> int:
+        try:
+            num = int(getattr(event, "num", 0) or 0)
+        except Exception:
+            num = 0
+        if num == 4:
+            return -3
+        if num == 5:
+            return 3
+        try:
+            delta = int(getattr(event, "delta", 0) or 0)
+        except Exception:
+            delta = 0
+        if delta == 0:
+            return 0
+        if abs(delta) >= 120:
+            units = int(-1 * (delta / 120))
+            return units if units != 0 else (-1 if delta > 0 else 1)
+        return -1 if delta > 0 else 1
+
+    @staticmethod
+    def _canvas_view_start(canvas: tk.Canvas) -> Tuple[float, float]:
+        x0 = 0.0
+        y0 = 0.0
+        try:
+            xv = canvas.xview()
+            if isinstance(xv, (tuple, list)) and xv:
+                x0 = float(xv[0] or 0.0)
+        except Exception:
+            x0 = 0.0
+        try:
+            yv = canvas.yview()
+            if isinstance(yv, (tuple, list)) and yv:
+                y0 = float(yv[0] or 0.0)
+        except Exception:
+            y0 = 0.0
+        return (max(0.0, x0), max(0.0, y0))
+
+    @staticmethod
+    def _restore_canvas_view(
+        canvas: tk.Canvas,
+        *,
+        x_start: float,
+        y_start: float,
+        total_w: int,
+        total_h: int,
+        view_w: int,
+        view_h: int,
+    ) -> None:
+        try:
+            max_x = max(0.0, 1.0 - (float(max(1, view_w)) / float(max(1, total_w))))
+            max_y = max(0.0, 1.0 - (float(max(1, view_h)) / float(max(1, total_h))))
+            canvas.xview_moveto(max(0.0, min(float(x_start or 0.0), max_x)))
+            canvas.yview_moveto(max(0.0, min(float(y_start or 0.0), max_y)))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _listbox_view_start(listbox: tk.Listbox) -> float:
+        try:
+            yv = listbox.yview()
+            if isinstance(yv, (tuple, list)) and yv:
+                return max(0.0, float(yv[0] or 0.0))
+        except Exception:
+            pass
+        return 0.0
+
+    def _bind_scroll_wheel(
+        self,
+        widget: Any,
+        *,
+        y_scroll: Optional[Callable[[int], None]] = None,
+        x_scroll: Optional[Callable[[int], None]] = None,
+        on_scroll: Optional[Callable[[], None]] = None,
+    ) -> None:
+        if widget is None:
+            return
+
+        def _handle(event: Any) -> Optional[str]:
+            units = self._mousewheel_units(event)
+            if units == 0:
+                return None
+            try:
+                shift_down = bool(int(getattr(event, "state", 0) or 0) & 0x0001)
+            except Exception:
+                shift_down = False
+            used = False
+            try:
+                if shift_down and callable(x_scroll):
+                    x_scroll(units)
+                    used = True
+                elif callable(y_scroll):
+                    y_scroll(units)
+                    used = True
+                elif callable(x_scroll):
+                    x_scroll(units)
+                    used = True
+            except Exception:
+                return None
+            if used and callable(on_scroll):
+                try:
+                    on_scroll()
+                except Exception:
+                    pass
+            return "break" if used else None
+
+        try:
+            widget.bind("<MouseWheel>", _handle, add="+")
+            widget.bind("<Button-4>", _handle, add="+")
+            widget.bind("<Button-5>", _handle, add="+")
+        except Exception:
+            pass
+
+    @staticmethod
     def _watchlist_width_bounds(col: str) -> Tuple[int, int]:
         key = str(col or "").strip().lower()
         if key == "rank":
@@ -10117,6 +10343,7 @@ class PowerTraderHub(tk.Tk):
             view_h = max(90, int(canvas.winfo_height() or 0))
         except Exception:
             return []
+        prev_x, prev_y = self._canvas_view_start(canvas)
         widths = self._watchlist_autofit_widths(columns, headings, rows, base_widths, view_w)
         total_w = sum(int(widths.get(col, 100) or 100) for col in columns) or view_w
         header_h = 30
@@ -10217,6 +10444,15 @@ class PowerTraderHub(tk.Tk):
 
         try:
             canvas.configure(scrollregion=(0, 0, total_w, max(y, view_h)))
+            self._restore_canvas_view(
+                canvas,
+                x_start=prev_x,
+                y_start=prev_y,
+                total_w=int(total_w),
+                total_h=int(max(y, view_h)),
+                view_w=int(view_w),
+                view_h=int(view_h),
+            )
         except Exception:
             pass
         return row_regions
@@ -10234,6 +10470,7 @@ class PowerTraderHub(tk.Tk):
             view_h = max(80, int(canvas.winfo_height() or 0))
         except Exception:
             return
+        prev_x, prev_y = self._canvas_view_start(canvas)
 
         base_widths = dict(panel.get("positions_widths", {}) or {})
         total_base = sum(int(base_widths.get(col, 110) or 110) for col in cols) or 1
@@ -10318,6 +10555,15 @@ class PowerTraderHub(tk.Tk):
             canvas.create_rectangle(0, header_h, total_w, empty_h, fill=DARK_PANEL, outline=DARK_BORDER, width=1)
             canvas.create_text(8, header_h + (row_h / 2), text="No open positions", fill=DARK_MUTED, anchor="w")
             canvas.create_line(0, empty_h, total_w, empty_h, fill=DARK_BORDER, width=1)
+        self._restore_canvas_view(
+            canvas,
+            x_start=prev_x,
+            y_start=prev_y,
+            total_w=int(total_w),
+            total_h=int(max(total_h, view_h)),
+            view_w=int(view_w),
+            view_h=int(view_h),
+        )
 
     def _market_trader_state_path(self, market_key: str) -> str:
         mk = str(market_key or "").strip().lower()
@@ -12080,6 +12326,38 @@ class PowerTraderHub(tk.Tk):
         if (inserted == 0) and lines:
             _set_summary(str(lines[0]).strip() or "No open positions.")
 
+    def _forex_row_realized_from_payload(self, row: Dict[str, Any]) -> Optional[float]:
+        payload = row.get("payload", {}) if isinstance(row, dict) else {}
+        if not isinstance(payload, dict):
+            return None
+        fill_txn: Dict[str, Any] = {}
+        for key in ("orderFillTransaction", "shortOrderFillTransaction", "longOrderFillTransaction"):
+            value = payload.get(key, {})
+            if isinstance(value, dict) and value:
+                fill_txn = value
+                break
+        if not fill_txn:
+            return None
+        trades_closed = fill_txn.get("tradesClosed", [])
+        if isinstance(trades_closed, list) and trades_closed:
+            total = 0.0
+            hits = 0
+            for tr in trades_closed:
+                if not isinstance(tr, dict):
+                    continue
+                val = self._coerce_float_value(tr.get("realizedPL"))
+                if val is None:
+                    continue
+                total += float(val)
+                hits += 1
+            if hits > 0:
+                return float(total)
+        for key in ("realizedPL", "pl"):
+            val = self._coerce_float_value(fill_txn.get(key))
+            if val is not None:
+                return float(val)
+        return None
+
     def _market_history_display_rows(self, market_key: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         mk = str(market_key or "").strip().lower()
         out: List[Dict[str, Any]] = []
@@ -12162,13 +12440,28 @@ class PowerTraderHub(tk.Tk):
             except Exception:
                 px_txt = "N/A"
             realized_val: Optional[float] = None
-            for key in ("realized_pnl", "realized_pl", "realized_profit_usd", "pnl_usd", "pl", "realized"):
-                raw = row.get(key, None)
-                if raw in (None, ""):
-                    continue
-                realized_val = self._coerce_float_value(raw)
-                if realized_val is not None:
-                    break
+            realized_is_estimate = False
+            if mk == "forex":
+                for key in ("realized_pnl", "realized_pl", "realized_profit_usd", "realized"):
+                    raw = row.get(key, None)
+                    if raw in (None, ""):
+                        continue
+                    realized_val = self._coerce_float_value(raw)
+                    if realized_val is not None:
+                        break
+                if realized_val is None:
+                    realized_val = self._forex_row_realized_from_payload(row if isinstance(row, dict) else {})
+                if realized_val is None:
+                    realized_val = self._coerce_float_value(row.get("pnl_usd", None))
+                    realized_is_estimate = realized_val is not None
+            else:
+                for key in ("realized_pnl", "realized_pl", "realized_profit_usd", "pnl_usd", "pl", "realized"):
+                    raw = row.get(key, None)
+                    if raw in (None, ""):
+                        continue
+                    realized_val = self._coerce_float_value(raw)
+                    if realized_val is not None:
+                        break
             parts = [when, f"{action}/{phase:5s}", f"{ident:7s}"]
             if qty_txt:
                 parts.append(f"qty={qty_txt}")
@@ -12177,7 +12470,8 @@ class PowerTraderHub(tk.Tk):
             if bool(row.get("_synthetic")):
                 parts.append("source=broker snapshot")
             if (realized_val is not None) and phase == "CLOSE":
-                parts.append(f"realized={realized_val:+.2f}")
+                label = "est" if realized_is_estimate else "realized"
+                parts.append(f"{label}={realized_val:+.2f}")
             if action == "SELL":
                 history_fg = DARK_ACCENT
             elif action == "BUY":
@@ -12304,6 +12598,7 @@ class PowerTraderHub(tk.Tk):
         if not payload:
             payload = [{"text": "(no completed trades yet)", "fg": DARK_MUTED}]
         if listbox is not None:
+            prior_start = self._listbox_view_start(listbox)
             try:
                 listbox.delete(0, "end")
                 row_index = 0
@@ -12328,8 +12623,10 @@ class PowerTraderHub(tk.Tk):
                     do_scroll = bool(panel.get("history_autoscroll_var").get()) if panel.get("history_autoscroll_var") else True
                 except Exception:
                     do_scroll = True
-                if do_scroll:
+                if do_scroll and prior_start <= 0.001:
                     listbox.yview_moveto(0.0)
+                elif prior_start > 0.0:
+                    listbox.yview_moveto(max(0.0, min(1.0, float(prior_start))))
             except Exception:
                 pass
             return
@@ -17278,6 +17575,7 @@ class PowerTraderHub(tk.Tk):
             view_h = max(80, int(canvas.winfo_height()))
         except Exception:
             return
+        prev_x, prev_y = self._canvas_view_start(canvas)
 
         base = dict(getattr(self, "_trades_base_widths", {}) or {})
         total_base = sum(base.get(c, 100) for c in cols) or 1
@@ -17491,6 +17789,15 @@ class PowerTraderHub(tk.Tk):
                     _safe_delete(cell_state.get("text_id"))
             for sep_id in list((stale_state.get("group_lines", {}) or {}).values()):
                 _safe_delete(sep_id)
+        self._restore_canvas_view(
+            canvas,
+            x_start=prev_x,
+            y_start=prev_y,
+            total_w=int(total_w),
+            total_h=int(max(total_h, view_h)),
+            view_w=int(view_w),
+            view_h=int(view_h),
+        )
 
     def _set_manual_sell_status(self, text: str, level: str = "info") -> None:
         lbl = getattr(self, "lbl_manual_sell_status", None)
@@ -18895,12 +19202,14 @@ class PowerTraderHub(tk.Tk):
         if getattr(self, "_last_trade_history_mtime", object()) == mtime:
             return
         self._last_trade_history_mtime = mtime
+        prior_start = self._listbox_view_start(self.hist_list)
 
         if not os.path.isfile(self.trade_history_path):
             self.hist_list.delete(0, "end")
             self.hist_list.insert("end", "(no trade_history.jsonl yet)")
             try:
                 self.hist_list.itemconfig(0, bg=DARK_PANEL2, fg=DARK_FG)
+                self.hist_list.yview_moveto(0.0 if prior_start <= 0.001 else max(0.0, min(1.0, float(prior_start))))
             except Exception:
                 pass
             return
@@ -18980,6 +19289,13 @@ class PowerTraderHub(tk.Tk):
             except Exception:
                 pass
             row_index += 1
+        try:
+            if prior_start <= 0.001:
+                self.hist_list.yview_moveto(0.0)
+            else:
+                self.hist_list.yview_moveto(max(0.0, min(1.0, float(prior_start))))
+        except Exception:
+            pass
 
 
 
@@ -22359,6 +22675,10 @@ class PowerTraderHub(tk.Tk):
     # ---- close ----
 
     def _on_close(self) -> None:
+        try:
+            self._hide_floating_tooltips()
+        except Exception:
+            pass
         try:
             self._persist_while_you_were_gone_snapshot()
         except Exception:

@@ -162,7 +162,7 @@ def _daily_loss_guard_triggered(audit_path: str, max_loss_usd: float, max_loss_p
                     continue
                 if str(row.get("event", "")).lower() not in {"exit", "shadow_exit"}:
                     continue
-                pnl_usd = float(row.get("pnl_usd", 0.0) or 0.0)
+                pnl_usd = _audit_realized_pnl_usd(row)
                 if pnl_usd < 0:
                     loss_usd += abs(pnl_usd)
     except Exception:
@@ -186,6 +186,66 @@ def _parse_order_id(msg: str, payload: Dict[str, Any]) -> str:
     if "order_id=" in txt:
         return txt.split("order_id=", 1)[1].strip().split(" ", 1)[0]
     return ""
+
+
+def _close_fill_transaction(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    for key in ("orderFillTransaction", "shortOrderFillTransaction", "longOrderFillTransaction"):
+        row = payload.get(key, {})
+        if isinstance(row, dict) and row:
+            return row
+    return {}
+
+
+def _realized_pnl_from_close_payload(payload: Dict[str, Any]) -> float | None:
+    fill_txn = _close_fill_transaction(payload if isinstance(payload, dict) else {})
+    if not fill_txn:
+        return None
+    trades_closed = fill_txn.get("tradesClosed", [])
+    if isinstance(trades_closed, list) and trades_closed:
+        total = 0.0
+        hits = 0
+        for row in trades_closed:
+            if not isinstance(row, dict):
+                continue
+            try:
+                total += float(row.get("realizedPL", 0.0) or 0.0)
+                hits += 1
+            except Exception:
+                continue
+        if hits > 0:
+            return float(total)
+    for key in ("realizedPL", "pl"):
+        try:
+            raw = fill_txn.get(key, None)
+            if raw in (None, ""):
+                continue
+            return float(raw)
+        except Exception:
+            continue
+    return None
+
+
+def _audit_realized_pnl_usd(row: Dict[str, Any]) -> float:
+    if not isinstance(row, dict):
+        return 0.0
+    for key in ("realized_pnl", "realized_pl", "realized_profit_usd", "realized"):
+        try:
+            raw = row.get(key, None)
+            if raw in (None, ""):
+                continue
+            return float(raw)
+        except Exception:
+            continue
+    payload = row.get("payload", {})
+    realized_from_payload = _realized_pnl_from_close_payload(payload if isinstance(payload, dict) else {})
+    if realized_from_payload is not None:
+        return float(realized_from_payload)
+    try:
+        return float(row.get("pnl_usd", 0.0) or 0.0)
+    except Exception:
+        return 0.0
 
 
 def _safe_float_from_dict(d: Dict[str, Any], keys: List[str]) -> float:
@@ -618,6 +678,8 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             if pnl <= (peak - trailing_gap_pct):
                 close_side = "long" if side == "long" else "short"
                 ok, msg, payload = client.close_position(inst, side=close_side)
+                realized_close_pnl = _realized_pnl_from_close_payload(payload if isinstance(payload, dict) else {})
+                pnl_for_audit = float(realized_close_pnl) if realized_close_pnl is not None else float(pnl_usd)
                 actions.append(f"CLOSE {inst} {close_side} | {'OK' if ok else 'FAIL'} | {msg}")
                 _append_jsonl(
                     audit_path,
@@ -630,7 +692,9 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                         "units": units,
                         "price": mid_px,
                         "pnl_pct": pnl,
-                        "pnl_usd": pnl_usd,
+                        "pnl_usd": pnl_for_audit,
+                        "pnl_usd_est": float(pnl_usd),
+                        "realized_pnl": pnl_for_audit if ok else None,
                         "mfe_pct": round(mfe, 4),
                         "mae_pct": round(mae, 4),
                         "hold_s": max(0, int(now_ts - entry_ts)),
@@ -642,7 +706,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 if ok:
                     trail_state.pop(inst, None)
                     open_meta.pop(inst, None)
-                    if pnl_usd < 0:
+                    if pnl_for_audit < 0:
                         loss_streak += 1
                         cooldown_until[inst] = float(now_ts + max(60, int(float(settings.get("forex_loss_cooldown_seconds", 1800) or 1800))))
                     else:
