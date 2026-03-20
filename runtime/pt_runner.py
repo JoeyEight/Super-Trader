@@ -78,6 +78,8 @@ WATCHDOG_INTERVAL_S = 15.0
 MARKETS_STALE_MULT = 4.0
 AUTOPILOT_STALE_MULT = 6.0
 MARKET_LOOP_RESTART_COOLDOWN_S = 180.0
+MARKET_LOOP_PHASE_TIMEOUT_RESTART_GRACE_S = 180.0
+MARKET_LOOP_PHASE_TIMEOUT_RESTART_GRACE_MULT = 1.25
 SCRIPT_WATCH_INTERVAL_S = 3.0
 SCRIPT_CHANGE_MIN_UPTIME_S = 3.0
 SCRIPT_CHANGE_RESTART_COOLDOWN_S = 10.0
@@ -510,6 +512,8 @@ class Runner:
         self._last_watchdog_at = 0.0
         self._last_market_loop_stale_note_at = 0.0
         self._last_market_loop_restart_at = 0.0
+        self._last_market_loop_phase_timeout_sig = ""
+        self._last_market_loop_phase_timeout_at = 0.0
         self._last_script_watch_at = 0.0
 
     def write_heartbeat(self) -> None:
@@ -975,22 +979,22 @@ class Runner:
         settings: Dict[str, Any],
         now: float,
         base_stale_after: float,
-    ) -> tuple[bool, float, str, str]:
+    ) -> tuple[bool, float, str, str, int, float]:
         loop_status = _safe_read_json(MARKET_LOOP_STATUS_PATH)
         phase = str(loop_status.get("phase", "idle") or "idle").strip().lower() if isinstance(loop_status, dict) else "idle"
+        phase_started_ts = int(loop_status.get("phase_started_ts", 0) or 0) if isinstance(loop_status, dict) else 0
+        phase_age_s = max(0.0, float(now) - float(phase_started_ts)) if phase_started_ts > 0 else 0.0
         if self._status_file_stale(MARKET_LOOP_STATUS_PATH, base_stale_after):
-            return True, float(base_stale_after), phase, "heartbeat_stale"
+            return True, float(base_stale_after), phase, "heartbeat_stale", int(phase_started_ts), float(phase_age_s)
         if not isinstance(loop_status, dict) or not loop_status:
-            return False, float(base_stale_after), phase, "ok"
-        phase_started_ts = int(loop_status.get("phase_started_ts", 0) or 0)
+            return False, float(base_stale_after), phase, "ok", int(phase_started_ts), float(phase_age_s)
         if phase in {"", "idle"} or phase_started_ts <= 0:
-            return False, float(base_stale_after), phase, "ok"
+            return False, float(base_stale_after), phase, "ok", int(phase_started_ts), float(phase_age_s)
         runtime_state = _safe_read_json(RUNTIME_STATE_PATH)
         phase_timeout_s = self._market_loop_phase_timeout_s(phase, runtime_state, base_stale_after)
-        phase_age_s = max(0.0, float(now) - float(phase_started_ts))
         if phase_age_s >= phase_timeout_s:
-            return True, float(phase_timeout_s), phase, "phase_timeout"
-        return False, float(phase_timeout_s), phase, "ok"
+            return True, float(phase_timeout_s), phase, "phase_timeout", int(phase_started_ts), float(phase_age_s)
+        return False, float(phase_timeout_s), phase, "ok", int(phase_started_ts), float(phase_age_s)
 
     def _child_uptime_s(self, child: Optional[ChildSpec], now: float) -> float:
         if child is None or child.proc is None or child.proc.poll() is not None:
@@ -1031,6 +1035,36 @@ class Runner:
         except Exception:
             market_loop_startup_grace_s = max(market_startup_grace_s, 150.0)
         market_loop_stale_after = self._market_loop_watchdog_stale_after(settings, floor_s=market_loop_startup_grace_s)
+        try:
+            raw_phase_timeout_restart_grace_s = settings.get(
+                "runner_market_loop_phase_timeout_restart_grace_s",
+                MARKET_LOOP_PHASE_TIMEOUT_RESTART_GRACE_S,
+            )
+            phase_timeout_restart_grace_s = max(
+                0.0,
+                float(
+                    MARKET_LOOP_PHASE_TIMEOUT_RESTART_GRACE_S
+                    if raw_phase_timeout_restart_grace_s in (None, "")
+                    else raw_phase_timeout_restart_grace_s
+                ),
+            )
+        except Exception:
+            phase_timeout_restart_grace_s = float(MARKET_LOOP_PHASE_TIMEOUT_RESTART_GRACE_S)
+        try:
+            raw_phase_timeout_restart_grace_mult = settings.get(
+                "runner_market_loop_phase_timeout_restart_grace_mult",
+                MARKET_LOOP_PHASE_TIMEOUT_RESTART_GRACE_MULT,
+            )
+            phase_timeout_restart_grace_mult = max(
+                0.0,
+                float(
+                    MARKET_LOOP_PHASE_TIMEOUT_RESTART_GRACE_MULT
+                    if raw_phase_timeout_restart_grace_mult in (None, "")
+                    else raw_phase_timeout_restart_grace_mult
+                ),
+            )
+        except Exception:
+            phase_timeout_restart_grace_mult = float(MARKET_LOOP_PHASE_TIMEOUT_RESTART_GRACE_MULT)
 
         targets = [
             (
@@ -1065,13 +1099,40 @@ class Runner:
                 market_loop_startup_grace_s + loop_stale_after
             ):
                 return
-            stale, loop_limit_s, phase, stale_reason = self._market_loop_watchdog_state(settings, now, loop_stale_after)
+            stale, loop_limit_s, phase, stale_reason, phase_started_ts, phase_age_s = self._market_loop_watchdog_state(
+                settings,
+                now,
+                loop_stale_after,
+            )
             if stale:
                 phase_txt = f" phase={phase}" if phase and phase != "idle" else ""
+                restart_deferred_reason = ""
+                if stale_reason == "phase_timeout":
+                    timeout_sig = f"{phase}:{int(phase_started_ts)}" if int(phase_started_ts) > 0 else str(phase or "")
+                    if timeout_sig != self._last_market_loop_phase_timeout_sig:
+                        self._last_market_loop_phase_timeout_sig = timeout_sig
+                        self._last_market_loop_phase_timeout_at = float(now)
+                    timeout_persist_s = max(0.0, float(now) - float(self._last_market_loop_phase_timeout_at or now))
+                    timeout_grace_s = min(
+                        1200.0,
+                        max(
+                            float(phase_timeout_restart_grace_s),
+                            float(loop_limit_s) * float(phase_timeout_restart_grace_mult),
+                        ),
+                    )
+                    if timeout_persist_s < timeout_grace_s:
+                        restart_deferred_reason = (
+                            f"phase-timeout grace {int(timeout_persist_s)}s/{int(timeout_grace_s)}s"
+                        )
+                else:
+                    self._last_market_loop_phase_timeout_sig = ""
+                    self._last_market_loop_phase_timeout_at = 0.0
                 if stale_reason == "phase_timeout" and phase_txt:
                     stale_msg = f"market loop phase timeout>{int(loop_limit_s)}s ({phase_txt.strip()}; markets child alive)"
                 else:
                     stale_msg = f"market loop status stale>{int(loop_limit_s)}s ({phase_txt.strip() + '; ' if phase_txt else ''}markets child alive)"
+                if restart_deferred_reason:
+                    stale_msg = f"{stale_msg} | restart deferred ({restart_deferred_reason})"
                 if (now - self._last_market_loop_stale_note_at) >= 60.0:
                     self._last_market_loop_stale_note_at = now
                     _runner_log(stale_msg)
@@ -1087,7 +1148,7 @@ class Runner:
                         },
                     )
                 restart_cooldown_s = max(float(MARKET_LOOP_RESTART_COOLDOWN_S), float(market_interval) * 3.0)
-                if (now - self._last_market_loop_restart_at) >= restart_cooldown_s:
+                if (not restart_deferred_reason) and ((now - self._last_market_loop_restart_at) >= restart_cooldown_s):
                     self._last_market_loop_restart_at = now
                     restart_msg = (
                         f"market loop stale>{int(loop_limit_s)}s; restarting markets child "
@@ -1110,6 +1171,9 @@ class Runner:
                         },
                     )
                     _terminate_process(markets_child.proc, "markets", force=False)
+            else:
+                self._last_market_loop_phase_timeout_sig = ""
+                self._last_market_loop_phase_timeout_at = 0.0
 
     def _retention_tick(self, now: float) -> None:
         if (now - self._last_log_cleanup_at) < LOG_RETENTION_INTERVAL_S:
