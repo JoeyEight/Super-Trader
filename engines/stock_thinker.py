@@ -310,21 +310,29 @@ def _build_top_chart_map(
     bars_lookup: Dict[str, List[Dict[str, Any]]],
     max_symbols: int = 6,
     limit: int = 120,
+    include_symbols: List[str] | None = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     out: Dict[str, List[Dict[str, Any]]] = {}
     seen: set[str] = set()
-    for row in list(leaders or []):
-        if len(out) >= max(1, int(max_symbols)):
-            break
-        if not isinstance(row, dict):
-            continue
-        symbol = str(row.get("symbol", "") or "").strip().upper()
-        if not symbol or symbol in seen:
-            continue
+    max_take = max(1, int(max_symbols))
+
+    def _add_symbol(raw_symbol: Any) -> None:
+        symbol = str(raw_symbol or "").strip().upper()
+        if (not symbol) or (symbol in seen) or (len(out) >= max_take):
+            return
         seen.add(symbol)
         bars = _compact_chart_bars(list(bars_lookup.get(symbol, []) or []), limit=limit)
         if len(bars) >= 2:
             out[symbol] = bars
+
+    for symbol in list(include_symbols or []):
+        _add_symbol(symbol)
+    for row in list(leaders or []):
+        if len(out) >= max_take:
+            break
+        if not isinstance(row, dict):
+            continue
+        _add_symbol(row.get("symbol"))
     return out
 
 
@@ -1593,9 +1601,9 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     prev_diag = _load_json_map(_scan_diag_path(hub_dir))
     prev_candidates = _norm_id_list(prev_diag.get("candidate_symbols", []))
     prev_leaders = _norm_id_list(prev_diag.get("leader_symbols", []))
+    prev_status = _load_json_map(_thinker_status_path(hub_dir))
     prev_top_symbol = str(prev_diag.get("top_symbol", "") or "").strip().upper()
     if not prev_top_symbol:
-        prev_status = _load_json_map(_thinker_status_path(hub_dir))
         prev_top = prev_status.get("top_pick", {}) if isinstance(prev_status.get("top_pick", {}), dict) else {}
         prev_top_symbol = str(prev_top.get("symbol", "") or "").strip().upper()
     provider = _stock_data_provider(settings)
@@ -1802,6 +1810,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "market_open": market_open,
             "market_clock": dict(clock_status),
         }
+    open_position_symbols = _load_open_position_symbols(hub_dir)
     max_scan = max(8, int(float(settings.get("stock_scan_max_symbols", 120) or 120)))
     if provider == "twelvedata":
         td_cap = max(1, int(float(settings.get("twelvedata_scan_symbol_cap", 8) or 8)))
@@ -1872,6 +1881,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     feed_order: List[str] = []
     td_bars_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
     client: AlpacaBrokerClient | None = None
+    td_client: TwelveDataClient | None = None
 
     if provider == "twelvedata":
         feed_order = ["twelvedata"]
@@ -2168,6 +2178,8 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                         except Exception:
                             symbol_bars = list(symbol_bars or [])
                 bars_count = int(len(symbol_bars or []))
+                if bars_count >= 2:
+                    best_bars_by_symbol[symbol] = list(symbol_bars or [])
                 if bars_count < min_bars_required:
                     retry_s = min(900, max(60, int((warm_queue.get(symbol, {}) or {}).get("retry_s", 60) or 60) * 2))
                     warm_queue[symbol] = {
@@ -2265,6 +2277,58 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 pass
             feed_health = _update_feed_health(feed_health, feed, ok=False, bars_total=0)
             scored = []
+
+    # Keep chart hydration independent from entry/quality gates: open positions should
+    # always have chart bars available even when a symbol is currently rejected.
+    if open_position_symbols:
+        missing_chart_symbols = [
+            sym
+            for sym in open_position_symbols
+            if _symbol_is_scannable(sym) and len(list(best_bars_by_symbol.get(sym, []) or [])) < 2
+        ]
+        if missing_chart_symbols:
+            if provider == "twelvedata" and td_client is not None:
+                try:
+                    td_extra = td_client.get_time_series_batch(
+                        missing_chart_symbols,
+                        interval="1h",
+                        outputsize=max(96, int(min_bars_required * 2)),
+                    )
+                    for sym in missing_chart_symbols:
+                        bars = list((td_extra.get(sym, []) if isinstance(td_extra, dict) else []) or [])
+                        if len(bars) >= 2:
+                            best_bars_by_symbol[sym] = bars
+                except Exception:
+                    pass
+            elif client is not None:
+                preferred_feed = str((feed_order[0] if feed_order else "iex") or "iex").strip().lower() or "iex"
+                for sym in missing_chart_symbols:
+                    symbol_bars: List[Dict[str, Any]] = []
+                    try:
+                        symbol_bars = client.get_stock_bars(
+                            sym,
+                            timeframe="1Hour",
+                            limit=160,
+                            feed=preferred_feed,
+                            start_iso=start_iso,
+                            end_iso=end_iso,
+                        )
+                    except Exception:
+                        symbol_bars = []
+                    if len(symbol_bars) < 2:
+                        try:
+                            symbol_bars = client.get_stock_bars(
+                                sym,
+                                timeframe="1Day",
+                                limit=120,
+                                feed=preferred_feed,
+                                start_iso=daily_start_iso,
+                                end_iso=daily_end_iso,
+                            )
+                        except Exception:
+                            symbol_bars = list(symbol_bars or [])
+                    if len(symbol_bars) >= 2:
+                        best_bars_by_symbol[sym] = list(symbol_bars)
 
     if not scored:
         # Keep thinker responsive even when bars are sparse/off-hours; execution still gates entries.
@@ -2691,15 +2755,32 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     chart_seed: List[Dict[str, Any]] = []
     if isinstance(top_pick, dict):
         chart_seed.append(dict(top_pick))
+    for symbol in list(open_position_symbols or []):
+        sym = str(symbol or "").strip().upper()
+        if sym:
+            chart_seed.append({"symbol": sym})
     chart_seed.extend([dict(r) for r in leaders[:10] if isinstance(r, dict)])
     chart_map_symbols = max(2, int(float(settings.get("market_chart_cache_symbols", 8) or 8)))
     chart_map_bars = max(40, int(float(settings.get("market_chart_cache_bars", 120) or 120)))
+    prev_chart_map_raw = prev_status.get("top_chart_map", {}) if isinstance(prev_status.get("top_chart_map", {}), dict) else {}
+    prev_chart_map = dict(prev_chart_map_raw) if isinstance(prev_chart_map_raw, dict) else {}
     top_chart_map = _build_top_chart_map(
         chart_seed,
         best_bars_by_symbol,
         max_symbols=chart_map_symbols,
         limit=chart_map_bars,
+        include_symbols=list(open_position_symbols or []),
     )
+    if prev_chart_map and (len(top_chart_map) < chart_map_symbols):
+        for symbol in list(open_position_symbols or []):
+            sym = str(symbol or "").strip().upper()
+            if (not sym) or (sym in top_chart_map):
+                continue
+            cached_rows = _compact_chart_bars(list(prev_chart_map.get(sym, []) or []), limit=chart_map_bars)
+            if len(cached_rows) >= 2:
+                top_chart_map[sym] = cached_rows
+            if len(top_chart_map) >= chart_map_symbols:
+                break
     top_source = str((top_pick or {}).get("data_source", "") or "")
     if top_symbol:
         top_chart = list(top_chart_map.get(top_symbol, []) or [])

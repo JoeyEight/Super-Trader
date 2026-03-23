@@ -36,6 +36,32 @@ class TestMarketChartMap(unittest.TestCase):
         self.assertEqual(set(out.keys()), {"AAPL"})
         self.assertEqual(len(out["AAPL"]), 2)
 
+    def test_stock_build_chart_map_prioritizes_include_symbols(self) -> None:
+        leaders = [{"symbol": "AAPL"}, {"symbol": "MSFT"}]
+        lookup = {
+            "AGRO": [
+                {"t": "t1", "o": 3.0, "h": 3.2, "l": 2.9, "c": 3.1},
+                {"t": "t2", "o": 3.1, "h": 3.3, "l": 3.0, "c": 3.2},
+            ],
+            "AAPL": [
+                {"t": "t1", "o": 1.0, "h": 1.2, "l": 0.9, "c": 1.1},
+                {"t": "t2", "o": 1.1, "h": 1.3, "l": 1.0, "c": 1.2},
+            ],
+            "MSFT": [
+                {"t": "t1", "o": 2.0, "h": 2.2, "l": 1.9, "c": 2.1},
+                {"t": "t2", "o": 2.1, "h": 2.3, "l": 2.0, "c": 2.2},
+            ],
+        }
+        out = build_stock_chart_map(
+            leaders,
+            lookup,
+            max_symbols=2,
+            limit=20,
+            include_symbols=["AGRO"],
+        )
+        self.assertEqual(list(out.keys())[0], "AGRO")
+        self.assertEqual(len(out["AGRO"]), 2)
+
     def test_forex_compact_chart_bars_maps_mid_payload(self) -> None:
         candles = [
             {"time": "2026-03-01T00:00:00Z", "mid": {"o": "1.1000", "h": "1.1010", "l": "1.0990", "c": "1.1005"}, "volume": 100},

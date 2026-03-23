@@ -412,21 +412,46 @@ def _build_top_chart_map(
     candles_lookup: Dict[str, List[Dict[str, Any]]],
     max_pairs: int = 6,
     limit: int = 120,
+    include_pairs: List[str] | None = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     out: Dict[str, List[Dict[str, Any]]] = {}
     seen: set[str] = set()
-    for row in list(leaders or []):
-        if len(out) >= max(1, int(max_pairs)):
-            break
-        if not isinstance(row, dict):
-            continue
-        pair = str(row.get("pair", "") or "").strip().upper()
-        if not pair or pair in seen:
-            continue
+    max_take = max(1, int(max_pairs))
+
+    def _add_pair(raw_pair: Any) -> None:
+        if len(out) >= max_take:
+            return
+        pair = str(raw_pair or "").strip().upper()
+        if (not pair) or (pair in seen):
+            return
         seen.add(pair)
         bars = _compact_chart_bars(list(candles_lookup.get(pair, []) or []), limit=limit)
         if len(bars) >= 2:
             out[pair] = bars
+
+    for pair in list(include_pairs or []):
+        _add_pair(pair)
+    for row in list(leaders or []):
+        if len(out) >= max_take:
+            break
+        if not isinstance(row, dict):
+            continue
+        _add_pair(row.get("pair"))
+    return out
+
+
+def _load_open_position_pairs(hub_dir: str) -> List[str]:
+    out: List[str] = []
+    try:
+        status = _load_json_map(os.path.join(hub_dir, "forex", "oanda_status.json"))
+        for row in list(status.get("raw_positions", []) or []):
+            if not isinstance(row, dict):
+                continue
+            pair = str(row.get("instrument", "") or row.get("pair", "") or "").strip().upper()
+            if pair and (pair not in out):
+                out.append(pair)
+    except Exception:
+        pass
     return out
 
 
@@ -1029,11 +1054,11 @@ def _summarize_rejections(rejected: List[Dict[str, Any]], universe_size: int) ->
 
 def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     prev_diag = _load_json_map(_scan_diag_path(hub_dir))
+    prev_status = _load_json_map(_thinker_status_path(hub_dir))
     prev_candidates = _norm_id_list(prev_diag.get("candidate_pairs", []))
     prev_leaders = _norm_id_list(prev_diag.get("leader_pairs", []))
     prev_top_pair = str(prev_diag.get("top_pair", "") or "").strip().upper()
     if not prev_top_pair:
-        prev_status = _load_json_map(_thinker_status_path(hub_dir))
         prev_top = prev_status.get("top_pick", {}) if isinstance(prev_status.get("top_pick", {}), dict) else {}
         prev_top_pair = str(prev_top.get("pair", "") or "").strip().upper()
     session_ctx = forex_session_bias()
@@ -1118,6 +1143,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         universe = client.list_tradeable_instruments() or list(DEFAULT_FX_UNIVERSE)
     max_scan = max(4, int(float(settings.get("forex_scan_max_pairs", 24) or 24)))
     universe = universe[:max_scan]
+    open_position_pairs = _load_open_position_pairs(hub_dir)
 
     max_spread_bps = max(0.0, float(settings.get("forex_max_spread_bps", 8.0) or 8.0))
     min_volatility_pct = max(0.0, float(settings.get("forex_min_volatility_pct", 0.01) or 0.01))
@@ -1247,6 +1273,25 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 continue
             candles_by_pair[pair] = list(candles or [])
             scored.append(row)
+
+        # Keep chart hydration independent from eligibility gates: open positions should
+        # always have chart bars available, even when currently filtered out of leaders.
+        for pair in list(open_position_pairs or []):
+            p = str(pair or "").strip().upper()
+            if not p:
+                continue
+            if len(list(candles_by_pair.get(p, []) or [])) >= 2:
+                continue
+            try:
+                params = urllib.parse.urlencode({"price": "M", "granularity": "H1", "count": "48"})
+                url = f"{rest_url}/v3/instruments/{p}/candles?{params}"
+                payload = _request_json(url, headers={"Authorization": f"Bearer {token}"}, timeout=10.0)
+                candles = payload.get("candles", []) or []
+                if isinstance(candles, list) and len(candles) >= 2:
+                    candles_by_pair[p] = list(candles)
+            except Exception:
+                continue
+
         scored.sort(key=lambda row: abs(float(row.get("score", 0.0))), reverse=True)
         outcome_map = _compute_outcome_map(hub_dir)
         market_calibration_samples = _market_pooled_calibration_samples(hub_dir, settings)
@@ -1378,15 +1423,36 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         chart_seed: List[Dict[str, Any]] = []
         if isinstance(top_pick, dict):
             chart_seed.append(dict(top_pick))
+        for pair in list(open_position_pairs or []):
+            p = str(pair or "").strip().upper()
+            if p:
+                chart_seed.append({"pair": p})
         chart_seed.extend([dict(r) for r in leaders[:10] if isinstance(r, dict)])
-        chart_map_pairs = max(2, int(float(settings.get("market_chart_cache_symbols", 8) or 8)))
+        chart_map_pairs = max(
+            2,
+            int(float(settings.get("market_chart_cache_symbols", 8) or 8)),
+            int(len([p for p in list(open_position_pairs or []) if str(p or "").strip()])),
+        )
         chart_map_bars = max(40, int(float(settings.get("market_chart_cache_bars", 120) or 120)))
+        prev_chart_map_raw = prev_status.get("top_chart_map", {}) if isinstance(prev_status.get("top_chart_map", {}), dict) else {}
+        prev_chart_map = dict(prev_chart_map_raw) if isinstance(prev_chart_map_raw, dict) else {}
         top_chart_map = _build_top_chart_map(
             chart_seed,
             candles_by_pair,
             max_pairs=chart_map_pairs,
             limit=chart_map_bars,
+            include_pairs=list(open_position_pairs or []),
         )
+        if prev_chart_map and open_position_pairs:
+            for pair in list(open_position_pairs or []):
+                p = str(pair or "").strip().upper()
+                if (not p) or (p in top_chart_map):
+                    continue
+                cached_rows = _compact_chart_bars(list(prev_chart_map.get(p, []) or []), limit=chart_map_bars)
+                if len(cached_rows) >= 2:
+                    top_chart_map[p] = cached_rows
+                if len(top_chart_map) >= chart_map_pairs:
+                    break
         top_chart = list(top_chart_map.get(top_pair, []) or [])
         _append_jsonl(
             _rankings_path(hub_dir),

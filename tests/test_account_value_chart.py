@@ -167,6 +167,84 @@ class AccountValueChartTests(unittest.TestCase):
             self.assertEqual(chart.ax.annotations[0][0], "BTC BUY")
             self.assertGreater(chart.canvas.draw_idle_calls, 0)
 
+    def test_market_history_trims_legacy_regime_after_large_value_jump(self) -> None:
+        pt_hub = _load_pt_hub_module()
+        hub_cls = pt_hub.PowerTraderHub
+
+        with tempfile.TemporaryDirectory() as td:
+            history_path = os.path.join(td, "stocks_account_value_history.jsonl")
+            rows = [
+                {"ts": 100, "total_account_value": 99996.74},
+                {"ts": 200, "total_account_value": 100007.29},
+                {"ts": 300, "total_account_value": 100.12},
+                {"ts": 400, "total_account_value": 100.53},
+            ]
+            with open(history_path, "w", encoding="utf-8") as f:
+                for row in rows:
+                    f.write(json.dumps(row) + "\n")
+
+            hub = types.SimpleNamespace(
+                settings={"alpaca_base_url": "https://api.alpaca.markets"},
+                market_account_history_paths={"stocks": history_path},
+                market_state_dirs={},
+                hub_dir=td,
+                project_dir=td,
+            )
+            hub._coerce_float_value = hub_cls._coerce_float_value.__get__(hub, hub_cls)
+            hub._market_account_history_path = hub_cls._market_account_history_path.__get__(hub, hub_cls)
+            hub._normalize_market_broker_mode = hub_cls._normalize_market_broker_mode.__get__(hub, hub_cls)
+            hub._market_account_history_context = hub_cls._market_account_history_context.__get__(hub, hub_cls)
+            hub._market_account_value_from_snapshot = hub_cls._market_account_value_from_snapshot.__get__(hub, hub_cls)
+
+            points = hub_cls._read_market_account_history(
+                hub,
+                "stocks",
+                status_data={"equity": 100.53, "ts": 450},
+                trader_data={"account_value_usd": 100.53, "updated_at": 450, "broker_mode": "live"},
+                max_points=250,
+            )
+            self.assertTrue(points)
+            self.assertTrue(all(float(v) < 1000.0 for _, v in points))
+
+    def test_market_history_filters_explicit_broker_mode_mismatch(self) -> None:
+        pt_hub = _load_pt_hub_module()
+        hub_cls = pt_hub.PowerTraderHub
+
+        with tempfile.TemporaryDirectory() as td:
+            history_path = os.path.join(td, "stocks_account_value_history.jsonl")
+            rows = [
+                {"ts": 100, "total_account_value": 99999.0, "broker_mode": "paper", "broker_endpoint": "https://paper-api.alpaca.markets"},
+                {"ts": 200, "total_account_value": 100.10, "broker_mode": "live", "broker_endpoint": "https://api.alpaca.markets"},
+                {"ts": 300, "total_account_value": 99990.0, "broker_mode": "paper", "broker_endpoint": "https://paper-api.alpaca.markets"},
+                {"ts": 400, "total_account_value": 100.40, "broker_mode": "live", "broker_endpoint": "https://api.alpaca.markets"},
+            ]
+            with open(history_path, "w", encoding="utf-8") as f:
+                for row in rows:
+                    f.write(json.dumps(row) + "\n")
+
+            hub = types.SimpleNamespace(
+                settings={"alpaca_base_url": "https://api.alpaca.markets"},
+                market_account_history_paths={"stocks": history_path},
+                market_state_dirs={},
+                hub_dir=td,
+                project_dir=td,
+            )
+            hub._coerce_float_value = hub_cls._coerce_float_value.__get__(hub, hub_cls)
+            hub._market_account_history_path = hub_cls._market_account_history_path.__get__(hub, hub_cls)
+            hub._normalize_market_broker_mode = hub_cls._normalize_market_broker_mode.__get__(hub, hub_cls)
+            hub._market_account_history_context = hub_cls._market_account_history_context.__get__(hub, hub_cls)
+            hub._market_account_value_from_snapshot = hub_cls._market_account_value_from_snapshot.__get__(hub, hub_cls)
+
+            points = hub_cls._read_market_account_history(
+                hub,
+                "stocks",
+                status_data={"equity": 100.50, "ts": 450},
+                trader_data={"account_value_usd": 100.50, "updated_at": 450, "broker_mode": "live"},
+                max_points=250,
+            )
+            self.assertTrue(points)
+            self.assertTrue(all(float(v) < 1000.0 for _, v in points))
+
 
 if __name__ == "__main__":
     unittest.main()

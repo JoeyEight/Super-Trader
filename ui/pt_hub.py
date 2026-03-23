@@ -1168,6 +1168,10 @@ class CandleChart(ttk.Frame):
         self.last_update_label = ttk.Label(status_row, text="Last: N/A")
         self.last_update_label.pack(side="right")
 
+        # Structured legend payload consumed by the crypto left-panel legend renderer.
+        self._legend_rows: List[Dict[str, Any]] = []
+        self._legend_note: str = ""
+
         # Figure
         # IMPORTANT: keep a stable DPI and resize the figure to the widget's pixel size.
         # On Windows scaling, trying to "sync DPI" via winfo_fpixels("1i") can produce the
@@ -1678,6 +1682,16 @@ class CandleChart(ttk.Frame):
 
         if not candles:
             self._legend_panel_text = f"{self.coin}: waiting for candle data..."
+            self._legend_rows = [
+                {"label": "Green candle", "meaning": "Price closed above open for that bar.", "color": DARK_ACCENT, "dash": (), "sample": "square"},
+                {"label": "Red candle", "meaning": "Price closed below open for that bar.", "color": "#FF6B57", "dash": (), "sample": "square"},
+                {"label": "Long neural level", "meaning": "Blue support/reference level from neural model.", "color": "blue", "dash": ()},
+                {"label": "Short neural level", "meaning": "Orange resistance/reference level from neural model.", "color": "orange", "dash": ()},
+                {"label": "Trail line (★)", "meaning": "Trailing sell threshold once armed.", "color": "green", "dash": ()},
+                {"label": "Next DCA (◆)", "meaning": "Next averaging-buy trigger level.", "color": "red", "dash": ()},
+                {"label": "Average cost (●)", "meaning": "Current blended entry price.", "color": "yellow", "dash": ()},
+            ]
+            self._legend_note = "Chart is loading. Legend previews the indicator meanings."
             self._legend_tooltip_text = ""
             self._legend_bbox_px = None
             self._legend_hover_artist = None
@@ -2049,8 +2063,82 @@ class CandleChart(ttk.Frame):
                 ]
 
             legend_text = _wrap_text_block("\n".join(legend_lines), width=60)
+            legend_rows: List[Dict[str, Any]] = [
+                {
+                    "label": "Green candle",
+                    "meaning": "Price closed above open for that bar.",
+                    "color": DARK_ACCENT,
+                    "dash": (),
+                    "sample": "square",
+                },
+                {
+                    "label": "Red candle",
+                    "meaning": "Price closed below open for that bar.",
+                    "color": "#FF6B57",
+                    "dash": (),
+                    "sample": "square",
+                },
+                {
+                    "label": "Long neural level",
+                    "meaning": "Blue support/reference level from neural model.",
+                    "color": "blue",
+                    "dash": (),
+                },
+                {
+                    "label": "Short neural level",
+                    "meaning": "Orange resistance/reference level from neural model.",
+                    "color": "orange",
+                    "dash": (),
+                },
+                {
+                    "label": "Trail line (★)",
+                    "meaning": (
+                        f"Trailing sell threshold ({trail_text}). "
+                        "Crossing back through it can trigger a sell."
+                    ),
+                    "color": "green",
+                    "dash": (),
+                },
+                {
+                    "label": "Next DCA (◆)",
+                    "meaning": (
+                        f"Next averaging-buy trigger ({dca_text}). "
+                        "Touching this line makes the next DCA buy eligible."
+                    ),
+                    "color": "red",
+                    "dash": (),
+                },
+                {
+                    "label": "Average cost (●)",
+                    "meaning": f"Current blended entry price ({avg_text}).",
+                    "color": "yellow",
+                    "dash": (),
+                },
+            ]
+            if show_detailed_levels:
+                legend_rows.extend(
+                    [
+                        {
+                            "label": "Ask line (A)",
+                            "meaning": f"Current buy-side market reference ({ask_text}).",
+                            "color": "purple",
+                            "dash": (),
+                        },
+                        {
+                            "label": "Bid line (B)",
+                            "meaning": f"Current sell-side market reference ({bid_text}).",
+                            "color": "teal",
+                            "dash": (),
+                        },
+                    ]
+                )
 
             self._legend_panel_text = legend_text
+            self._legend_rows = legend_rows
+            self._legend_note = (
+                f"Mode: {level_mode_label}. "
+                "Use this key to map each chart line/symbol to entry/exit meaning."
+            )
             self._legend_mode = level_mode_label
             self._legend_tooltip_text = ""
             self._legend_bbox_px = None
@@ -2058,6 +2146,8 @@ class CandleChart(ttk.Frame):
             self._legend_needs_scroll = bool(show_detailed_levels)
         except Exception:
             self._legend_panel_text = "Legend unavailable"
+            self._legend_rows = []
+            self._legend_note = "Legend unavailable."
             self._legend_mode = "N/A"
             self._legend_tooltip_text = ""
             self._legend_bbox_px = None
@@ -7455,6 +7545,18 @@ class PowerTraderHub(tk.Tk):
         chart_legend_body = ttk.Frame(chart_legend_box)
         chart_legend_body.pack(fill="both", expand=True, padx=6, pady=6)
 
+        self.chart_legend_note_var = tk.StringVar(
+            value="Select a coin chart to view legend details."
+        )
+        self.chart_legend_note_lbl = ttk.Label(
+            chart_legend_body,
+            textvariable=self.chart_legend_note_var,
+            foreground=DARK_MUTED,
+            justify="left",
+            wraplength=520,
+        )
+        self.chart_legend_note_lbl.pack(fill="x", pady=(0, 4))
+
         self.chart_legend_text = tk.Text(
             chart_legend_body,
             height=7,
@@ -7474,9 +7576,13 @@ class PowerTraderHub(tk.Tk):
         )
         self.chart_legend_scroll = ttk.Scrollbar(chart_legend_body, orient="vertical", command=self.chart_legend_text.yview)
         self.chart_legend_text.configure(yscrollcommand=self.chart_legend_scroll.set)
-        self.chart_legend_text.pack(side="left", fill="both", expand=True)
-        self.chart_legend_scroll.pack(side="right", fill="y")
-        self.chart_legend_scroll.pack_forget()
+        self.chart_legend_rows_frame = ttk.Frame(chart_legend_body)
+        self.chart_legend_rows_frame.pack(fill="both", expand=True)
+        self._chart_legend_rows_sig = ()
+        try:
+            chart_legend_body.bind("<Configure>", lambda _e: self._refresh_chart_legend_panel(), add="+")
+        except Exception:
+            pass
         try:
             self.chart_legend_text.tag_configure("legend_head", foreground=DARK_ACCENT2, font=(self._live_log_font.cget("family"), int(self._live_log_font.cget("size")), "bold"))
             self.chart_legend_text.tag_configure("legend_label", foreground="#A9B7C6")
@@ -7484,6 +7590,8 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             pass
         self.chart_legend_text.configure(state="disabled")
+        self.chart_legend_text.pack_forget()
+        self.chart_legend_scroll.pack_forget()
         # Removed Neural Levels panel from the account overview per UX request.
         # Keep these placeholders so existing refresh helpers remain no-op safe.
         self.neural_box = None
@@ -8710,6 +8818,22 @@ class PowerTraderHub(tk.Tk):
         )
         quick_setting_lbl.pack(anchor="w", padx=6, pady=(0, 4), fill="x")
 
+        legend_box = ttk.LabelFrame(market_dash_body, text="Chart Legend")
+        legend_box.pack(fill="x", padx=6, pady=(0, 6))
+        legend_note_var = tk.StringVar(
+            value="Select a symbol from Chart Focus to view the active line meanings."
+        )
+        legend_note_lbl = ttk.Label(
+            legend_box,
+            textvariable=legend_note_var,
+            foreground=DARK_MUTED,
+            justify="left",
+            wraplength=520,
+        )
+        legend_note_lbl.pack(fill="x", padx=6, pady=(4, 2))
+        legend_rows_frame = ttk.Frame(legend_box)
+        legend_rows_frame.pack(fill="x", padx=6, pady=(0, 6))
+
         def _responsive_grid(container: tk.Widget, widgets: List[tk.Widget], *, min_col_width: int = 160) -> None:
             try:
                 width = max(1, int(container.winfo_width() or market_dash_body.winfo_width() or 1))
@@ -8741,7 +8865,7 @@ class PowerTraderHub(tk.Tk):
             except Exception:
                 width = 260
             detail_wrap = max(220, width - 28)
-            for label_widget in (state_lbl, endpoint_lbl, quick_setting_lbl):
+            for label_widget in (state_lbl, endpoint_lbl, quick_setting_lbl, legend_note_lbl):
                 try:
                     label_widget.configure(wraplength=detail_wrap)
                 except Exception:
@@ -9281,6 +9405,10 @@ class PowerTraderHub(tk.Tk):
             "chart_table_headings": {},
             "chart_table_layout_key": "",
             "chart_table_widths": {},
+            "chart_legend_rows": [],
+            "chart_legend_note_var": legend_note_var,
+            "chart_legend_rows_frame": legend_rows_frame,
+            "chart_legend_render_sig": (),
             "watch_box": watch_box,
             "watch_tree": None,
             "watch_canvas": watch_canvas,
@@ -9300,6 +9428,15 @@ class PowerTraderHub(tk.Tk):
             "system_details_visible_var": system_details_visible_var,
             "system_toggle_btn": system_toggle_btn,
         }
+        try:
+            legend_rows_frame.bind(
+                "<Configure>",
+                lambda _e, mk=market_key: self._render_market_chart_legend(mk),
+                add="+",
+            )
+        except Exception:
+            pass
+        self._render_market_chart_legend(market_key)
         self._render_market_log(market_key)
 
         right_split.add(charts_frame, weight=4)
@@ -10789,6 +10926,69 @@ class PowerTraderHub(tk.Tk):
             return None
         return float(fallback_value)
 
+    def _normalize_market_broker_mode(self, market_key: str, raw_mode: Any) -> str:
+        mk = str(market_key or "").strip().lower()
+        mode_txt = str(raw_mode or "").strip().lower()
+        if not mode_txt:
+            return ""
+        if mk == "stocks":
+            if ("paper" in mode_txt) or ("sim" in mode_txt):
+                return "paper"
+            if "live" in mode_txt:
+                return "live"
+            return ""
+        if mk == "forex":
+            if ("practice" in mode_txt) or ("paper" in mode_txt) or ("demo" in mode_txt):
+                return "practice"
+            if ("live" in mode_txt) or ("fxtrade" in mode_txt):
+                return "live"
+            return ""
+        return mode_txt
+
+    def _market_account_history_context(
+        self,
+        market_key: str,
+        *,
+        status_data: Optional[Dict[str, Any]] = None,
+        trader_data: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, str]:
+        mk = str(market_key or "").strip().lower()
+        status = status_data if isinstance(status_data, dict) else {}
+        trader = trader_data if isinstance(trader_data, dict) else {}
+        mode = self._normalize_market_broker_mode(
+            mk,
+            trader.get("broker_mode", status.get("broker_mode", "")),
+        )
+        endpoint = ""
+        if mk == "stocks":
+            raw_endpoint = str(
+                self.settings.get("alpaca_base_url", DEFAULT_SETTINGS.get("alpaca_base_url", f"https://{ALPACA_LIVE_HOST}"))
+                or f"https://{ALPACA_LIVE_HOST}"
+            )
+            normalized_endpoint, _, endpoint_host = normalize_endpoint_url(
+                raw_endpoint,
+                default=f"https://{ALPACA_LIVE_HOST}",
+            )
+            endpoint = str(normalized_endpoint or raw_endpoint or "").strip().rstrip("/")
+            if not mode:
+                mode = "paper" if str(endpoint_host or "").strip().lower() == ALPACA_PAPER_HOST else "live"
+        elif mk == "forex":
+            raw_endpoint = str(
+                self.settings.get("oanda_rest_url", DEFAULT_SETTINGS.get("oanda_rest_url", f"https://{OANDA_LIVE_REST_HOST}"))
+                or f"https://{OANDA_LIVE_REST_HOST}"
+            )
+            normalized_endpoint, _, endpoint_host = normalize_endpoint_url(
+                raw_endpoint,
+                default=f"https://{OANDA_LIVE_REST_HOST}",
+            )
+            endpoint = str(normalized_endpoint or raw_endpoint or "").strip().rstrip("/")
+            if not mode:
+                mode = "practice" if str(endpoint_host or "").strip().lower() == OANDA_PRACTICE_REST_HOST else "live"
+        return {
+            "mode": str(mode or "").strip().lower(),
+            "endpoint": str(endpoint or "").strip().rstrip("/"),
+        }
+
     def _append_market_account_history_point(
         self,
         market_key: str,
@@ -10822,10 +11022,21 @@ class PowerTraderHub(tk.Tk):
             return
         try:
             _ensure_dir(os.path.dirname(path))
+            context = self._market_account_history_context(
+                market_key,
+                status_data=status_data,
+                trader_data=trader_data,
+            )
             payload = {
                 "ts": int(ts_f),
                 "total_account_value": float(account_value),
             }
+            hist_mode = str(context.get("mode", "") or "").strip().lower()
+            hist_endpoint = str(context.get("endpoint", "") or "").strip().rstrip("/")
+            if hist_mode:
+                payload["broker_mode"] = hist_mode
+            if hist_endpoint:
+                payload["broker_endpoint"] = hist_endpoint
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(payload, ensure_ascii=True) + "\n")
             self._last_market_account_history_write_ts[market_key] = float(ts_f)
@@ -10842,6 +11053,14 @@ class PowerTraderHub(tk.Tk):
         max_points: int = 250,
     ) -> List[Tuple[float, float]]:
         points: List[Tuple[float, float]] = []
+        rows: List[Dict[str, Any]] = []
+        current_context = self._market_account_history_context(
+            market_key,
+            status_data=status_data,
+            trader_data=trader_data,
+        )
+        current_mode = str(current_context.get("mode", "") or "").strip().lower()
+        current_endpoint = str(current_context.get("endpoint", "") or "").strip().rstrip("/")
         path = self._market_account_history_path(market_key)
         if path and os.path.isfile(path):
             try:
@@ -10860,11 +11079,58 @@ class PowerTraderHub(tk.Tk):
                             continue
                         if (not math.isfinite(ts_f)) or (not math.isfinite(val_f)) or val_f <= 0.0:
                             continue
-                        points.append((ts_f, val_f))
+                        row_mode = self._normalize_market_broker_mode(
+                            market_key,
+                            row.get("broker_mode", row.get("mode", "")),
+                        )
+                        row_endpoint = str(row.get("broker_endpoint", row.get("endpoint", "")) or "").strip().rstrip("/")
+                        if row_endpoint:
+                            try:
+                                row_endpoint_norm, _, _ = normalize_endpoint_url(row_endpoint, default=row_endpoint)
+                                row_endpoint = str(row_endpoint_norm or row_endpoint).strip().rstrip("/")
+                            except Exception:
+                                row_endpoint = str(row_endpoint or "").strip().rstrip("/")
+                        rows.append(
+                            {
+                                "ts": float(ts_f),
+                                "value": float(val_f),
+                                "mode": str(row_mode or "").strip().lower(),
+                                "endpoint": str(row_endpoint or "").strip().rstrip("/"),
+                            }
+                        )
             except Exception:
-                points = []
+                rows = []
+        if rows:
+            if current_mode or current_endpoint:
+                filtered_rows: List[Dict[str, Any]] = []
+                for row in rows:
+                    row_mode = str(row.get("mode", "") or "").strip().lower()
+                    row_endpoint = str(row.get("endpoint", "") or "").strip().rstrip("/")
+                    if current_mode and row_mode and row_mode != current_mode:
+                        continue
+                    if current_endpoint and row_endpoint and row_endpoint != current_endpoint:
+                        continue
+                    filtered_rows.append(row)
+                if filtered_rows:
+                    rows = filtered_rows
+            points = [(float(row.get("ts", 0.0) or 0.0), float(row.get("value", 0.0) or 0.0)) for row in rows]
         if points:
             points.sort(key=lambda row: row[0])
+            if len(points) >= 3:
+                # If account context switches (paper -> live), history can contain a large
+                # discontinuity. Keep the newest contiguous regime to avoid skewed axes.
+                jump_cut_idx = 0
+                jump_ratio_threshold = 12.0
+                for idx in range(1, len(points)):
+                    prev_val = float(points[idx - 1][1] or 0.0)
+                    cur_val = float(points[idx][1] or 0.0)
+                    if prev_val <= 0.0 or cur_val <= 0.0:
+                        continue
+                    ratio = max(prev_val, cur_val) / max(min(prev_val, cur_val), 1e-9)
+                    if ratio >= jump_ratio_threshold:
+                        jump_cut_idx = idx
+                if jump_cut_idx > 0 and (len(points) - jump_cut_idx) >= 2:
+                    points = points[jump_cut_idx:]
             dedup: List[Tuple[float, float]] = []
             for ts_f, val_f in points:
                 if dedup and ts_f == dedup[-1][0]:
@@ -11154,6 +11420,219 @@ class PowerTraderHub(tk.Tk):
         if impact_parts:
             base += f"\nImpact if hit: {' | '.join(impact_parts)}"
         return base
+
+    def _overlay_meaning_from_tooltip(self, tooltip: Any) -> str:
+        txt = str(tooltip or "").strip()
+        if not txt:
+            return ""
+        for raw in txt.splitlines():
+            line = str(raw or "").strip()
+            if line.lower().startswith("meaning:"):
+                return str(line.split(":", 1)[1]).strip()
+        return ""
+
+    def _market_chart_legend_payload(
+        self,
+        market_key: str,
+        *,
+        side: str = "",
+        overlays: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[List[Dict[str, Any]], str]:
+        mk = str(market_key or "").strip().lower()
+        side_up = str(side or "").strip().upper()
+
+        rows: List[Dict[str, Any]] = [
+            {
+                "label": "Green candle",
+                "meaning": "Price closed above open for that bar.",
+                "color": DARK_ACCENT,
+                "dash": (),
+                "sample": "square",
+            },
+            {
+                "label": "Red candle",
+                "meaning": "Price closed below open for that bar.",
+                "color": "#FF6B57",
+                "dash": (),
+                "sample": "square",
+            },
+            {
+                "label": "EMA 9 (cyan)",
+                "meaning": "Fast trend line; responds quickly to momentum shifts.",
+                "color": "#00E5FF",
+                "dash": (),
+            },
+            {
+                "label": "EMA 21 (gold)",
+                "meaning": "Slow trend line; baseline trend direction.",
+                "color": "#FFD166",
+                "dash": (),
+            },
+            {
+                "label": "Last price (cyan dashed)",
+                "meaning": "Current market price guide.",
+                "color": DARK_ACCENT2,
+                "dash": (4, 3),
+            },
+        ]
+
+        seen_overlay_labels: set[str] = set()
+        for item in list(overlays or []):
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label", "Level") or "Level").strip()
+            if not label:
+                continue
+            key = label.upper()
+            if key in seen_overlay_labels:
+                continue
+            seen_overlay_labels.add(key)
+            tip_meaning = self._overlay_meaning_from_tooltip(item.get("tooltip", ""))
+            meaning = tip_meaning
+            if not meaning:
+                if key == "AVG":
+                    meaning = "Blended entry price of your current position."
+                elif key == "TARGET":
+                    meaning = "Profit-arm threshold; once reached, trailing exit becomes eligible."
+                elif key == "TRAIL":
+                    meaning = "Trailing exit line; crossing back through it can close the trade."
+                elif key in {"BREAKOUT", "BREAKDOWN", "RANGE HIGH", "RANGE LOW"}:
+                    meaning = "Recent structure benchmark from the current scan window."
+                else:
+                    meaning = "Benchmark line for the active setup."
+            rows.append(
+                {
+                    "label": label,
+                    "meaning": meaning,
+                    "color": str(item.get("color", "#A3B1FF") or "#A3B1FF"),
+                    "dash": tuple(item.get("dash", ()) if isinstance(item.get("dash", ()), (list, tuple)) else ()),
+                }
+            )
+
+        if side_up == "SHORT":
+            note = (
+                "SHORT context: lower target/trail lines can be correct. "
+                "Price must move down into those levels before exit logic can trigger."
+            )
+        elif side_up == "LONG":
+            note = (
+                "LONG context: target/trail lines are usually above current price. "
+                "Price must rise into those levels before trailing exits can trigger."
+            )
+        else:
+            market_label = "pair" if mk == "forex" else "symbol"
+            note = f"Select a {market_label} to see side-aware entry/exit line meanings."
+        return rows, note
+
+    def _render_market_chart_legend(self, market_key: str) -> None:
+        panel = self.market_panels.get(market_key, {})
+        rows_frame = panel.get("chart_legend_rows_frame")
+        note_var = panel.get("chart_legend_note_var")
+        if not rows_frame:
+            return
+        rows = panel.get("chart_legend_rows", [])
+        if not isinstance(rows, list):
+            rows = []
+        note_txt = str(panel.get("chart_legend_note", "") or "").strip()
+        if not note_txt:
+            note_txt = "Select a symbol from Chart Focus to view the active line meanings."
+        try:
+            if note_var is not None:
+                note_var.set(note_txt)
+        except Exception:
+            pass
+
+        try:
+            wrap_w = max(220, int(rows_frame.winfo_width() or 320) - 86)
+        except Exception:
+            wrap_w = 240
+        sig = (
+            note_txt,
+            int(wrap_w),
+            tuple(
+                (
+                    str((row or {}).get("label", "") or ""),
+                    str((row or {}).get("meaning", "") or ""),
+                    str((row or {}).get("color", "") or ""),
+                    tuple((row or {}).get("dash", ()) if isinstance((row or {}).get("dash", ()), (list, tuple)) else ()),
+                )
+                for row in rows
+                if isinstance(row, dict)
+            ),
+        )
+        if panel.get("chart_legend_render_sig") == sig:
+            return
+        panel["chart_legend_render_sig"] = sig
+
+        try:
+            for child in list(rows_frame.winfo_children()):
+                child.destroy()
+        except Exception:
+            pass
+
+        if not rows:
+            try:
+                ttk.Label(
+                    rows_frame,
+                    text="Legend will populate after chart data loads.",
+                    foreground=DARK_MUTED,
+                    justify="left",
+                ).pack(fill="x")
+            except Exception:
+                pass
+            return
+
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label", "Line") or "Line").strip()
+            meaning = str(item.get("meaning", "") or "").strip()
+            color = str(item.get("color", DARK_ACCENT2) or DARK_ACCENT2)
+            dash = tuple(item.get("dash", ()) if isinstance(item.get("dash", ()), (list, tuple)) else ())
+            sample_kind = str(item.get("sample", "line") or "line").strip().lower()
+            row_wrap = ttk.Frame(rows_frame)
+            row_wrap.pack(fill="x", pady=(0, 3))
+            sample = tk.Canvas(
+                row_wrap,
+                width=72,
+                height=14,
+                bg=DARK_PANEL,
+                highlightthickness=1,
+                highlightbackground=DARK_BORDER,
+                bd=0,
+            )
+            sample.pack(side="left", padx=(0, 8))
+            try:
+                if sample_kind in {"square", "box", "candle"}:
+                    sample.create_rectangle(
+                        28,
+                        3,
+                        44,
+                        11,
+                        outline=color,
+                        fill=color,
+                        width=1,
+                    )
+                else:
+                    sample.create_line(
+                        6,
+                        7,
+                        66,
+                        7,
+                        fill=color,
+                        width=2,
+                        dash=(tuple(dash) if dash else ()),
+                    )
+            except Exception:
+                pass
+            desc = f"{label}: {meaning}" if meaning else label
+            ttk.Label(
+                row_wrap,
+                text=desc,
+                foreground=DARK_FG,
+                justify="left",
+                wraplength=wrap_w,
+            ).pack(side="left", fill="x", expand=True)
 
     def _market_chart_benchmark_overlays(
         self,
@@ -13784,6 +14263,16 @@ class PowerTraderHub(tk.Tk):
         if view == "Overview":
             _canvas_mode()
             if focus_selection == "ACCOUNT":
+                legend_rows, _legend_note = self._market_chart_legend_payload(
+                    market_key,
+                    side="",
+                    overlays=[],
+                )
+                panel["chart_legend_rows"] = legend_rows
+                panel["chart_legend_note"] = (
+                    "Account view shows equity only. Select a symbol/pair to see target/trail line meanings."
+                )
+                self._render_market_chart_legend(market_key)
                 self._render_market_account_overview(
                     market_key,
                     canvas,
@@ -13910,6 +14399,17 @@ class PowerTraderHub(tk.Tk):
                     parsed=parsed,
                     base_overlays=chart_overlays,
                 )
+                legend_side = str(
+                    (position_ctx.get("side", "") if isinstance(position_ctx, dict) else "")
+                    or (focus_row.get("side", "") if isinstance(focus_row, dict) else "")
+                ).strip().upper()
+                legend_rows, legend_note = self._market_chart_legend_payload(
+                    market_key,
+                    side=legend_side,
+                    overlays=benchmark_overlays,
+                )
+                panel["chart_legend_rows"] = legend_rows
+                panel["chart_legend_note"] = legend_note
                 overlay_values = [
                     float((row or {}).get("price", 0.0) or 0.0)
                     for row in list(benchmark_overlays or [])
@@ -14109,6 +14609,21 @@ class PowerTraderHub(tk.Tk):
                         font=(self._live_log_font.cget("family"), max(8, int(self._live_log_font.cget("size")))),
                     )
             else:
+                legend_side = str(
+                    (position_ctx.get("side", "") if isinstance(position_ctx, dict) else "")
+                    or (focus_row.get("side", "") if isinstance(focus_row, dict) else "")
+                ).strip().upper()
+                legend_rows, legend_note = self._market_chart_legend_payload(
+                    market_key,
+                    side=legend_side,
+                    overlays=list(chart_overlays or []),
+                )
+                panel["chart_legend_rows"] = legend_rows
+                panel["chart_legend_note"] = (
+                    f"{legend_note} Waiting for hydrated bars on this symbol."
+                    if legend_note
+                    else "Waiting for hydrated bars on this symbol."
+                )
                 panel_left = (18 if compact_overview else min(width - 220, max(250, int(width * 0.42))))
                 panel_right = width - 20
                 panel_top = (78 if compact_overview else 42)
@@ -14157,7 +14672,7 @@ class PowerTraderHub(tk.Tk):
                     or (warmup_pending > 0 and updated_age_s <= 240)
                     or (thinker_state in {"starting", "running", "scanning", "hydrating"})
                     or ((not has_cached_chart) and updated_age_s <= 35)
-                    or (selected_chart_missing and (explicit_focus_pending or updated_age_s <= 45))
+                    or (selected_chart_missing and explicit_focus_pending)
                 )
 
                 if likely_loading:
@@ -14287,6 +14802,10 @@ class PowerTraderHub(tk.Tk):
                         canvas.tag_bind(scanner_tag, "<Button-1>", lambda _e, mk=market_key: self._switch_market_view(mk, "Scanner"))
                         canvas.tag_bind(scanner_tag, "<Enter>", lambda _e, cv=canvas: cv.configure(cursor="hand2"))
                         canvas.tag_bind(scanner_tag, "<Leave>", lambda _e, cv=canvas: cv.configure(cursor=""))
+        except Exception:
+            pass
+        try:
+            self._render_market_chart_legend(market_key)
         except Exception:
             pass
         self._schedule_market_chart_hover_refresh(market_key)
@@ -17420,12 +17939,12 @@ class PowerTraderHub(tk.Tk):
 
 
     def _refresh_chart_legend_panel(self) -> None:
-        widget = getattr(self, "chart_legend_text", None)
         box = getattr(self, "chart_legend_box", None)
         btn = getattr(self, "btn_chart_legend_toggle", None)
         header = getattr(self, "chart_legend_header", None)
-        scroll = getattr(self, "chart_legend_scroll", None)
-        if widget is None or box is None:
+        rows_frame = getattr(self, "chart_legend_rows_frame", None)
+        note_var = getattr(self, "chart_legend_note_var", None)
+        if box is None or rows_frame is None:
             return
 
         try:
@@ -17434,8 +17953,9 @@ class PowerTraderHub(tk.Tk):
             collapsed = False
 
         page = str(getattr(self, "_current_chart_page", "ACCOUNT") or "ACCOUNT").strip().upper()
+        rows: List[Dict[str, Any]] = []
+        note_txt = "Select a coin chart to view legend details."
         if page == "ACCOUNT":
-            text = "Select a coin chart to view legend details."
             try:
                 if header is not None and header.winfo_manager():
                     header.pack_forget()
@@ -17448,12 +17968,22 @@ class PowerTraderHub(tk.Tk):
                 pass
         else:
             chart = self.charts.get(page) if isinstance(getattr(self, "charts", None), dict) else None
-            text = str(getattr(chart, "_legend_panel_text", "") or "").strip()
-            if not text:
-                text = f"{page}: waiting for chart data..."
-            neural_legend = "Signal levels: 0 = bottom, 7 = top\nBlue = Long | Orange = Short"
-            if neural_legend not in text:
-                text = f"{text}\n\n{neural_legend}".strip()
+            raw_rows = getattr(chart, "_legend_rows", []) if chart is not None else []
+            if isinstance(raw_rows, list):
+                rows = [dict(r) for r in raw_rows if isinstance(r, dict)]
+            if not rows:
+                rows = [
+                    {"label": "Green candle", "meaning": "Price closed above open for that bar.", "color": DARK_ACCENT, "dash": (), "sample": "square"},
+                    {"label": "Red candle", "meaning": "Price closed below open for that bar.", "color": "#FF6B57", "dash": (), "sample": "square"},
+                    {"label": "Long neural level", "meaning": "Blue support/reference level from neural model.", "color": "blue", "dash": ()},
+                    {"label": "Short neural level", "meaning": "Orange resistance/reference level from neural model.", "color": "orange", "dash": ()},
+                    {"label": "Trail line (★)", "meaning": "Trailing sell threshold once armed.", "color": "green", "dash": ()},
+                    {"label": "Next DCA (◆)", "meaning": "Next averaging-buy trigger line.", "color": "red", "dash": ()},
+                    {"label": "Average cost (●)", "meaning": "Current blended entry price.", "color": "yellow", "dash": ()},
+                ]
+            note_txt = str(getattr(chart, "_legend_note", "") or "").strip()
+            if not note_txt:
+                note_txt = f"{page}: waiting for chart data..."
             try:
                 if header is not None and (not header.winfo_manager()):
                     header.pack(fill="x", padx=6, pady=(0, 0), before=box)
@@ -17467,24 +17997,6 @@ class PowerTraderHub(tk.Tk):
                     box.pack(fill="x", padx=6, pady=(0, 6))
             except Exception:
                 pass
-            try:
-                mode = str(getattr(chart, "_legend_mode", "clean") or "clean").strip().lower()
-                widget.configure(height=(11 if mode == "detailed" else 6))
-                needs_scroll = bool(getattr(chart, "_legend_needs_scroll", False))
-                if scroll is not None:
-                    if needs_scroll and (not collapsed):
-                        if not scroll.winfo_manager():
-                            scroll.pack(side="right", fill="y")
-                    elif scroll.winfo_manager():
-                        scroll.pack_forget()
-            except Exception:
-                pass
-        if page == "ACCOUNT":
-            try:
-                if scroll is not None and scroll.winfo_manager():
-                    scroll.pack_forget()
-            except Exception:
-                pass
 
         try:
             if btn is not None:
@@ -17494,14 +18006,87 @@ class PowerTraderHub(tk.Tk):
             pass
 
         try:
-            widget.configure(state="normal")
-            widget.delete("1.0", "end")
-            for idx, line in enumerate(str(text).splitlines()):
-                tag = "legend_head" if idx == 0 else ("legend_label" if ":" in line else "legend_value")
-                widget.insert("end", line + ("\n" if idx < (len(str(text).splitlines()) - 1) else ""), (tag,))
-            widget.configure(state="disabled")
+            if note_var is not None:
+                note_var.set(note_txt)
         except Exception:
             pass
+        if page == "ACCOUNT" or collapsed or (not bool(box.winfo_manager())):
+            return
+
+        try:
+            wrap_w = max(220, int(rows_frame.winfo_width() or box.winfo_width() or 360) - 90)
+        except Exception:
+            wrap_w = 260
+        sig = (
+            page,
+            note_txt,
+            int(wrap_w),
+            tuple(
+                (
+                    str((r or {}).get("label", "") or ""),
+                    str((r or {}).get("meaning", "") or ""),
+                    str((r or {}).get("color", "") or ""),
+                    tuple((r or {}).get("dash", ()) if isinstance((r or {}).get("dash", ()), (list, tuple)) else ()),
+                    str((r or {}).get("sample", "") or ""),
+                )
+                for r in rows
+                if isinstance(r, dict)
+            ),
+        )
+        if getattr(self, "_chart_legend_rows_sig", None) == sig:
+            return
+        self._chart_legend_rows_sig = sig
+        try:
+            for child in list(rows_frame.winfo_children()):
+                child.destroy()
+        except Exception:
+            pass
+        if not rows:
+            try:
+                ttk.Label(
+                    rows_frame,
+                    text="Legend is loading…",
+                    foreground=DARK_MUTED,
+                    justify="left",
+                ).pack(fill="x")
+            except Exception:
+                pass
+            return
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label", "Line") or "Line").strip()
+            meaning = str(item.get("meaning", "") or "").strip()
+            color = str(item.get("color", DARK_ACCENT2) or DARK_ACCENT2)
+            dash = tuple(item.get("dash", ()) if isinstance(item.get("dash", ()), (list, tuple)) else ())
+            sample_kind = str(item.get("sample", "line") or "line").strip().lower()
+            row_wrap = ttk.Frame(rows_frame)
+            row_wrap.pack(fill="x", pady=(0, 3))
+            sample = tk.Canvas(
+                row_wrap,
+                width=72,
+                height=14,
+                bg=DARK_PANEL,
+                highlightthickness=1,
+                highlightbackground=DARK_BORDER,
+                bd=0,
+            )
+            sample.pack(side="left", padx=(0, 8))
+            try:
+                if sample_kind in {"square", "box", "candle"}:
+                    sample.create_rectangle(28, 3, 44, 11, outline=color, fill=color, width=1)
+                else:
+                    sample.create_line(6, 7, 66, 7, fill=color, width=2, dash=(tuple(dash) if dash else ()))
+            except Exception:
+                pass
+            desc = f"{label}: {meaning}" if meaning else label
+            ttk.Label(
+                row_wrap,
+                text=desc,
+                foreground=DARK_FG,
+                justify="left",
+                wraplength=wrap_w,
+            ).pack(side="left", fill="x", expand=True)
 
     def _trade_table_row_key(self, row: Dict[str, Any], row_index: int, seen_keys: Optional[set[str]] = None) -> str:
         base_key = str(row.get("coin", "") or "").strip().upper()
