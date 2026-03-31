@@ -27,15 +27,25 @@ Primary repository: `https://github.com/JoeyEight/Super-Trader.git`
 ## Install
 Recommended Python: `3.10.x`
 
+macOS / Linux:
 ```bash
-python3 -m pip install -r requirements.txt
+python3 -m venv venv
+./venv/bin/python -m pip install --upgrade pip setuptools wheel
+./venv/bin/python -m pip install -r requirements.txt
+```
+
+Windows (PowerShell):
+```powershell
+py -3 -m venv venv
+.\venv\Scripts\python.exe -m pip install --upgrade pip setuptools wheel
+.\venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 If you use the launcher, it will create `venv/` automatically and install missing core dependencies before opening the hub.
 
 Runtime packages currently used by the app code:
 - `requests`, `kucoin-python`, `PyNaCl`, `cryptography`, `colorama`
-- `matplotlib`, `psutil`
+- `matplotlib`, `psutil`, `Pillow` (desktop icon/app packaging path)
 - `python-dotenv`, `pandas` (used by `sources/*` helpers)
 
 ## Run
