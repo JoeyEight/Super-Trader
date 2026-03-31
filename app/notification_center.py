@@ -15,6 +15,7 @@ _TRANSIENT_INCIDENT_TTL_S: Dict[str, int] = {
     "runner_script_path_changed": 600,
     "runner_script_hot_reload": 600,
     "runner_forced_shutdown": 600,
+    "runner_sleep_resume_detected": 600,
     "runner_child_start_failed": 900,
     "runner_child_crash_loop": 900,
     "runner_missing_script": 900,
@@ -263,6 +264,402 @@ def _dedupe_notification_rows(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, 
     return list(keep.values())
 
 
+def _f(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _market_score_threshold_key(market: str) -> str:
+    m = str(market or "").strip().lower()
+    if m == "stocks":
+        return "stock_score_threshold"
+    if m == "forex":
+        return "forex_score_threshold"
+    return ""
+
+
+def _market_scan_interval_key(market: str) -> str:
+    m = str(market or "").strip().lower()
+    if m == "stocks":
+        return "market_bg_stocks_interval_s"
+    if m == "forex":
+        return "market_bg_forex_interval_s"
+    return ""
+
+
+def _market_trade_size_key(market: str) -> str:
+    m = str(market or "").strip().lower()
+    if m == "stocks":
+        return "stock_trade_notional_usd"
+    if m == "forex":
+        return "forex_trade_units"
+    return ""
+
+
+def _market_min_samples_key(market: str) -> str:
+    m = str(market or "").strip().lower()
+    if m == "stocks":
+        return "stock_min_samples_live_guarded"
+    if m == "forex":
+        return "forex_min_samples_live_guarded"
+    return ""
+
+
+def _market_max_open_positions_key(market: str) -> str:
+    m = str(market or "").strip().lower()
+    if m == "stocks":
+        return "stock_max_open_positions"
+    if m == "forex":
+        return "forex_max_open_positions"
+    if m == "crypto":
+        return "crypto_max_open_positions"
+    return ""
+
+
+def _market_label(market: str) -> str:
+    m = str(market or "").strip().lower()
+    if m == "stocks":
+        return "stocks"
+    if m == "forex":
+        return "forex"
+    if m == "crypto":
+        return "crypto"
+    return "market"
+
+
+def _notification_action(
+    action_id: str,
+    label: str,
+    kind: str,
+    setting_key: str,
+    *,
+    reason: str = "",
+    minimum: Any | None = None,
+    maximum: Any | None = None,
+    step: Any | None = None,
+    factor: Any | None = None,
+    precision: Any | None = None,
+    value: Any | None = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "id": str(action_id or "").strip(),
+        "label": str(label or "").strip() or "Auto-adjust setting",
+        "kind": str(kind or "").strip().lower(),
+        "setting_key": str(setting_key or "").strip(),
+    }
+    if reason:
+        payload["reason"] = str(reason or "").strip()
+    if minimum is not None:
+        payload["min"] = minimum
+    if maximum is not None:
+        payload["max"] = maximum
+    if step is not None:
+        payload["step"] = step
+    if factor is not None:
+        payload["factor"] = factor
+    if precision is not None:
+        payload["precision"] = precision
+    if value is not None:
+        payload["value"] = value
+    return payload
+
+
+def _dominant_reject_market(runtime_state: Dict[str, Any]) -> str:
+    rs = runtime_state if isinstance(runtime_state, dict) else {}
+    trends = rs.get("market_trends", {}) if isinstance(rs.get("market_trends", {}), dict) else {}
+    best_market = ""
+    best_pressure = -1.0
+    for market in ("stocks", "forex"):
+        row = trends.get(market, {}) if isinstance(trends.get(market, {}), dict) else {}
+        quality = row.get("quality_aggregates", {}) if isinstance(row.get("quality_aggregates", {}), dict) else {}
+        reject_raw = _f(quality.get("reject_rate_raw_pct", quality.get("reject_rate_pct", 0.0)), 0.0)
+        reject = effective_reject_pressure(
+            reject_raw,
+            dominant_reason=quality.get("dominant_reason", ""),
+            dominant_ratio_pct=quality.get("reject_dominant_ratio_pct", 0.0),
+            leaders_total=quality.get("leaders_total", 0),
+            scores_total=quality.get("scores_total", 0),
+        )
+        if reject > best_pressure:
+            best_market = market
+            best_pressure = reject
+    return best_market
+
+
+def _dominant_cadence_market(runtime_state: Dict[str, Any]) -> str:
+    rs = runtime_state if isinstance(runtime_state, dict) else {}
+    scan_cadence = rs.get("scan_cadence", {}) if isinstance(rs.get("scan_cadence", {}), dict) else {}
+    active = scan_cadence.get("active", []) if isinstance(scan_cadence.get("active", []), list) else []
+    best_market = ""
+    best_late_pct = -1.0
+    for row in active:
+        if not isinstance(row, dict):
+            continue
+        market = str(row.get("market", "") or "").strip().lower()
+        if market not in {"stocks", "forex"}:
+            continue
+        late_pct = _f(row.get("late_pct", 0.0), 0.0)
+        if late_pct > best_late_pct:
+            best_late_pct = late_pct
+            best_market = market
+    return best_market
+
+
+def _top_exposure_market(runtime_state: Dict[str, Any]) -> str:
+    rs = runtime_state if isinstance(runtime_state, dict) else {}
+    exposure = rs.get("exposure_map", {}) if isinstance(rs.get("exposure_map", {}), dict) else {}
+    top = exposure.get("top_positions", []) if isinstance(exposure.get("top_positions", []), list) else []
+    if not top or not isinstance(top[0], dict):
+        return ""
+    market = str(top[0].get("market", "") or "").strip().lower()
+    return market if market in {"stocks", "forex", "crypto"} else ""
+
+
+def _action_for_runtime_reason(reason: str, runtime_state: Dict[str, Any], hint: str = "") -> Dict[str, Any]:
+    key = str(reason or "").strip().lower()
+    if not key:
+        return {}
+
+    if key in {"scan_reject_pressure", "scanner_reject_spike"}:
+        market = _dominant_reject_market(runtime_state) or "stocks"
+        setting_key = _market_score_threshold_key(market)
+        if not setting_key:
+            return {}
+        return _notification_action(
+            f"{key}_{market}_threshold",
+            f"Loosen {str(_market_label(market)).title()} score threshold",
+            "float_scale_down",
+            setting_key,
+            reason=hint or "Lower threshold slightly to reduce reject pressure.",
+            minimum=0.0,
+            factor=0.92,
+            precision=4,
+        )
+
+    if key == "cadence_drift_pressure":
+        market = _dominant_cadence_market(runtime_state) or "stocks"
+        setting_key = _market_scan_interval_key(market)
+        if not setting_key:
+            return {}
+        return _notification_action(
+            f"{key}_{market}_interval",
+            f"Reduce {str(_market_label(market)).title()} scan pressure",
+            "float_scale_up",
+            setting_key,
+            reason=hint or "Increase scanner interval to reduce cadence drift pressure.",
+            minimum=0.0,
+            maximum=300.0,
+            factor=1.15,
+            precision=2,
+        )
+
+    if key == "exposure_concentration":
+        market = _top_exposure_market(runtime_state)
+        setting_key = _market_max_open_positions_key(market)
+        if not setting_key:
+            return {}
+        minimum = 1 if market == "crypto" else 0
+        return _notification_action(
+            f"{key}_{market}_max_open",
+            f"Tighten {str(_market_label(market)).title()} concentration cap",
+            "int_step_down",
+            setting_key,
+            reason=hint or "Reduce max concurrent positions for the concentrated market.",
+            minimum=minimum,
+            step=1,
+        )
+
+    if key == "execution_temporarily_disabled":
+        return _notification_action(
+            f"{key}_cooldown",
+            "Increase broker failure cooldown",
+            "int_scale_up",
+            "broker_failure_disable_cooldown_s",
+            reason=hint or "Increase cooldown before retrying execution after repeated failures.",
+            minimum=60,
+            maximum=86400,
+            factor=1.25,
+        )
+
+    if key == "api_unstable":
+        return _notification_action(
+            f"{key}_retry_cap",
+            "Increase API retry-after cap",
+            "float_scale_up",
+            "broker_order_retry_after_cap_s",
+            reason=hint or "Increase retry-after cap to reduce request thrash while unstable.",
+            minimum=1.0,
+            maximum=3600.0,
+            factor=1.2,
+            precision=1,
+        )
+
+    return {}
+
+
+def _action_for_market_trend_row(market: str, title: str, message: str) -> Dict[str, Any]:
+    m = str(market or "").strip().lower()
+    t = str(title or "").strip().lower()
+    msg = str(message or "").strip()
+    if m not in {"stocks", "forex"}:
+        return {}
+
+    if t == "high scanner rejection pressure":
+        setting_key = _market_score_threshold_key(m)
+        if not setting_key:
+            return {}
+        return _notification_action(
+            f"{m}_reject_pressure_threshold",
+            f"Loosen {str(_market_label(m)).title()} score threshold",
+            "float_scale_down",
+            setting_key,
+            reason=msg or "Lower threshold slightly to improve candidate flow.",
+            minimum=0.0,
+            factor=0.92,
+            precision=4,
+        )
+
+    if t == "data reliability degraded":
+        setting_key = _market_scan_interval_key(m)
+        if not setting_key:
+            return {}
+        return _notification_action(
+            f"{m}_reliability_interval",
+            f"Slow {str(_market_label(m)).title()} scan cadence",
+            "float_scale_up",
+            setting_key,
+            reason=msg or "Increase scanner interval to reduce data provider pressure.",
+            minimum=0.0,
+            maximum=300.0,
+            factor=1.12,
+            precision=2,
+        )
+
+    return {}
+
+
+def _action_for_execution_gate_row(market: str, message: str) -> Dict[str, Any]:
+    m = str(market or "").strip().lower()
+    msg = str(message or "").strip()
+    msg_l = msg.lower()
+    if m not in {"stocks", "forex"}:
+        return {}
+
+    if "risk cap:" in msg_l:
+        size_key = _market_trade_size_key(m)
+        if not size_key:
+            return {}
+        if m == "forex":
+            return _notification_action(
+                f"{m}_risk_cap_trade_size",
+                "Reduce forex trade units",
+                "int_scale_down",
+                size_key,
+                reason=msg,
+                minimum=1,
+                factor=0.8,
+            )
+        return _notification_action(
+            f"{m}_risk_cap_trade_size",
+            "Reduce stock trade notional",
+            "float_scale_down",
+            size_key,
+            reason=msg,
+            minimum=1.0,
+            factor=0.85,
+            precision=2,
+        )
+
+    if "max open positions reached" in msg_l:
+        key = _market_max_open_positions_key(m)
+        if not key:
+            return {}
+        return _notification_action(
+            f"{m}_max_open_positions_up",
+            f"Increase {str(_market_label(m)).title()} max open positions",
+            "int_scale_up",
+            key,
+            reason=msg,
+            minimum=0,
+            maximum=500,
+            factor=1.2,
+        )
+
+    if "reject-pressure gate active" in msg_l:
+        threshold_key = _market_score_threshold_key(m)
+        if not threshold_key:
+            return {}
+        return _notification_action(
+            f"{m}_execution_gate_threshold",
+            f"Loosen {str(_market_label(m)).title()} score threshold",
+            "float_scale_down",
+            threshold_key,
+            reason=msg,
+            minimum=0.0,
+            factor=0.92,
+            precision=4,
+        )
+
+    if "calibration sample gate" in msg_l or "calibration history insufficient" in msg_l:
+        sample_key = _market_min_samples_key(m)
+        if not sample_key:
+            return {}
+        return _notification_action(
+            f"{m}_calibration_samples",
+            f"Reduce {str(_market_label(m)).title()} minimum calibration samples",
+            "int_step_down",
+            sample_key,
+            reason=msg,
+            minimum=0,
+            step=1,
+        )
+
+    return {}
+
+
+def _action_for_incident_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(row, dict):
+        return {}
+    evt = str(row.get("event", "") or "").strip().lower()
+    market = _market_from_incident(row)
+    details = row.get("details", {}) if isinstance(row.get("details", {}), dict) else {}
+    message = str(row.get("msg", "") or "").strip()
+    if evt == "scanner_cadence_drift":
+        setting_key = _market_scan_interval_key(market)
+        if not setting_key:
+            return {}
+        late_pct = _f(details.get("late_pct", 0.0), 0.0)
+        factor = 1.15 if late_pct < 150.0 else 1.25
+        return _notification_action(
+            f"{market}_incident_cadence",
+            f"Slow {str(_market_label(market)).title()} scan cadence",
+            "float_scale_up",
+            setting_key,
+            reason=message,
+            minimum=0.0,
+            maximum=300.0,
+            factor=factor,
+            precision=2,
+        )
+    if evt == "scanner_reject_spike":
+        setting_key = _market_score_threshold_key(market)
+        if not setting_key:
+            return {}
+        return _notification_action(
+            f"{market}_incident_reject",
+            f"Loosen {str(_market_label(market)).title()} score threshold",
+            "float_scale_down",
+            setting_key,
+            reason=message,
+            minimum=0.0,
+            factor=0.9,
+            precision=4,
+        )
+    return {}
+
+
 def build_notification_center_payload(
     runtime_state: Dict[str, Any],
     incidents_rows: Iterable[Dict[str, Any]] | None = None,
@@ -278,16 +675,20 @@ def build_notification_center_payload(
     sev = _sev(str(alerts.get("severity", "info") or "info"))
     for i, reason in enumerate(reasons[:8]):
         hint = hints[i] if i < len(hints) else ""
+        action = _action_for_runtime_reason(reason, rs, hint=hint)
+        row: Dict[str, Any] = {
+            "id": f"alert_{i}_{ts_now}",
+            "ts": int(ts_now),
+            "severity": sev,
+            "market": "global",
+            "source": "runtime_alerts",
+            "title": reason,
+            "message": hint or reason,
+        }
+        if action:
+            row["action"] = action
         out_rows.append(
-            {
-                "id": f"alert_{i}_{ts_now}",
-                "ts": int(ts_now),
-                "severity": sev,
-                "market": "global",
-                "source": "runtime_alerts",
-                "title": reason,
-                "message": hint or reason,
-            }
+            row
         )
 
     trends = rs.get("market_trends", {}) if isinstance(rs.get("market_trends", {}), dict) else {}
@@ -307,40 +708,54 @@ def build_notification_center_payload(
         rel_score = float(rel.get("score", 0.0) or 0.0)
         why_reason = str(why.get("reason", "") or "").strip()
         if reject >= 90.0:
+            message = f"Reject rate {reject:.1f}% is suppressing candidate flow."
+            action = _action_for_market_trend_row(market, "High scanner rejection pressure", message)
+            row: Dict[str, Any] = {
+                "id": f"{market}_reject_{ts_now}",
+                "ts": int(ts_now),
+                "severity": "warning",
+                "market": market,
+                "source": "market_trends",
+                "title": "High scanner rejection pressure",
+                "message": message,
+            }
+            if action:
+                row["action"] = action
             out_rows.append(
-                {
-                    "id": f"{market}_reject_{ts_now}",
-                    "ts": int(ts_now),
-                    "severity": "warning",
-                    "market": market,
-                    "source": "market_trends",
-                    "title": "High scanner rejection pressure",
-                    "message": f"Reject rate {reject:.1f}% is suppressing candidate flow.",
-                }
+                row
             )
         if rel_score < 70.0:
+            message = f"Reliability score {rel_score:.1f}/100."
+            action = _action_for_market_trend_row(market, "Data reliability degraded", message)
+            row = {
+                "id": f"{market}_reliability_{ts_now}",
+                "ts": int(ts_now),
+                "severity": ("critical" if rel_score < 55.0 else "warning"),
+                "market": market,
+                "source": "market_trends",
+                "title": "Data reliability degraded",
+                "message": message,
+            }
+            if action:
+                row["action"] = action
             out_rows.append(
-                {
-                    "id": f"{market}_reliability_{ts_now}",
-                    "ts": int(ts_now),
-                    "severity": ("critical" if rel_score < 55.0 else "warning"),
-                    "market": market,
-                    "source": "market_trends",
-                    "title": "Data reliability degraded",
-                    "message": f"Reliability score {rel_score:.1f}/100.",
-                }
+                row
             )
         if why_reason:
+            action = _action_for_execution_gate_row(market, why_reason)
+            row = {
+                "id": f"{market}_why_not_{ts_now}",
+                "ts": int(ts_now),
+                "severity": "info",
+                "market": market,
+                "source": "execution_gate",
+                "title": "Why top candidate was not traded",
+                "message": why_reason,
+            }
+            if action:
+                row["action"] = action
             out_rows.append(
-                {
-                    "id": f"{market}_why_not_{ts_now}",
-                    "ts": int(ts_now),
-                    "severity": "info",
-                    "market": market,
-                    "source": "execution_gate",
-                    "title": "Why top candidate was not traded",
-                    "message": why_reason,
-                }
+                row
             )
 
     for row in list(incidents_rows or []):
@@ -356,17 +771,19 @@ def build_notification_center_payload(
             continue
         msg = str(row.get("msg", "") or "").strip()
         evt = str(row.get("event", "") or "").strip()
-        out_rows.append(
-            {
-                "id": f"inc_{ts}_{evt[:24]}",
-                "ts": int(ts),
-                "severity": severity,
-                "market": _market_from_incident(row),
-                "source": "incidents",
-                "title": evt or "runtime_incident",
-                "message": msg[:220],
-            }
-        )
+        out_row = {
+            "id": f"inc_{ts}_{evt[:24]}",
+            "ts": int(ts),
+            "severity": severity,
+            "market": _market_from_incident(row),
+            "source": "incidents",
+            "title": evt or "runtime_incident",
+            "message": msg[:220],
+        }
+        action = _action_for_incident_row(row)
+        if action:
+            out_row["action"] = action
+        out_rows.append(out_row)
 
     out_rows = _dedupe_notification_rows(out_rows)
     out_rows = sorted(
