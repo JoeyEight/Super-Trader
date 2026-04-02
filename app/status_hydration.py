@@ -1,20 +1,59 @@
 from __future__ import annotations
 
-import json
 import math
+import os
 import time
 from typing import Any, Dict, List
 
+from app.json_codec import load as json_load
+from app.json_codec import loads as json_loads
 from app.scan_diagnostics_schema import normalize_scan_diagnostics
+
+_JSON_DICT_CACHE: Dict[str, tuple[tuple[int, int], Dict[str, Any], float]] = {}
+_JSONL_CACHE: Dict[tuple[str, int], tuple[tuple[int, int], List[Dict[str, Any]], float]] = {}
+_CACHE_MAX_ENTRIES = 256
+
+
+def _file_sig(path: str) -> tuple[int, int] | None:
+    try:
+        st = os.stat(path)
+        return int(getattr(st, "st_mtime_ns", 0) or 0), int(getattr(st, "st_size", 0) or 0)
+    except Exception:
+        return None
+
+
+def _trim_cache(cache: Dict[Any, tuple[Any, Any, float]], max_entries: int = _CACHE_MAX_ENTRIES) -> None:
+    if len(cache) <= int(max_entries):
+        return
+    try:
+        drop = max(1, len(cache) - int(max_entries))
+        oldest = sorted(cache.items(), key=lambda item: float((item[1][2] if isinstance(item[1], tuple) and len(item[1]) >= 3 else 0.0)))[:drop]
+        for key, _ in oldest:
+            cache.pop(key, None)
+    except Exception:
+        # If trimming fails, keep cache best-effort without breaking callers.
+        pass
 
 
 def safe_read_json_dict(path: str) -> Dict[str, Any]:
     if not str(path or "").strip():
         return {}
+    sig = _file_sig(path)
+    if sig is None:
+        return {}
+    key = os.path.abspath(str(path))
+    cached = _JSON_DICT_CACHE.get(key)
+    if isinstance(cached, tuple) and len(cached) >= 3 and cached[0] == sig:
+        payload = cached[1] if isinstance(cached[1], dict) else {}
+        # Return a shallow copy so callers don't mutate cache entries.
+        return dict(payload)
     try:
         with open(path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-        return payload if isinstance(payload, dict) else {}
+            payload = json_load(f, default={})
+        out = payload if isinstance(payload, dict) else {}
+        _JSON_DICT_CACHE[key] = (sig, dict(out), float(time.time()))
+        _trim_cache(_JSON_DICT_CACHE)
+        return out
     except Exception:
         return {}
 
@@ -22,23 +61,44 @@ def safe_read_json_dict(path: str) -> Dict[str, Any]:
 def safe_read_jsonl_dicts(path: str, limit: int = 200) -> List[Dict[str, Any]]:
     if not str(path or "").strip():
         return []
-    rows: List[Dict[str, Any]] = []
+    lim = max(1, int(limit or 200))
+    sig = _file_sig(path)
+    if sig is None:
+        return []
+    key = (os.path.abspath(str(path)), int(lim))
+    cached = _JSONL_CACHE.get(key)
+    if isinstance(cached, tuple) and len(cached) >= 3 and cached[0] == sig:
+        rows = cached[1] if isinstance(cached[1], list) else []
+        return [dict(row) for row in rows if isinstance(row, dict)]
+    lines: List[str] = []
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            for ln in f:
-                txt = str(ln or "").strip()
-                if not txt:
-                    continue
-                try:
-                    obj = json.loads(txt)
-                except Exception:
-                    continue
-                if isinstance(obj, dict):
-                    rows.append(obj)
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = int(f.tell() or 0)
+            if size <= 0:
+                return []
+            window = min(size, max(8192, (512 * lim), (512 * 1024)))
+            f.seek(-window, os.SEEK_END)
+            blob = f.read(window)
+        lines = str(blob.decode("utf-8", errors="ignore")).splitlines()
+        if window < size and lines:
+            lines = lines[1:]
     except Exception:
         return []
-    lim = max(1, int(limit or 200))
-    return rows[-lim:]
+    rows: List[Dict[str, Any]] = []
+    for ln in lines[-lim:]:
+        txt = str(ln or "").strip()
+        if not txt:
+            continue
+        try:
+            obj = json_loads(txt, default=None)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            rows.append(obj)
+    _JSONL_CACHE[key] = (sig, [dict(row) for row in rows], float(time.time()))
+    _trim_cache(_JSONL_CACHE)
+    return rows
 
 
 def _is_missing_metric(value: Any) -> bool:

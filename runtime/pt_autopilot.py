@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import signal
 import sys
@@ -14,6 +13,7 @@ if __package__ in (None, ""):
         sys.path.insert(0, _ROOT)
 
 from app.path_utils import read_settings_file, resolve_runtime_paths, resolve_settings_path
+from app.json_codec import load as json_load
 from app.runtime_logging import atomic_write_json, runtime_event
 from app.settings_utils import sanitize_settings
 
@@ -50,7 +50,7 @@ def _log(msg: str) -> None:
 def _safe_read_json(path: str) -> Dict[str, Any]:
     try:
         with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            data = json_load(f, default={})
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
@@ -122,6 +122,32 @@ def _set_if_changed(settings: Dict[str, Any], key: str, value: Any, changes: Dic
     changes[key] = value
 
 
+def _stock_account_value_usd(stock_status: Dict[str, Any], stock_trader: Dict[str, Any]) -> float:
+    try:
+        v = _to_float(stock_trader.get("account_value_usd", 0.0), 0.0)
+        if v > 0.0:
+            return float(v)
+    except Exception:
+        pass
+    for key in ("equity", "account_equity", "account_value"):
+        try:
+            v = _to_float(stock_status.get(key, 0.0), 0.0)
+            if v > 0.0:
+                return float(v)
+        except Exception:
+            continue
+    return 0.0
+
+
+def _local_load_ratio() -> float:
+    try:
+        load1, _load5, _load15 = os.getloadavg()
+        cpu_n = max(1, int(os.cpu_count() or 1))
+        return max(0.0, float(load1) / float(cpu_n))
+    except Exception:
+        return 0.0
+
+
 def run_once(dry_run: bool = False) -> Dict[str, Any]:
     now = int(time.time())
     state = _safe_read_json(AUTOPILOT_STATE_PATH)
@@ -131,15 +157,26 @@ def run_once(dry_run: bool = False) -> Dict[str, Any]:
     settings, settings_path = _load_settings_with_path()
 
     # health inputs
+    stock_status = _safe_read_json(os.path.join(HUB_DATA_DIR, "stocks", "stock_thinker_status.json"))
     stock_trader = _safe_read_json(os.path.join(HUB_DATA_DIR, "stocks", "stock_trader_status.json"))
     forex_trader = _safe_read_json(os.path.join(HUB_DATA_DIR, "forex", "forex_trader_status.json"))
     stock_health = (stock_trader.get("health", {}) if isinstance(stock_trader, dict) else {}) or {}
     forex_health = (forex_trader.get("health", {}) if isinstance(forex_trader, dict) else {}) or {}
+    stock_account_value = _stock_account_value_usd(
+        stock_status if isinstance(stock_status, dict) else {},
+        stock_trader if isinstance(stock_trader, dict) else {},
+    )
 
     kucoin_err, rate_err = _tail_error_counts(THINKER_LOG_PATH, offsets)
     api_unstable = (kucoin_err + rate_err) >= 4
     markets_healthy = bool(stock_health.get("data_ok", True)) and bool(forex_health.get("data_ok", True))
     markets_healthy = markets_healthy and (not bool(stock_health.get("drift_warning", False))) and (not bool(forex_health.get("drift_warning", False)))
+    load_ratio = _local_load_ratio()
+    try:
+        load_high_threshold = _clamp(_to_float(settings.get("autopilot_load_high_threshold", 0.60), 0.60), 0.30, 1.5)
+    except Exception:
+        load_high_threshold = 0.60
+    local_load_high = bool(load_ratio >= load_high_threshold)
 
     changes: Dict[str, Any] = {}
     notes = []
@@ -159,13 +196,24 @@ def run_once(dry_run: bool = False) -> Dict[str, Any]:
         notes.append("Detected API instability; reduced request aggressiveness.")
     else:
         stable_cycles += 1
-        if stable_cycles >= 10:
+        if local_load_high:
+            trader_loop = _clamp(trader_loop + 0.10, 0.8, 4.0)
+            trader_err_sleep = _clamp(trader_err_sleep + 0.20, 1.2, 8.0)
+            min_interval = _clamp(min_interval + 0.05, 0.45, 2.50)
+            cache_ttl = _clamp(cache_ttl + 0.25, 1.8, 10.0)
+            notes.append(f"Local system load high ({load_ratio:.2f}); easing crypto loop cadence.")
+        elif stable_cycles >= 10:
             min_interval = _clamp(min_interval - 0.05, 0.35, 2.00)
             cache_ttl = _clamp(cache_ttl - 0.25, 1.5, 8.0)
             trader_loop = _clamp(trader_loop - 0.05, 0.5, 3.0)
             trader_err_sleep = _clamp(trader_err_sleep - 0.10, 1.0, 6.0)
             stable_cycles = 7
             notes.append("Stable APIs; cautiously improved responsiveness.")
+
+    # Hard floor for sustained machine responsiveness (prevents runaway aggressiveness).
+    min_crypto_loop_floor = 0.85 if local_load_high else 0.70
+    trader_loop = max(float(min_crypto_loop_floor), float(trader_loop))
+    trader_err_sleep = max(1.0, float(trader_err_sleep))
 
     _set_if_changed(settings, "kucoin_min_interval_sec", round(min_interval, 3), changes)
     _set_if_changed(settings, "kucoin_cache_ttl_sec", round(cache_ttl, 3), changes)
@@ -179,16 +227,43 @@ def run_once(dry_run: bool = False) -> Dict[str, Any]:
     stock_size_floor = _to_float(settings.get("stock_loss_streak_size_floor_pct", 0.40), 0.40)
     forex_size_step = _to_float(settings.get("forex_loss_streak_size_step_pct", 0.15), 0.15)
     forex_size_floor = _to_float(settings.get("forex_loss_streak_size_floor_pct", 0.40), 0.40)
-    if markets_healthy and (not api_unstable):
-        s_every = _clamp(s_every - 1.0, 12.0, 60.0)
-        f_every = _clamp(f_every - 1.0, 8.0, 60.0)
+    try:
+        min_stocks_interval = _clamp(_to_float(settings.get("autopilot_min_stocks_scan_interval_s", 16.0), 16.0), 8.0, 120.0)
+    except Exception:
+        min_stocks_interval = 16.0
+    try:
+        min_forex_interval = _clamp(_to_float(settings.get("autopilot_min_forex_scan_interval_s", 10.0), 10.0), 6.0, 120.0)
+    except Exception:
+        min_forex_interval = 10.0
+    def _step_toward(cur: float, target: float, step: float, lo: float, hi: float) -> float:
+        if cur < target:
+            return _clamp(cur + abs(step), lo, hi)
+        if cur > target:
+            return _clamp(cur - abs(step), lo, hi)
+        return _clamp(cur, lo, hi)
+
+    if local_load_high:
+        target_s_every = max(float(min_stocks_interval), 24.0)
+        target_f_every = max(float(min_forex_interval), 18.0)
+        s_every = _step_toward(s_every, target_s_every, 1.5, max(16.0, min_stocks_interval), 120.0)
+        f_every = _step_toward(f_every, target_f_every, 1.5, max(10.0, min_forex_interval), 120.0)
+        stock_size_step = _clamp(stock_size_step - 0.01, 0.05, 0.35)
+        stock_size_floor = _clamp(stock_size_floor - 0.02, 0.20, 0.80)
+        forex_size_step = _clamp(forex_size_step - 0.01, 0.05, 0.35)
+        forex_size_floor = _clamp(forex_size_floor - 0.02, 0.20, 0.80)
+        notes.append(f"Local system load high ({load_ratio:.2f}); increasing stock/forex scan intervals.")
+    elif markets_healthy and (not api_unstable):
+        s_every = _step_toward(s_every, float(min_stocks_interval), 0.75, float(min_stocks_interval), 120.0)
+        f_every = _step_toward(f_every, float(min_forex_interval), 0.75, float(min_forex_interval), 120.0)
         stock_size_step = _clamp(stock_size_step + 0.01, 0.05, 0.35)
         stock_size_floor = _clamp(stock_size_floor + 0.02, 0.35, 0.80)
         forex_size_step = _clamp(forex_size_step + 0.01, 0.05, 0.35)
         forex_size_floor = _clamp(forex_size_floor + 0.02, 0.35, 0.80)
     else:
-        s_every = _clamp(s_every + 1.0, 12.0, 60.0)
-        f_every = _clamp(f_every + 1.0, 8.0, 60.0)
+        target_s_every = max(float(min_stocks_interval), 20.0)
+        target_f_every = max(float(min_forex_interval), 14.0)
+        s_every = _step_toward(s_every, target_s_every, 1.0, float(min_stocks_interval), 120.0)
+        f_every = _step_toward(f_every, target_f_every, 1.0, float(min_forex_interval), 120.0)
         # Under degraded market/broker health, reduce new-entry aggression automatically.
         stock_size_step = _clamp(stock_size_step - 0.01, 0.05, 0.35)
         stock_size_floor = _clamp(stock_size_floor - 0.02, 0.20, 0.80)
@@ -200,6 +275,73 @@ def run_once(dry_run: bool = False) -> Dict[str, Any]:
     _set_if_changed(settings, "stock_loss_streak_size_floor_pct", round(stock_size_floor, 3), changes)
     _set_if_changed(settings, "forex_loss_streak_size_step_pct", round(forex_size_step, 3), changes)
     _set_if_changed(settings, "forex_loss_streak_size_floor_pct", round(forex_size_floor, 3), changes)
+
+    # Stock scanner load shaping (capital-aware + local load-aware).
+    scan_max = max(8, int(_to_float(settings.get("stock_scan_max_symbols", 160), 160)))
+    mtf_max = max(0, int(_to_float(settings.get("stock_mtf_confirm_max_symbols", 12), 12)))
+    fallback_limit = max(0, int(_to_float(settings.get("stock_scan_symbol_fallback_limit", 48), 48)))
+    if stock_account_value >= 100_000.0:
+        scan_target = 180
+    elif stock_account_value >= 25_000.0:
+        scan_target = 140
+    elif stock_account_value >= 5_000.0:
+        scan_target = 100
+    elif stock_account_value >= 1_000.0:
+        scan_target = 72
+    elif stock_account_value >= 250.0:
+        scan_target = 54
+    else:
+        scan_target = 40
+    if local_load_high:
+        scan_target = int(max(40, round(float(scan_target) * 0.85)))
+    elif api_unstable or (not markets_healthy):
+        scan_target = int(max(32, round(float(scan_target) * 0.80)))
+    else:
+        scan_target = int(max(32, scan_target))
+    if scan_max > scan_target:
+        scan_max = max(scan_target, scan_max - 12)
+    elif (scan_max < scan_target) and (stable_cycles >= 10) and (not local_load_high):
+        scan_max = min(scan_target, scan_max + 6)
+    scan_max = int(max(16, min(220, scan_max)))
+    mtf_target = int(max(0, min(16, round(float(scan_max) * 0.12))))
+    fallback_target = int(max(0, min(120, round(float(scan_max) * 0.35))))
+    if local_load_high:
+        mtf_target = min(mtf_target, 8)
+        fallback_target = int(max(8, round(float(fallback_target) * 0.75)))
+    else:
+        mtf_target = max(4, mtf_target)
+        fallback_target = max(12, fallback_target)
+    if mtf_max > mtf_target:
+        mtf_max = max(mtf_target, mtf_max - 2)
+    elif (mtf_max < mtf_target) and (stable_cycles >= 10) and (not local_load_high):
+        mtf_max = min(mtf_target, mtf_max + 1)
+    if fallback_limit > fallback_target:
+        fallback_limit = max(fallback_target, fallback_limit - 6)
+    elif (fallback_limit < fallback_target) and (stable_cycles >= 10) and (not local_load_high):
+        fallback_limit = min(fallback_target, fallback_limit + 3)
+    _set_if_changed(settings, "stock_scan_max_symbols", int(scan_max), changes)
+    _set_if_changed(settings, "stock_mtf_confirm_max_symbols", int(max(0, mtf_max)), changes)
+    _set_if_changed(settings, "stock_scan_symbol_fallback_limit", int(max(0, fallback_limit)), changes)
+    if local_load_high:
+        notes.append(
+            f"Stock scanner load cap active: {int(scan_max)} symbols, {int(mtf_max)} MTF checks."
+        )
+
+    # UI cadence tuning for responsiveness on constrained systems.
+    ui_refresh_s = _to_float(settings.get("ui_refresh_seconds", 1.0), 1.0)
+    chart_refresh_s = _to_float(settings.get("chart_refresh_seconds", 10.0), 10.0)
+    if local_load_high:
+        ui_refresh_s = _clamp(ui_refresh_s + 0.15, 1.0, 3.0)
+        chart_refresh_s = _clamp(chart_refresh_s + 0.75, 8.0, 25.0)
+        notes.append("Raised UI/chart refresh intervals to reduce render pressure.")
+    elif markets_healthy and (not api_unstable):
+        ui_refresh_s = _clamp(ui_refresh_s - 0.05, 0.9, 3.0)
+        chart_refresh_s = _clamp(chart_refresh_s - 0.25, 6.0, 25.0)
+    else:
+        ui_refresh_s = _clamp(ui_refresh_s + 0.10, 0.9, 3.0)
+        chart_refresh_s = _clamp(chart_refresh_s + 0.50, 6.0, 25.0)
+    _set_if_changed(settings, "ui_refresh_seconds", round(ui_refresh_s, 2), changes)
+    _set_if_changed(settings, "chart_refresh_seconds", round(chart_refresh_s, 2), changes)
 
     # Safely promote execution stage in paper/practice after sustained health.
     stage = str(settings.get("market_rollout_stage", "legacy") or "legacy").strip().lower()
@@ -252,6 +394,8 @@ def run_once(dry_run: bool = False) -> Dict[str, Any]:
         "autonomous": True,
         "api_unstable": api_unstable,
         "markets_healthy": markets_healthy,
+        "local_load_ratio": round(float(load_ratio), 3),
+        "local_load_high": bool(local_load_high),
         "stable_cycles": stable_cycles,
         "kucoin_errors_window": kucoin_err,
         "rate_errors_window": rate_err,
@@ -264,6 +408,12 @@ def run_once(dry_run: bool = False) -> Dict[str, Any]:
             "crypto_trader_loop_sleep_s": settings.get("crypto_trader_loop_sleep_s", 1.0),
             "market_bg_stocks_interval_s": settings.get("market_bg_stocks_interval_s", 18.0),
             "market_bg_forex_interval_s": settings.get("market_bg_forex_interval_s", 12.0),
+            "stock_scan_max_symbols": settings.get("stock_scan_max_symbols", 160),
+            "stock_mtf_confirm_max_symbols": settings.get("stock_mtf_confirm_max_symbols", 12),
+            "stock_scan_symbol_fallback_limit": settings.get("stock_scan_symbol_fallback_limit", 48),
+            "stock_account_value_usd": round(float(stock_account_value), 2),
+            "ui_refresh_seconds": settings.get("ui_refresh_seconds", 1.0),
+            "chart_refresh_seconds": settings.get("chart_refresh_seconds", 10.0),
             "market_rollout_stage": settings.get("market_rollout_stage", "legacy"),
             "stock_loss_streak_size_step_pct": settings.get("stock_loss_streak_size_step_pct", 0.15),
             "stock_loss_streak_size_floor_pct": settings.get("stock_loss_streak_size_floor_pct", 0.40),

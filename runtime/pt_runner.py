@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -14,6 +14,7 @@ if __package__ in (None, ""):
         sys.path.insert(0, _ROOT)
 
 from app.api_quota import summarize_quota_events
+from app.automation_policy import summarize_policy_snapshot
 from app.cache_maintenance import prune_data_cache, prune_scanner_quality_artifacts
 from app.credential_utils import (
     get_alpaca_creds,
@@ -25,6 +26,8 @@ from app.exposure_analytics import build_exposure_payload
 from app.feature_flags import build_feature_flag_snapshot
 from app.health_rules import evaluate_runtime_alerts
 from app.http_utils import parse_retry_after_value
+from app.json_codec import load as json_load
+from app.json_codec import loads as json_loads
 from app.notification_center import build_notification_center_payload
 from app.path_utils import read_settings_file, resolve_runtime_paths, resolve_settings_path
 from app.runtime_insights import (
@@ -43,6 +46,7 @@ BASE_DIR, _SETTINGS_PATH, HUB_DATA_DIR, _BOOT_SETTINGS = resolve_runtime_paths(_
 RUNNER_PID_PATH = os.path.join(HUB_DATA_DIR, "runner.pid")
 STOP_FLAG_PATH = os.path.join(HUB_DATA_DIR, "stop_trading.flag")
 TRADER_STATUS_PATH = os.path.join(HUB_DATA_DIR, "trader_status.json")
+CRYPTO_TRADER_DETAIL_PATH = os.path.join(HUB_DATA_DIR, "trader_data.json")
 LOG_DIR = os.path.join(HUB_DATA_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -80,9 +84,12 @@ AUTOPILOT_STALE_MULT = 6.0
 MARKET_LOOP_RESTART_COOLDOWN_S = 180.0
 MARKET_LOOP_PHASE_TIMEOUT_RESTART_GRACE_S = 180.0
 MARKET_LOOP_PHASE_TIMEOUT_RESTART_GRACE_MULT = 1.25
+WATCHDOG_SLEEP_GAP_DETECT_S = 90.0
+WATCHDOG_SLEEP_RESUME_GRACE_S = 180.0
 SCRIPT_WATCH_INTERVAL_S = 3.0
 SCRIPT_CHANGE_MIN_UPTIME_S = 3.0
 SCRIPT_CHANGE_RESTART_COOLDOWN_S = 10.0
+SLEEP_GUARD_RESTART_COOLDOWN_S = 60.0
 DRAWDOWN_GUARD_PATH = os.path.join(HUB_DATA_DIR, "global_drawdown_guard.json")
 SAFETY_ACK_PATH = os.path.join(HUB_DATA_DIR, "safety_ack.json")
 
@@ -175,7 +182,7 @@ def _check_writable_dir(path: str) -> Optional[str]:
 def _safe_read_json(path: str) -> Dict[str, Any]:
     try:
         with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            data = json_load(f, default={})
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
@@ -192,7 +199,7 @@ def _intraday_drawdown_pct(history_path: str, lookback_hours: int = 24) -> float
                 if not ln:
                     continue
                 try:
-                    row = json.loads(ln)
+                    row = json_loads(ln, default=None)
                 except Exception:
                     continue
                 try:
@@ -225,7 +232,7 @@ def _read_jsonl_tail(path: str, limit: int = 600) -> list[Dict[str, Any]]:
     out: list[Dict[str, Any]] = []
     for ln in lines[-max(1, int(limit)):]:
         try:
-            row = json.loads(ln)
+            row = json_loads(ln, default=None)
             if isinstance(row, dict):
                 out.append(row)
         except Exception:
@@ -289,7 +296,7 @@ def _stop_flag_payload(path: str) -> Dict[str, Any]:
         with open(path, "r", encoding="utf-8") as f:
             raw = str(f.read() or "").strip()
         if raw.startswith("{"):
-            obj = json.loads(raw)
+            obj = json_loads(raw, default=None)
             if isinstance(obj, dict):
                 ts = int(float(obj.get("ts", 0) or 0))
                 reason = str(obj.get("reason", "") or "").strip().lower()
@@ -406,7 +413,24 @@ def _pid_is_alive(pid: Optional[int]) -> bool:
     try:
         if not pid or int(pid) <= 0:
             return False
-        os.kill(int(pid), 0)
+        pid_i = int(pid)
+        os.kill(pid_i, 0)
+        # On Unix, zombie processes still pass kill(pid, 0). Treat zombies as
+        # dead so stale runner.pid files self-heal instead of blocking relaunch.
+        if os.name != "nt":
+            try:
+                out = subprocess.run(
+                    ["ps", "-o", "stat=", "-p", str(pid_i)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    check=False,
+                )
+                stat = str((out.stdout or "").strip())
+                if stat.upper().startswith("Z"):
+                    return False
+            except Exception:
+                pass
         return True
     except OSError:
         return False
@@ -514,7 +538,19 @@ class Runner:
         self._last_market_loop_restart_at = 0.0
         self._last_market_loop_phase_timeout_sig = ""
         self._last_market_loop_phase_timeout_at = 0.0
+        self._watchdog_resume_grace_until = 0.0
         self._last_script_watch_at = 0.0
+        self._sleep_guard_proc: Optional[subprocess.Popen] = None
+        self._sleep_guard_last_start_at = 0.0
+        self._sleep_guard_warned_unavailable = False
+        self._sleep_guard_warned_disabled = False
+
+    def __del__(self) -> None:
+        # Best-effort cleanup for tests and short-lived invocations that do not call run().
+        try:
+            self._stop_sleep_guard()
+        except Exception:
+            pass
 
     def write_heartbeat(self) -> None:
         payload = {
@@ -567,7 +603,7 @@ class Runner:
 
         for ln in lines[-max(1, int(limit)):]:
             try:
-                row = json.loads(ln)
+                row = json_loads(ln, default=None)
             except Exception:
                 continue
             sev = str(row.get("severity", "info") or "info").strip().lower()
@@ -651,6 +687,14 @@ class Runner:
         autopilot = _safe_read_json(os.path.join(HUB_DATA_DIR, "autopilot_status.json"))
         stock_broker = _safe_read_json(os.path.join(HUB_DATA_DIR, "stocks", "alpaca_status.json"))
         forex_broker = _safe_read_json(os.path.join(HUB_DATA_DIR, "forex", "oanda_status.json"))
+        stock_trader = _safe_read_json(os.path.join(HUB_DATA_DIR, "stocks", "stock_trader_status.json"))
+        forex_trader = _safe_read_json(os.path.join(HUB_DATA_DIR, "forex", "forex_trader_status.json"))
+        crypto_trader = _safe_read_json(CRYPTO_TRADER_DETAIL_PATH)
+        automation_policy = summarize_policy_snapshot(
+            stock_trader if isinstance(stock_trader, dict) else {},
+            forex_trader if isinstance(forex_trader, dict) else {},
+            crypto_trader if isinstance(crypto_trader, dict) else {},
+        )
         status = _safe_read_json(TRADER_STATUS_PATH)
         incidents_rows = _read_jsonl_tail(INCIDENTS_PATH, limit=800)
         runtime_event_rows = _read_jsonl_tail(RUNTIME_EVENTS_PATH, limit=2000)
@@ -867,6 +911,12 @@ class Runner:
             "equity_curve_anomaly": equity_anomaly,
             "stale_history": stale_history,
             "feature_flags": feature_flags,
+            "automation_policy": {
+                "ts": int(time.time()),
+                "crypto": dict(automation_policy.get("crypto", {}) or {}) if isinstance(automation_policy.get("crypto", {}), dict) else {},
+                "stocks": dict(automation_policy.get("stocks", {}) or {}) if isinstance(automation_policy.get("stocks", {}), dict) else {},
+                "forex": dict(automation_policy.get("forex", {}) or {}) if isinstance(automation_policy.get("forex", {}), dict) else {},
+            },
         }
         payload["alerts"] = evaluate_runtime_alerts(payload, settings)
         notifications = build_notification_center_payload(payload, incidents_rows=incidents_rows, max_items=240)
@@ -1005,35 +1055,74 @@ class Runner:
         return max(0.0, float(now) - started_at)
 
     def _watchdog_tick(self, now: float) -> None:
-        if (now - self._last_watchdog_at) < WATCHDOG_INTERVAL_S:
+        prev_watchdog_at = float(self._last_watchdog_at or 0.0)
+        if (prev_watchdog_at > 0.0) and ((now - prev_watchdog_at) < WATCHDOG_INTERVAL_S):
             return
+        tick_gap_s = max(0.0, float(now) - prev_watchdog_at) if prev_watchdog_at > 0.0 else 0.0
         self._last_watchdog_at = now
 
         settings_path = resolve_settings_path(BASE_DIR) or _SETTINGS_PATH or os.path.join(BASE_DIR, "gui_settings.json")
         settings = sanitize_settings(read_settings_file(settings_path, module_name="pt_runner") or {})
+        self._ensure_sleep_guard(settings, now)
+        try:
+            sleep_gap_detect_s = max(
+                30.0,
+                float(settings.get("runner_sleep_gap_detect_s", WATCHDOG_SLEEP_GAP_DETECT_S) or WATCHDOG_SLEEP_GAP_DETECT_S),
+            )
+        except Exception:
+            sleep_gap_detect_s = float(WATCHDOG_SLEEP_GAP_DETECT_S)
+        try:
+            sleep_resume_grace_s = max(
+                30.0,
+                float(
+                    settings.get("runner_sleep_resume_grace_s", WATCHDOG_SLEEP_RESUME_GRACE_S) or WATCHDOG_SLEEP_RESUME_GRACE_S
+                ),
+            )
+        except Exception:
+            sleep_resume_grace_s = float(WATCHDOG_SLEEP_RESUME_GRACE_S)
+        if prev_watchdog_at > 0.0 and tick_gap_s >= sleep_gap_detect_s:
+            self._watchdog_resume_grace_until = max(self._watchdog_resume_grace_until, float(now) + float(sleep_resume_grace_s))
+            msg = (
+                f"system sleep/standby gap detected ({int(tick_gap_s)}s); "
+                f"suppressing watchdog restarts for {int(sleep_resume_grace_s)}s"
+            )
+            self.msg = msg
+            _runner_log(msg)
+            _append_incident(
+                "info",
+                "runner_sleep_resume_detected",
+                msg,
+                {
+                    "gap_s": round(float(tick_gap_s), 3),
+                    "grace_s": round(float(sleep_resume_grace_s), 3),
+                },
+            )
+        if float(now) < float(self._watchdog_resume_grace_until):
+            return
+
         market_interval = max(6.0, float(settings.get("market_bg_forex_interval_s", 12.0) or 12.0))
         autopilot_interval = 30.0
         try:
             market_startup_grace_s = max(
                 20.0,
-                float(settings.get("runner_market_watchdog_startup_grace_s", 90.0) or 90.0),
+                float(settings.get("runner_market_watchdog_startup_grace_s", 120.0) or 120.0),
             )
         except Exception:
-            market_startup_grace_s = 90.0
+            market_startup_grace_s = 120.0
         try:
             autopilot_startup_grace_s = max(
                 20.0,
-                float(settings.get("runner_autopilot_watchdog_startup_grace_s", 60.0) or 60.0),
+                float(settings.get("runner_autopilot_watchdog_startup_grace_s", 120.0) or 120.0),
             )
         except Exception:
-            autopilot_startup_grace_s = 60.0
+            autopilot_startup_grace_s = 120.0
         try:
             market_loop_startup_grace_s = max(
                 market_startup_grace_s,
-                float(settings.get("runner_market_loop_startup_grace_s", 150.0) or 150.0),
+                float(settings.get("runner_market_loop_startup_grace_s", 240.0) or 240.0),
             )
         except Exception:
-            market_loop_startup_grace_s = max(market_startup_grace_s, 150.0)
+            market_loop_startup_grace_s = max(market_startup_grace_s, 240.0)
         market_loop_stale_after = self._market_loop_watchdog_stale_after(settings, floor_s=market_loop_startup_grace_s)
         try:
             raw_phase_timeout_restart_grace_s = settings.get(
@@ -1174,6 +1263,92 @@ class Runner:
             else:
                 self._last_market_loop_phase_timeout_sig = ""
                 self._last_market_loop_phase_timeout_at = 0.0
+
+    def _sleep_guard_should_run(self, settings: Dict[str, Any]) -> bool:
+        if sys.platform != "darwin":
+            return False
+        raw = settings.get("runner_prevent_system_sleep", True)
+        return bool(raw)
+
+    def _stop_sleep_guard(self) -> None:
+        proc = self._sleep_guard_proc
+        self._sleep_guard_proc = None
+        if not proc or proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=2.0)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def _ensure_sleep_guard(self, settings: Dict[str, Any], now: float) -> None:
+        if not self._sleep_guard_should_run(settings):
+            if not self._sleep_guard_warned_disabled:
+                self._sleep_guard_warned_disabled = True
+                _runner_log("sleep guard disabled by settings (runner_prevent_system_sleep=false)")
+            self._stop_sleep_guard()
+            return
+        self._sleep_guard_warned_disabled = False
+
+        proc = self._sleep_guard_proc
+        if proc and proc.poll() is None:
+            return
+
+        if (float(now) - float(self._sleep_guard_last_start_at or 0.0)) < float(SLEEP_GUARD_RESTART_COOLDOWN_S):
+            return
+
+        caffeinate_bin = shutil.which("caffeinate")
+        if not caffeinate_bin:
+            if not self._sleep_guard_warned_unavailable:
+                self._sleep_guard_warned_unavailable = True
+                _runner_log("sleep guard unavailable: 'caffeinate' not found on PATH")
+                runtime_event(
+                    RUNTIME_EVENTS_PATH,
+                    component="runner",
+                    event="runner_sleep_guard_unavailable",
+                    level="warning",
+                    msg="Sleep guard unavailable; caffeinate not found. Host may enter standby while unattended.",
+                    details={"platform": sys.platform},
+                )
+            return
+
+        self._sleep_guard_warned_unavailable = False
+        self._sleep_guard_last_start_at = float(now)
+        try:
+            proc = subprocess.Popen(
+                [str(caffeinate_bin), "-dims", "-w", str(int(os.getpid()))],
+                cwd=BASE_DIR,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                **_detached_subprocess_kwargs(),
+            )
+            self._sleep_guard_proc = proc
+            msg = f"sleep guard active via caffeinate (pid={int(proc.pid)})"
+            _runner_log(msg)
+            runtime_event(
+                RUNTIME_EVENTS_PATH,
+                component="runner",
+                event="runner_sleep_guard_active",
+                level="info",
+                msg=msg,
+                details={"caffeinate_pid": int(proc.pid)},
+            )
+        except Exception as exc:
+            self._sleep_guard_proc = None
+            err = f"failed to start sleep guard: {type(exc).__name__}: {exc}"
+            _runner_log(err)
+            runtime_event(
+                RUNTIME_EVENTS_PATH,
+                component="runner",
+                event="runner_sleep_guard_start_failed",
+                level="warning",
+                msg=err,
+                details={"platform": sys.platform},
+            )
 
     def _retention_tick(self, now: float) -> None:
         if (now - self._last_log_cleanup_at) < LOG_RETENTION_INTERVAL_S:
@@ -1520,6 +1695,7 @@ class Runner:
         self.state = "STOPPING"
         self.msg = "Stopping child processes"
         self.write_heartbeat()
+        self._stop_sleep_guard()
         for child in self.children.values():
             _terminate_process(child.proc, child.name, force=force)
 

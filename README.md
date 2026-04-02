@@ -47,6 +47,7 @@ Runtime packages currently used by the app code:
 - `requests`, `kucoin-python`, `PyNaCl`, `cryptography`, `colorama`
 - `matplotlib`, `psutil`, `Pillow` (desktop icon/app packaging path)
 - `python-dotenv`, `pandas` (used by `sources/*` helpers)
+- `orjson` (fast JSON decode/encode), `watchdog` (event-driven file change signals), `prometheus-client` (optional metrics hooks)
 
 ## Run
 ### Hub UI

@@ -34,6 +34,11 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.patches import Rectangle
 from matplotlib.ticker import FuncFormatter
 from matplotlib.transforms import blended_transform_factory
+from app.file_watch import FileChangeWatch
+from app.json_codec import dump as fast_json_dump
+from app.json_codec import dumps as fast_json_dumps
+from app.json_codec import load as fast_json_load
+from app.json_codec import loads as fast_json_loads
 from app.path_utils import resolve_runtime_paths, resolve_settings_path, read_settings_file, log_once
 from app.runtime_logging import append_jsonl, runtime_event
 from app.rejection_replay import build_rejection_replay_report
@@ -45,7 +50,7 @@ from app.operator_notes import (
     read_recent_operator_note_entries,
     write_operator_notes_markdown,
 )
-from app.settings_utils import sanitize_settings, recommend_market_profile_overrides
+from app.settings_utils import sanitize_settings, recommend_market_profile_overrides, normalize_settings_profile
 from app.live_mode_guard import evaluate_live_mode_checklist
 from app.market_awareness import build_awareness_payload
 from app.health_rules import evaluate_runtime_alerts
@@ -486,7 +491,7 @@ DEFAULT_SETTINGS = {
     "alpaca_paper_mode": False,
     "market_rollout_stage": "live",  # internal rollout stage (locked to live)
     "settings_control_mode": "self_managed",  # preset_managed | self_managed
-    "settings_profile": "balanced",  # guarded | balanced | performance
+    "settings_profile": "balanced",  # safe | balanced | aggressive | max_growth
     "ui_role_mode": "basic",  # basic | advanced | admin
     "ui_timestamp_mode": "local_24h",  # local_24h | local_12h | utc_24h
     "ui_font_scale_preset": "normal",  # small | normal | large
@@ -650,6 +655,8 @@ DEFAULT_SETTINGS = {
 }
 
 _READ_INT_FILE_CACHE: Dict[str, Tuple[float, int]] = {}
+_READ_JSON_CACHE: Dict[str, Tuple[Tuple[int, int], Any]] = {}
+_TRADE_HISTORY_CACHE: Dict[str, Tuple[Tuple[int, int], List[dict]]] = {}
 
 
 
@@ -665,9 +672,36 @@ SETTINGS_FILE = "gui_settings.json"
 
 
 def _safe_read_json(path: str) -> Optional[dict]:
+    def _clone_payload(payload: Any) -> Any:
+        if isinstance(payload, dict):
+            return dict(payload)
+        if isinstance(payload, list):
+            return list(payload)
+        return payload
+
+    key = os.path.abspath(str(path or ""))
+    try:
+        st = os.stat(path)
+        sig = (int(getattr(st, "st_mtime_ns", 0) or 0), int(getattr(st, "st_size", 0) or 0))
+    except Exception:
+        sig = None
+    if sig is not None:
+        cached = _READ_JSON_CACHE.get(key)
+        if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == sig:
+            return _clone_payload(cached[1])
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            payload = fast_json_load(f)
+        if sig is not None:
+            _READ_JSON_CACHE[key] = (sig, payload)
+            if len(_READ_JSON_CACHE) > 384:
+                try:
+                    # Keep cache bounded; clear stale bulk safely.
+                    for _drop_key in list(_READ_JSON_CACHE.keys())[: max(1, len(_READ_JSON_CACHE) - 320)]:
+                        _READ_JSON_CACHE.pop(_drop_key, None)
+                except Exception:
+                    pass
+        return _clone_payload(payload)
     except (FileNotFoundError, PermissionError, OSError, json.JSONDecodeError, ValueError) as exc:
         log_once(
             f"pt_hub:_safe_read_json:{path}:{type(exc).__name__}",
@@ -680,7 +714,7 @@ def _safe_write_json(path: str, data: dict) -> None:
     try:
         tmp = f"{path}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+            fast_json_dump(data, f, indent=2, ensure_ascii=False)
         os.replace(tmp, path)
     except (PermissionError, OSError, TypeError, ValueError) as exc:
         log_once(
@@ -695,6 +729,16 @@ def _read_trade_history_jsonl(path: str) -> List[dict]:
     Returns a list of dicts (only buy/sell rows).
     """
     out: List[dict] = []
+    key = os.path.abspath(str(path or ""))
+    try:
+        st = os.stat(path)
+        sig = (int(getattr(st, "st_mtime_ns", 0) or 0), int(getattr(st, "st_size", 0) or 0))
+    except Exception:
+        sig = None
+    if sig is not None:
+        cached = _TRADE_HISTORY_CACHE.get(key)
+        if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == sig:
+            return list(cached[1])
     try:
         if os.path.isfile(path):
             with open(path, "r", encoding="utf-8") as f:
@@ -703,7 +747,7 @@ def _read_trade_history_jsonl(path: str) -> List[dict]:
                     if not ln:
                         continue
                     try:
-                        obj = json.loads(ln)
+                        obj = fast_json_loads(ln, default=None)
                         side = str(obj.get("side", "")).lower().strip()
                         if side not in ("buy", "sell"):
                             continue
@@ -712,6 +756,14 @@ def _read_trade_history_jsonl(path: str) -> List[dict]:
                         continue
     except Exception:
         pass
+    if sig is not None:
+        _TRADE_HISTORY_CACHE[key] = (sig, list(out))
+        if len(_TRADE_HISTORY_CACHE) > 64:
+            try:
+                for _drop_key in list(_TRADE_HISTORY_CACHE.keys())[: max(1, len(_TRADE_HISTORY_CACHE) - 48)]:
+                    _TRADE_HISTORY_CACHE.pop(_drop_key, None)
+            except Exception:
+                pass
     return out
 
 
@@ -854,6 +906,8 @@ def read_price_levels_from_html(path: str) -> List[float]:
                 if v <= 0:
                     continue
                 if v >= 9e15:  # pt_thinker uses 99999999999999999
+                    continue
+                if abs(v - 0.01) <= 1e-9:  # pt_thinker low-side inactive placeholder
                     continue
 
 
@@ -2548,7 +2602,7 @@ class AccountValueChart(ttk.Frame):
 
                 for ln in lines:
                     try:
-                        obj = json.loads(ln)
+                        obj = fast_json_loads(ln, default=None)
                         ts = obj.get("ts", None)
                         v = obj.get("total_account_value", None)
                         if ts is None or v is None:
@@ -2995,6 +3049,8 @@ class PowerTraderHub(tk.Tk):
 
         # Rebuild folder map after potential folder creation
         self.coin_folders = build_coin_folders(self.settings["main_neural_dir"], self.coins)
+        self._file_watch = FileChangeWatch()
+        self._file_watch_enabled = False
 
 
         # scripts
@@ -3044,6 +3100,27 @@ class PowerTraderHub(tk.Tk):
             pass
 
         self._last_chart_refresh = 0.0
+        self._last_parallel_market_panels_refresh_ts = 0.0
+        self._parallel_market_panels_refresh_interval_s = 2.0
+        self._last_log_panel_refresh_ts = 0.0
+        self._log_panel_refresh_interval_s = 2.5
+        self._last_chart_legend_refresh_ts = 0.0
+        self._chart_legend_refresh_interval_s = 1.5
+        self._log_style_cooldown_s = 3.0
+        self._log_style_last_ts: Dict[str, float] = {}
+        self._trade_history_agg_mtime: Optional[float] = None
+        self._trade_history_agg_last_calc_ts = 0.0
+        self._trade_history_agg_refresh_s = 20.0
+        self._trade_history_agg_dca24h: Dict[str, int] = {}
+        self._trade_history_agg_realized: Dict[str, float] = {}
+        self._runtime_snapshot_cache: Dict[str, Any] = {}
+        self._file_watch_panel_force_interval_s = 8.0
+        self._file_watch_log_force_interval_s = 8.0
+        self._file_watch_chart_force_interval_s = 20.0
+        try:
+            self._start_file_watch()
+        except Exception:
+            self._file_watch_enabled = False
 
         if bool(self.settings.get("auto_start_scripts", False)):
             self.start_all_scripts()
@@ -3053,6 +3130,79 @@ class PowerTraderHub(tk.Tk):
         self.after(1200, self._maybe_route_invalid_credentials)
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+
+    def _file_watch_roots(self) -> List[str]:
+        roots: Set[str] = set()
+        hub_root = os.path.abspath(str(getattr(self, "hub_dir", "") or "").strip())
+        if hub_root and os.path.isdir(hub_root):
+            roots.add(hub_root)
+        folder_map = getattr(self, "coin_folders", {})
+        if isinstance(folder_map, dict):
+            for folder in folder_map.values():
+                fp = os.path.abspath(str(folder or "").strip())
+                if fp and os.path.isdir(fp):
+                    roots.add(fp)
+        return sorted(roots)
+
+    def _start_file_watch(self) -> None:
+        watcher = getattr(self, "_file_watch", None)
+        if not isinstance(watcher, FileChangeWatch):
+            watcher = FileChangeWatch()
+            self._file_watch = watcher
+        if not watcher.available:
+            self._file_watch_enabled = False
+            return
+        roots = self._file_watch_roots()
+        self._file_watch_enabled = bool(watcher.start(roots))
+
+    def _stop_file_watch(self) -> None:
+        watcher = getattr(self, "_file_watch", None)
+        if not isinstance(watcher, FileChangeWatch):
+            self._file_watch_enabled = False
+            return
+        try:
+            watcher.stop()
+        finally:
+            self._file_watch_enabled = False
+
+    def _consume_file_watch_hints(self) -> Dict[str, bool]:
+        fallback = {"runtime": True, "logs": True, "charts": True}
+        watcher = getattr(self, "_file_watch", None)
+        if (not isinstance(watcher, FileChangeWatch)) or (not bool(getattr(self, "_file_watch_enabled", False))):
+            return fallback
+        changed = watcher.pop_changed_paths()
+        if not changed:
+            return {"runtime": False, "logs": False, "charts": False}
+        hub_root = os.path.abspath(str(getattr(self, "hub_dir", "") or "").strip()).lower()
+        coin_roots: List[str] = []
+        folder_map = getattr(self, "coin_folders", {})
+        if isinstance(folder_map, dict):
+            for folder in folder_map.values():
+                fp = os.path.abspath(str(folder or "").strip()).lower()
+                if fp and os.path.isdir(fp):
+                    coin_roots.append(fp)
+        runtime_dirty = False
+        logs_dirty = False
+        charts_dirty = False
+        for raw in changed:
+            path = os.path.abspath(str(raw or "").strip()).lower()
+            if not path:
+                continue
+            if hub_root and (path == hub_root or path.startswith(hub_root + os.sep)):
+                runtime_dirty = True
+                charts_dirty = True
+                if (f"{os.sep}logs{os.sep}" in path) or path.endswith(".log"):
+                    logs_dirty = True
+            for root in coin_roots:
+                if path == root or path.startswith(root + os.sep):
+                    charts_dirty = True
+                    break
+            if runtime_dirty and logs_dirty and charts_dirty:
+                break
+        if not (runtime_dirty or logs_dirty or charts_dirty):
+            runtime_dirty = True
+        return {"runtime": runtime_dirty, "logs": logs_dirty, "charts": charts_dirty}
 
 
     # ---- forced dark mode ----
@@ -3524,10 +3674,8 @@ class PowerTraderHub(tk.Tk):
         if mode_key != "preset_managed":
             return
         try:
-            profile_key = str(self.settings.get("settings_profile", "balanced") or "balanced").strip().lower()
+            profile_key = normalize_settings_profile(self.settings.get("settings_profile", "balanced"), default="balanced")
         except Exception:
-            profile_key = "balanced"
-        if profile_key not in {"guarded", "balanced", "performance"}:
             profile_key = "balanced"
         now = float(time.time() if now_ts is None else now_ts)
         interval_s = float(getattr(self, "_profile_autotune_interval_s", 20.0) or 20.0)
@@ -3560,77 +3708,6 @@ class PowerTraderHub(tk.Tk):
         self.settings.update(changes)
         self._save_settings()
 
-    def _save_market_max_open_positions(self, market_key: str, value: Any) -> Tuple[bool, str]:
-        mk = str(market_key or "").strip().lower()
-        if mk not in {"stocks", "forex"}:
-            return False, "Unsupported market."
-        cfg_key = "stock_max_open_positions" if mk == "stocks" else "forex_max_open_positions"
-        label = "Stocks" if mk == "stocks" else "Forex"
-        try:
-            new_val = max(1, int(float(str(value or "").strip() or "1")))
-        except Exception:
-            return False, "Enter a whole number of 1 or higher."
-        self.settings[cfg_key] = new_val
-        try:
-            overrides = self._profile_manual_override_keys()
-            overrides.add(cfg_key)
-            self.settings["profile_manual_overrides"] = sorted(overrides)
-        except Exception:
-            self.settings["profile_manual_overrides"] = [cfg_key]
-        try:
-            self._save_settings()
-        except Exception as exc:
-            return False, f"Save failed: {type(exc).__name__}: {exc}"
-        return True, f"{label} max open positions saved: {new_val}"
-
-    def _save_crypto_max_open_positions(self, value: Any) -> Tuple[bool, str]:
-        cfg_key = "crypto_max_open_positions"
-        try:
-            new_val = max(1, int(float(str(value or "").strip() or "1")))
-        except Exception:
-            return False, "Enter a whole number of 1 or higher."
-        self.settings[cfg_key] = new_val
-        try:
-            overrides = self._profile_manual_override_keys()
-            overrides.add(cfg_key)
-            self.settings["profile_manual_overrides"] = sorted(overrides)
-        except Exception:
-            self.settings["profile_manual_overrides"] = [cfg_key]
-        try:
-            self._save_settings()
-        except Exception as exc:
-            return False, f"Save failed: {type(exc).__name__}: {exc}"
-        return True, f"Crypto max open positions saved: {new_val}"
-
-    def _crypto_max_open_positions_setting_value(self) -> int:
-        try:
-            fallback = max(
-                1,
-                int(
-                    float(
-                        self.settings.get(
-                            "crypto_dynamic_target_count",
-                            DEFAULT_SETTINGS.get("crypto_dynamic_target_count", 8),
-                        )
-                        or DEFAULT_SETTINGS.get("crypto_dynamic_target_count", 8)
-                    )
-                ),
-            )
-        except Exception:
-            fallback = 8
-        try:
-            return max(1, int(float(self.settings.get("crypto_max_open_positions", fallback) or fallback)))
-        except Exception:
-            return max(1, int(fallback))
-
-    def _market_max_open_positions_setting_value(self, market_key: str) -> int:
-        mk = str(market_key or "").strip().lower()
-        cfg_key = "stock_max_open_positions" if mk == "stocks" else "forex_max_open_positions"
-        try:
-            return max(1, int(float(self.settings.get(cfg_key, 1) or 1)))
-        except Exception:
-            return 1
-
     def _profile_manual_override_keys(self) -> Set[str]:
         raw = self.settings.get("profile_manual_overrides", [])
         if isinstance(raw, str):
@@ -3651,61 +3728,6 @@ class PowerTraderHub(tk.Tk):
             "forex_min_samples_live_guarded",
         }
         return {k for k in seq if k in allowed}
-
-    def _sync_market_max_open_positions_editor(
-        self,
-        market_key: str,
-        panel: Optional[Dict[str, Any]] = None,
-        *,
-        force: bool = False,
-    ) -> None:
-        mk = str(market_key or "").strip().lower()
-        row = panel if isinstance(panel, dict) else self.market_panels.get(mk, {})
-        var = row.get("max_open_positions_var")
-        if not (hasattr(var, "set") and hasattr(var, "get")):
-            return
-        dirty_var = row.get("max_open_positions_dirty_var")
-        dirty = False
-        try:
-            dirty = bool(dirty_var.get()) if hasattr(dirty_var, "get") else False
-        except Exception:
-            dirty = False
-        if dirty and (not force):
-            return
-        sync_state = row.get("max_open_positions_sync_state")
-        row["max_open_positions_syncing"] = True
-        if isinstance(sync_state, dict):
-            sync_state["value"] = True
-        try:
-            var.set(str(self._market_max_open_positions_setting_value(mk)))
-            if hasattr(dirty_var, "set"):
-                dirty_var.set(False)
-        finally:
-            row["max_open_positions_syncing"] = False
-
-    def _sync_crypto_max_open_positions_editor(self, *, force: bool = False) -> None:
-        var = getattr(self, "crypto_max_open_positions_var", None)
-        if not (hasattr(var, "set") and hasattr(var, "get")):
-            return
-        dirty_var = getattr(self, "crypto_max_open_positions_dirty_var", None)
-        sync_state = getattr(self, "crypto_max_open_positions_sync_state", {})
-        try:
-            dirty = bool(dirty_var.get()) if hasattr(dirty_var, "get") else False
-        except Exception:
-            dirty = False
-        if (not force) and dirty:
-            return
-        if isinstance(sync_state, dict):
-            sync_state["value"] = True
-        try:
-            var.set(str(self._crypto_max_open_positions_setting_value()))
-            if hasattr(dirty_var, "set"):
-                dirty_var.set(False)
-        finally:
-            if isinstance(sync_state, dict):
-                sync_state["value"] = False
-            if isinstance(sync_state, dict):
-                sync_state["value"] = False
 
     def _market_money_text(
         self,
@@ -4139,7 +4161,7 @@ class PowerTraderHub(tk.Tk):
         try:
             _ensure_dir(os.path.dirname(path))
             with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+                f.write(fast_json_dumps(payload, ensure_ascii=True) + "\n")
         except Exception:
             pass
 
@@ -5589,7 +5611,7 @@ class PowerTraderHub(tk.Tk):
                     except Exception:
                         manifest["files"].append({"path": rel, "size": 0, "mtime": 0, "sha256": sha256})
                     zf.write(p, arcname=rel)
-                zf.writestr("manifest.json", json.dumps(manifest, indent=2))
+                zf.writestr("manifest.json", fast_json_dumps(manifest, indent=2, ensure_ascii=False))
             self._audit_operator_action("export_diagnostics_bundle", {"path": path, "files": int(len(manifest.get("files", []) or []))})
             messagebox.showinfo("Export", f"Diagnostics bundle exported:\n{path}")
         except Exception as exc:
@@ -6780,8 +6802,8 @@ class PowerTraderHub(tk.Tk):
         try:
             if os.path.isfile(report_path):
                 with open(report_path, "r", encoding="utf-8") as f:
-                    parsed = json.load(f)
-                report_txt = json.dumps(parsed, indent=2, ensure_ascii=True)
+                    parsed = fast_json_load(f, default={})
+                report_txt = fast_json_dumps(parsed, indent=2, ensure_ascii=True)
         except Exception as exc:
             report_txt = f"Could not read diagnostics report:\n{type(exc).__name__}: {exc}"
         if error_text:
@@ -7439,73 +7461,9 @@ class PowerTraderHub(tk.Tk):
         self.lbl_acct_buying_power = _add_portfolio_metric(2, "Buying Power")
         self.lbl_acct_percent_in_trade = _add_portfolio_metric(3, "Percent In Trade")
         self.lbl_acct_open_positions = _add_portfolio_metric(4, "Open Positions")
-
-        ttk.Label(portfolio_grid, text="Max Open Positions").grid(row=5, column=0, sticky="w", padx=(0, 10), pady=2)
-        crypto_max_open_row = ttk.Frame(portfolio_grid)
-        crypto_max_open_row.grid(row=5, column=1, sticky="ew", pady=2)
-        crypto_max_open_row.columnconfigure(0, weight=1)
-        self.crypto_max_open_positions_var = tk.StringVar(value=str(self._crypto_max_open_positions_setting_value()))
-        self.crypto_max_open_positions_dirty_var = tk.BooleanVar(value=False)
-        self.crypto_max_open_positions_sync_state = {"value": False}
-        self.crypto_quick_setting_status_var = tk.StringVar(value="")
-        self.crypto_max_open_edit = ttk.Entry(
-            crypto_max_open_row,
-            textvariable=self.crypto_max_open_positions_var,
-            width=8,
-            justify="right",
-        )
-        self.crypto_max_open_edit.grid(row=0, column=0, sticky="e")
-
-        def _mark_crypto_max_open_positions_dirty(*_args: Any) -> None:
-            if bool(self.crypto_max_open_positions_sync_state.get("value", False)):
-                return
-            expected = str(self._crypto_max_open_positions_setting_value())
-            try:
-                dirty = str(self.crypto_max_open_positions_var.get()).strip() != expected
-            except Exception:
-                dirty = True
-            self.crypto_max_open_positions_dirty_var.set(bool(dirty))
-            if dirty:
-                self.crypto_quick_setting_status_var.set("")
-
-        self.crypto_max_open_positions_var.trace_add("write", _mark_crypto_max_open_positions_dirty)
-
-        def _save_crypto_max_open_positions() -> None:
-            ok, msg = self._save_crypto_max_open_positions(self.crypto_max_open_positions_var.get())
-            if ok:
-                self.crypto_quick_setting_status_var.set(msg)
-                self.crypto_max_open_positions_sync_state["value"] = True
-                try:
-                    self.crypto_max_open_positions_var.set(str(self._crypto_max_open_positions_setting_value()))
-                    self.crypto_max_open_positions_dirty_var.set(False)
-                finally:
-                    self.crypto_max_open_positions_sync_state["value"] = False
-                return
-            messagebox.showerror("Invalid value", msg)
-
-        self.crypto_max_open_save_btn = ttk.Button(
-            crypto_max_open_row,
-            text="Save",
-            width=6,
-            style="Compact.TButton",
-            command=_save_crypto_max_open_positions,
-        )
-        self.crypto_max_open_save_btn.grid(row=0, column=1, padx=(6, 0))
-        try:
-            self.crypto_max_open_edit.bind("<Return>", lambda _e: (_save_crypto_max_open_positions(), "break")[1])
-        except Exception:
-            pass
-
-        self.lbl_acct_dca_spread = _add_portfolio_metric(6, "DCA Levels (spread)")
-        self.lbl_acct_dca_single = _add_portfolio_metric(7, "DCA Levels (single)")
-        self.lbl_pnl = _add_portfolio_metric(8, "Total realized")
-        self.lbl_crypto_quick_setting = ttk.Label(
-            acct_box,
-            textvariable=self.crypto_quick_setting_status_var,
-            foreground=DARK_MUTED,
-            justify="left",
-        )
-        self.lbl_crypto_quick_setting.pack(anchor="w", padx=6, pady=(0, 4), fill="x")
+        self.lbl_acct_dca_spread = _add_portfolio_metric(5, "DCA Levels (spread)")
+        self.lbl_acct_dca_single = _add_portfolio_metric(6, "DCA Levels (single)")
+        self.lbl_pnl = _add_portfolio_metric(7, "Total realized")
 
         self.crypto_watchlist_box = None
         self.lbl_crypto_watchlist_meta = None
@@ -8741,10 +8699,6 @@ class PowerTraderHub(tk.Tk):
             "realized_pnl": tk.StringVar(value="N/A"),
             "daily_guard": tk.StringVar(value="Armed"),
         }
-        max_open_positions_var = tk.StringVar(value=str(self._market_max_open_positions_setting_value(market_key)))
-        max_open_positions_dirty_var = tk.BooleanVar(value=False)
-        max_open_positions_sync_state = {"value": False}
-        quick_setting_status_var = tk.StringVar(value="")
 
         metric_rows = (
             ("Total Account Value", "total_account_value"),
@@ -8752,71 +8706,12 @@ class PowerTraderHub(tk.Tk):
             (("Margin Available" if market_key == "forex" else "Buying Power"), "buying_power"),
             (("Margin Utilization" if market_key == "forex" else "Percent In Trade"), "percent_in_trade"),
             ("Open Positions", "open_positions"),
-            ("Max Open Positions", "max_open_positions"),
             ("Realized PnL", "realized_pnl"),
             ("Daily Loss Guardrail", "daily_guard"),
         )
         for idx, (label, key) in enumerate(metric_rows):
             ttk.Label(metric_grid, text=label).grid(row=idx, column=0, sticky="w", padx=(0, 10), pady=2)
-            if key == "max_open_positions":
-                max_open_row = ttk.Frame(metric_grid)
-                max_open_row.grid(row=idx, column=1, sticky="ew", pady=2)
-                max_open_row.columnconfigure(0, weight=1)
-                max_open_edit = ttk.Entry(max_open_row, textvariable=max_open_positions_var, width=8, justify="right")
-                max_open_edit.grid(row=0, column=0, sticky="e")
-            else:
-                ttk.Label(metric_grid, textvariable=portfolio_vars[key]).grid(row=idx, column=1, sticky="e", pady=2)
-
-        def _mark_max_open_positions_dirty(*_args: Any) -> None:
-            if bool(max_open_positions_sync_state.get("value", False)):
-                return
-            expected = str(self._market_max_open_positions_setting_value(market_key))
-            try:
-                dirty = str(max_open_positions_var.get()).strip() != expected
-            except Exception:
-                dirty = True
-            max_open_positions_dirty_var.set(bool(dirty))
-            if dirty:
-                quick_setting_status_var.set("")
-
-        max_open_positions_var.trace_add("write", _mark_max_open_positions_dirty)
-
-        def _save_max_open_positions(mk: str = market_key) -> None:
-            ok, msg = self._save_market_max_open_positions(mk, max_open_positions_var.get())
-            if ok:
-                quick_setting_status_var.set(msg)
-                max_open_positions_sync_state["value"] = True
-                try:
-                    max_open_positions_var.set(str(self._market_max_open_positions_setting_value(mk)))
-                    max_open_positions_dirty_var.set(False)
-                finally:
-                    max_open_positions_sync_state["value"] = False
-                try:
-                    self._refresh_parallel_market_panels()
-                except Exception:
-                    pass
-                return
-            messagebox.showerror("Invalid value", msg)
-
-        max_open_save_btn = ttk.Button(
-            max_open_row,
-            text="Save",
-            width=6,
-            style="Compact.TButton",
-            command=_save_max_open_positions,
-        )
-        max_open_save_btn.grid(row=0, column=1, padx=(6, 0))
-        try:
-            max_open_edit.bind("<Return>", lambda _e: (_save_max_open_positions(), "break")[1])
-        except Exception:
-            pass
-        quick_setting_lbl = ttk.Label(
-            portfolio_box,
-            textvariable=quick_setting_status_var,
-            foreground=DARK_MUTED,
-            justify="left",
-        )
-        quick_setting_lbl.pack(anchor="w", padx=6, pady=(0, 4), fill="x")
+            ttk.Label(metric_grid, textvariable=portfolio_vars[key]).grid(row=idx, column=1, sticky="e", pady=2)
 
         legend_box = ttk.LabelFrame(market_dash_body, text="Chart Legend")
         legend_box.pack(fill="x", padx=6, pady=(0, 6))
@@ -8865,17 +8760,13 @@ class PowerTraderHub(tk.Tk):
             except Exception:
                 width = 260
             detail_wrap = max(220, width - 28)
-            for label_widget in (state_lbl, endpoint_lbl, quick_setting_lbl, legend_note_lbl):
+            for label_widget in (state_lbl, endpoint_lbl, legend_note_lbl):
                 try:
                     label_widget.configure(wraplength=detail_wrap)
                 except Exception:
                     pass
             _responsive_grid(health_chip_row, chip_widgets, min_col_width=112)
             _responsive_grid(action_buttons, action_widgets, min_col_width=150)
-            try:
-                max_open_row.columnconfigure(0, weight=1)
-            except Exception:
-                pass
 
         try:
             market_dash_body.bind("<Configure>", _reflow_market_dashboard, add="+")
@@ -9327,10 +9218,6 @@ class PowerTraderHub(tk.Tk):
             "state_var": state_var,
             "endpoint_var": endpoint_var,
             "portfolio_vars": portfolio_vars,
-            "max_open_positions_var": max_open_positions_var,
-            "max_open_positions_dirty_var": max_open_positions_dirty_var,
-            "max_open_positions_sync_state": max_open_positions_sync_state,
-            "quick_setting_status_var": quick_setting_status_var,
             "notes_text": notes_text,
             "notes_toggle_btn": notes_toggle_btn,
             "notes_collapsed_var": notes_collapsed_var,
@@ -10841,18 +10728,35 @@ class PowerTraderHub(tk.Tk):
             if not ident:
                 continue
             side = str(row.get("side", "watch") or "watch").strip().upper()
+            raw_score: Optional[float] = None
             try:
-                score_txt = f"{float(row.get('score', 0.0)):+.4f}"
+                raw_score = float(row.get("score", 0.0) or 0.0)
             except Exception:
+                raw_score = None
+            score_outlier = False
+            score_cap = 100.0 if mk == "stocks" else (10.0 if mk == "forex" else 1000.0)
+            if raw_score is not None:
+                if (not math.isfinite(raw_score)) or abs(float(raw_score)) > float(score_cap):
+                    score_outlier = True
+                    score_txt = "N/A"
+                else:
+                    score_txt = f"{float(raw_score):+.4f}"
+            else:
                 score_txt = str(row.get("score", "N/A") or "N/A")
             eligible = bool(row.get("eligible_for_entry", False)) and side in {"LONG", "SHORT"}
             gate_reason = str(row.get("entry_gate_reason", "") or "").strip()
+            if score_outlier:
+                eligible = False
+                if not gate_reason:
+                    gate_reason = "Blocked: scanner outlier protection active for this symbol."
             note_logic, note_data = self._market_reason_parts(mk, row)
             why_txt = gate_reason or str(note_logic or "").strip()
             if not why_txt:
                 why_txt = ("Eligible now; waiting for next trader cycle." if eligible else "Waiting for the next qualified setup.")
             logic_txt = str(note_logic or row.get("reason", "") or "").strip()
             status_txt = "READY" if eligible else ("ENTRY WAIT" if side in {"LONG", "SHORT"} else side)
+            if score_outlier:
+                status_txt = "DATA CHECK"
             try:
                 last_price = float(row.get("last", 0.0) or 0.0)
             except Exception:
@@ -10892,13 +10796,16 @@ class PowerTraderHub(tk.Tk):
                     gain_pct = ((entry_val / exit_val) - 1.0) * 100.0
                 else:
                     gain_pct = ((exit_val / entry_val) - 1.0) * 100.0
+            gain_txt = "N/A"
+            if entry_val > 0.0 and exit_val > 0.0 and math.isfinite(gain_pct) and abs(float(gain_pct)) <= 250.0:
+                gain_txt = f"{gain_pct:+.2f}%"
             rows.append(
                 {
                     "symbol": ident,
                     "score": score_txt,
                     "entry": _fmt_price(entry_val) if entry_val > 0.0 else "N/A",
                     "exit": _fmt_price(exit_val) if exit_val > 0.0 else "N/A",
-                    "gain": f"{gain_pct:+.2f}%" if (entry_val > 0.0 and exit_val > 0.0) else "N/A",
+                    "gain": gain_txt,
                     "status": status_txt,
                     "why": why_txt,
                     "logic": logic_txt,
@@ -11038,7 +10945,7 @@ class PowerTraderHub(tk.Tk):
             if hist_endpoint:
                 payload["broker_endpoint"] = hist_endpoint
             with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+                f.write(fast_json_dumps(payload, ensure_ascii=True) + "\n")
             self._last_market_account_history_write_ts[market_key] = float(ts_f)
             self._last_market_account_history_value[market_key] = float(account_value)
         except Exception:
@@ -11067,7 +10974,7 @@ class PowerTraderHub(tk.Tk):
                 with open(path, "r", encoding="utf-8") as f:
                     for ln in f:
                         try:
-                            row = json.loads(str(ln or "").strip())
+                            row = fast_json_loads(str(ln or "").strip(), default=None)
                         except Exception:
                             continue
                         if not isinstance(row, dict):
@@ -13427,7 +13334,7 @@ class PowerTraderHub(tk.Tk):
                 with open(path, "r", encoding="utf-8") as f:
                     for ln in f:
                         try:
-                            row = json.loads(str(ln or "").strip())
+                            row = fast_json_loads(str(ln or "").strip(), default=None)
                         except Exception:
                             continue
                         if not isinstance(row, dict):
@@ -13819,7 +13726,7 @@ class PowerTraderHub(tk.Tk):
                 audit_lines = [ln.strip() for ln in f if ln.strip()]
             for ln in audit_lines[-200:]:
                 try:
-                    row = json.loads(ln)
+                    row = fast_json_loads(ln, default=None)
                 except Exception:
                     continue
                 event = str(row.get("event", "") or "").strip().lower()
@@ -14199,7 +14106,7 @@ class PowerTraderHub(tk.Tk):
                     data = [ln.strip() for ln in f if ln.strip()]
                 for ln in data[-80:]:
                     try:
-                        row = json.loads(ln)
+                        row = fast_json_loads(ln, default=None)
                     except Exception:
                         continue
                     when = ""
@@ -15034,6 +14941,7 @@ class PowerTraderHub(tk.Tk):
             if gate_reason:
                 state_line += f" | Gate={gate_reason[:56]}"
             gate_flags = trader_data.get("entry_gate_flags", {}) if isinstance(trader_data.get("entry_gate_flags", {}), dict) else {}
+            policy_data = trader_data.get("automation_policy", {}) if isinstance(trader_data.get("automation_policy", {}), dict) else {}
             if gate_flags:
                 try:
                     rej = float(gate_flags.get("reject_rate_pct", 0.0) or 0.0)
@@ -15044,6 +14952,21 @@ class PowerTraderHub(tk.Tk):
                     pass
                 if bool(gate_flags.get("data_quality_required", False)) and (not bool(gate_flags.get("data_quality_ok", True))):
                     state_line += " | DataGate=BLOCK"
+            if policy_data:
+                pol_summary = str(policy_data.get("summary", "") or "").strip()
+                if pol_summary:
+                    state_line += f" | Policy={pol_summary[:64]}"
+                trust = policy_data.get("runtime_trust", {}) if isinstance(policy_data.get("runtime_trust", {}), dict) else {}
+                try:
+                    trust_score = float(trust.get("score", 0.0) or 0.0)
+                except Exception:
+                    trust_score = 0.0
+                if trust_score > 0.0:
+                    state_line += f" | Trust={trust_score:.0f}"
+                compliance = policy_data.get("compliance", {}) if isinstance(policy_data.get("compliance", {}), dict) else {}
+                compliance_status = str(compliance.get("status_text", "") or "").strip()
+                if market_key == "stocks" and compliance_status:
+                    state_line += f" | {compliance_status[:56]}"
             try:
                 entry_size_scale = float(trader_data.get("entry_size_scale", 1.0) or 1.0)
                 if entry_size_scale < 0.999:
@@ -15208,6 +15131,16 @@ class PowerTraderHub(tk.Tk):
                 except Exception:
                     rem_s = 0
                 action_hint = f"Next: execution temporarily paused for broker stability ({rem_s}s remaining)."
+            elif policy_data and (not bool(policy_data.get("allow_new_entries", True))):
+                compliance = policy_data.get("compliance", {}) if isinstance(policy_data.get("compliance", {}), dict) else {}
+                policy_reason = str(
+                    compliance.get("entry_block_reason", "")
+                    or ((policy_data.get("runtime_trust", {}) if isinstance(policy_data.get("runtime_trust", {}), dict) else {}).get("reasons", [""])
+                        or [""])[0]
+                    or policy_data.get("summary", "")
+                    or "automation policy is restricting new entries"
+                ).strip()
+                action_hint = f"Next: automation is currently restricted ({policy_reason})."
             elif "MAX OPEN POSITIONS" in str(msg).upper():
                 max_key = "stock_max_open_positions" if market_key == "stocks" else "forex_max_open_positions"
                 try:
@@ -15286,7 +15219,6 @@ class PowerTraderHub(tk.Tk):
                         daily_guard_var.set(self._market_daily_guard_text(market_key, trader_data))
                     except Exception:
                         pass
-            self._sync_market_max_open_positions_editor(market_key, panel)
             self._set_market_positions(
                 market_key,
                 list(status_data.get("positions_preview", []) or []),
@@ -15771,8 +15703,6 @@ class PowerTraderHub(tk.Tk):
                             daily_guard_var.set(self._market_daily_guard_text(market_key, trader_data))
                         except Exception:
                             pass
-                self._sync_market_max_open_positions_editor(market_key, panel)
-
                 try:
                     self._set_market_positions(
                         market_key,
@@ -16420,7 +16350,24 @@ class PowerTraderHub(tk.Tk):
         try:
             if pid is None or int(pid) <= 0:
                 return False
-            os.kill(int(pid), 0)
+            pid_i = int(pid)
+            os.kill(pid_i, 0)
+            # On Unix, zombie processes still pass kill(pid, 0). Treat zombies as dead
+            # so the hub can recover from stale/defunct runner pid files.
+            if os.name != "nt":
+                try:
+                    out = subprocess.run(
+                        ["ps", "-o", "stat=", "-p", str(pid_i)],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        text=True,
+                        check=False,
+                    )
+                    stat = str((out.stdout or "").strip())
+                    if stat.upper().startswith("Z"):
+                        return False
+                except Exception:
+                    pass
             return True
         except OSError:
             return False
@@ -17061,15 +17008,34 @@ class PowerTraderHub(tk.Tk):
                     txt.delete("1.0", f"{current - max_lines}.0")
             except Exception:
                 pass
-            self._style_log_text_widget(txt)
+            try:
+                now_ts = float(time.time())
+                style_map = getattr(self, "_log_style_last_ts", {})
+                if not isinstance(style_map, dict):
+                    style_map = {}
+                key = str(txt)
+                last_ts = float(style_map.get(key, 0.0) or 0.0)
+                cooldown_s = max(0.75, float(getattr(self, "_log_style_cooldown_s", 3.0) or 3.0))
+                if (now_ts - last_ts) >= cooldown_s:
+                    self._style_log_text_widget(txt)
+                    style_map[key] = now_ts
+                    self._log_style_last_ts = style_map
+            except Exception:
+                pass
             txt.see("end")
 
     def _style_log_text_widget(self, txt: tk.Text) -> None:
         try:
-            for tag in ("log_ts", "log_warn", "log_err", "log_launch"):
-                txt.tag_remove(tag, "1.0", "end")
+            if not bool(txt.winfo_ismapped()):
+                return
             end_line = int(txt.index("end-1c").split(".")[0])
-            for idx in range(1, end_line + 1):
+            if end_line <= 0:
+                return
+            start_line = max(1, int(end_line) - 220)
+            start_idx = f"{start_line}.0"
+            for tag in ("log_ts", "log_warn", "log_err", "log_launch"):
+                txt.tag_remove(tag, start_idx, "end")
+            for idx in range(start_line, end_line + 1):
                 line = txt.get(f"{idx}.0", f"{idx}.end")
                 if not line:
                     continue
@@ -17094,6 +17060,31 @@ class PowerTraderHub(tk.Tk):
         prefix_path: Optional[str] = None,
     ) -> None:
         try:
+            def _tail_lines(fp: str, lim: int) -> List[str]:
+                try:
+                    with open(fp, "rb") as f:
+                        f.seek(0, os.SEEK_END)
+                        size = int(f.tell() or 0)
+                        if size <= 0:
+                            return []
+                        window = min(size, max(8192, (2 * 1024 * 1024), int(lim) * 320))
+                        f.seek(-window, os.SEEK_END)
+                        blob = f.read(window)
+                except Exception:
+                    return []
+                try:
+                    lines = str(blob.decode("utf-8", errors="ignore")).splitlines()
+                except Exception:
+                    return []
+                if window < size and lines:
+                    lines = lines[1:]
+                out: List[str] = []
+                for ln in lines:
+                    txt_ln = str(ln or "").rstrip()
+                    if txt_ln:
+                        out.append(txt_ln)
+                return out[-max(1, int(lim or 1)) :]
+
             parts = []
             mtimes = []
             for fp in [p for p in (prefix_path, path) if p]:
@@ -17110,13 +17101,21 @@ class PowerTraderHub(tk.Tk):
 
             for fp, _ in mtimes:
                 try:
-                    with open(fp, "r", encoding="utf-8", errors="ignore") as f:
-                        lines = f.read().splitlines()
+                    lines = _tail_lines(fp, max_lines)
                     if prefix_path and fp == prefix_path and lines:
                         lines = [f"[launch] {ln}" for ln in lines]
                     parts.extend(lines[-max_lines:])
                 except Exception:
                     continue
+
+            try:
+                content_probe = tuple(parts[-80:])
+                content_key = f"{cache_key}:content"
+                if getattr(self, content_key, object()) == content_probe:
+                    return
+                setattr(self, content_key, content_probe)
+            except Exception:
+                pass
 
             txt.configure(state="normal")
             txt.delete("1.0", "end")
@@ -17126,13 +17125,27 @@ class PowerTraderHub(tk.Tk):
                 name = os.path.basename(path)
                 txt.insert("1.0", f"(waiting for {name} output)")
             txt.configure(state="normal")
-            self._style_log_text_widget(txt)
+            try:
+                now_ts = float(time.time())
+                style_map = getattr(self, "_log_style_last_ts", {})
+                if not isinstance(style_map, dict):
+                    style_map = {}
+                key = str(txt)
+                last_ts = float(style_map.get(key, 0.0) or 0.0)
+                cooldown_s = max(0.75, float(getattr(self, "_log_style_cooldown_s", 3.0) or 3.0))
+                if (now_ts - last_ts) >= cooldown_s:
+                    self._style_log_text_widget(txt)
+                    style_map[key] = now_ts
+                    self._log_style_last_ts = style_map
+            except Exception:
+                pass
             txt.see("end")
         except Exception:
             pass
 
     def _tick(self) -> None:
         fetcher_changed = False
+        now_ts = float(time.time())
         try:
             if hasattr(self, "fetcher") and self.fetcher:
                 fetcher_changed = bool(self.fetcher.drain_results())
@@ -17142,8 +17155,20 @@ class PowerTraderHub(tk.Tk):
         runner_state_early = str(runtime_early.get("state", "") or "").upper().strip()
         runner_pid_early = runtime_early.get("runner_pid", None)
         runner_ts_early = float(runtime_early.get("ts", 0.0) or 0.0)
-        runner_live = bool(runner_pid_early) and ((time.time() - runner_ts_early) <= 12.0) and runner_state_early in {"RUNNING", "ERROR", "STOPPING"}
+        runner_live = bool(runner_pid_early) and ((now_ts - runner_ts_early) <= 12.0) and runner_state_early in {"RUNNING", "ERROR", "STOPPING"}
+        try:
+            ui_refresh_s = max(0.5, float(self.settings.get("ui_refresh_seconds", 1.0) or 1.0))
+        except Exception:
+            ui_refresh_s = 1.0
+        panel_refresh_s = max(1.5, float(ui_refresh_s) * 2.0)
+        log_refresh_s = max(1.5, float(ui_refresh_s) * 2.5)
+        self._parallel_market_panels_refresh_interval_s = float(panel_refresh_s)
+        self._log_panel_refresh_interval_s = float(log_refresh_s)
         self._maybe_apply_profile_autotune()
+        watch_hints = self._consume_file_watch_hints()
+        runtime_dirty_hint = bool(watch_hints.get("runtime", True))
+        log_dirty_hint = bool(watch_hints.get("logs", True))
+        chart_dirty_hint = bool(watch_hints.get("charts", True))
         if not runner_live:
             try:
                 stocks_scan_s = max(5.0, float(self.settings.get("market_bg_stocks_interval_s", DEFAULT_SETTINGS.get("market_bg_stocks_interval_s", 15.0)) or 15.0))
@@ -17189,28 +17214,38 @@ class PowerTraderHub(tk.Tk):
                     self._run_forex_trader_step(force=False, min_interval_s=forex_step_s)
             except Exception:
                 pass
-        try:
-            self._refresh_parallel_market_panels()
-        except Exception as exc:
-            log_once(
-                f"pt_hub:market_panel_refresh:{type(exc).__name__}:{str(exc)[:120]}",
-                f"[pt_hub] market panel refresh fallback {type(exc).__name__}: {exc}",
-            )
+        panel_elapsed_s = now_ts - float(getattr(self, "_last_parallel_market_panels_refresh_ts", 0.0) or 0.0)
+        panel_force_due = panel_elapsed_s >= max(
+            float(getattr(self, "_file_watch_panel_force_interval_s", 8.0) or 8.0),
+            float(panel_refresh_s) * 4.0,
+        )
+        panel_refresh_due = panel_elapsed_s >= float(panel_refresh_s) and (
+            runtime_dirty_hint or panel_force_due or (not runner_live)
+        )
+        if panel_refresh_due or (not runner_live):
             try:
-                self._record_ui_incident(
-                    "error",
-                    "market_panel_refresh_failed",
-                    f"{type(exc).__name__}: {exc}",
-                    {"exception": traceback.format_exc(limit=12)[-4000:]},
-                    cooldown_key=f"market_panel_refresh_failed:{type(exc).__name__}:{str(exc)[:160]}",
-                    cooldown_s=180.0,
+                self._refresh_parallel_market_panels()
+                self._last_parallel_market_panels_refresh_ts = now_ts
+            except Exception as exc:
+                log_once(
+                    f"pt_hub:market_panel_refresh:{type(exc).__name__}:{str(exc)[:120]}",
+                    f"[pt_hub] market panel refresh fallback {type(exc).__name__}: {exc}",
                 )
-            except Exception:
-                pass
-            try:
-                self._refresh_market_overview_fallback()
-            except Exception:
-                pass
+                try:
+                    self._record_ui_incident(
+                        "error",
+                        "market_panel_refresh_failed",
+                        f"{type(exc).__name__}: {exc}",
+                        {"exception": traceback.format_exc(limit=12)[-4000:]},
+                        cooldown_key=f"market_panel_refresh_failed:{type(exc).__name__}:{str(exc)[:160]}",
+                        cooldown_s=180.0,
+                    )
+                except Exception:
+                    pass
+                try:
+                    self._refresh_market_overview_fallback()
+                except Exception:
+                    pass
 
         runtime = self._read_runner_status()
         runtime_state = str(runtime.get("state", "STOPPED") or "STOPPED").upper().strip()
@@ -17274,13 +17309,10 @@ class PowerTraderHub(tk.Tk):
                     self.crypto_auto_step_var.set(desired_step)
         except Exception:
             pass
-        try:
-            self._sync_crypto_max_open_positions_editor()
-        except Exception:
-            pass
         runtime_snapshot: Dict[str, Any] = {}
         try:
-            runtime_snapshot = _safe_read_json(os.path.join(self.hub_dir, "runtime_state.json")) or {}
+            runtime_snapshot = _safe_read_json(self.runtime_state_path) or {}
+            self._runtime_snapshot_cache = runtime_snapshot if isinstance(runtime_snapshot, dict) else {}
             bh = runtime_snapshot.get("broker_health", {}) if isinstance(runtime_snapshot.get("broker_health", {}), dict) else {}
             aq = runtime_snapshot.get("api_quota", {}) if isinstance(runtime_snapshot.get("api_quota", {}), dict) else {}
             total_15m = int(aq.get("total_15m", 0) or 0)
@@ -17618,7 +17650,9 @@ class PowerTraderHub(tk.Tk):
             else:
                 action_hint = "Next: click Start Trades to run thinker + trader."
             try:
-                runtime_snapshot = _safe_read_json(os.path.join(self.hub_dir, "runtime_state.json")) or {}
+                runtime_snapshot = self._runtime_snapshot_cache if isinstance(self._runtime_snapshot_cache, dict) else {}
+                if not runtime_snapshot:
+                    runtime_snapshot = _safe_read_json(self.runtime_state_path) or {}
                 scoped_alerts = self._scoped_alert_snapshot(runtime_snapshot, self._active_market_key())
                 qf = scoped_alerts.get("quickfix_suggestions", []) if isinstance(scoped_alerts.get("quickfix_suggestions", []), list) else []
                 if qf:
@@ -17663,7 +17697,14 @@ class PowerTraderHub(tk.Tk):
 
         # charts (throttle)
         now = time.time()
-        if fetcher_changed or (now - self._last_chart_refresh) >= float(self.settings.get("chart_refresh_seconds", 10.0)):
+        chart_refresh_s = max(2.0, float(self.settings.get("chart_refresh_seconds", 10.0) or 10.0))
+        chart_elapsed_s = now - float(self._last_chart_refresh or 0.0)
+        chart_force_due = chart_elapsed_s >= max(
+            float(getattr(self, "_file_watch_chart_force_interval_s", 20.0) or 20.0),
+            float(chart_refresh_s) * 2.0,
+        )
+        chart_refresh_due = chart_elapsed_s >= float(chart_refresh_s) and (chart_dirty_hint or chart_force_due)
+        if fetcher_changed or chart_refresh_due:
             # account value chart (internally mtime-cached already)
             try:
                 if self.account_chart:
@@ -17733,28 +17774,36 @@ class PowerTraderHub(tk.Tk):
 
             self._last_chart_refresh = now
 
-        # drain logs into panes
-        self._drain_queue_to_text(self.runner_log_q, self.supervisor_text)
-        self._drain_queue_to_text(self.trader_log_q, self.trader_text)
-        self._refresh_log_file_to_text(
-            self.runner_log_path,
-            self.runner_text,
-            "_last_runner_log_sig",
-            max_lines=500,
+        # Drain and redraw heavy log panes on a slower cadence to reduce UI CPU load.
+        log_elapsed_s = now - float(getattr(self, "_last_log_panel_refresh_ts", 0.0) or 0.0)
+        log_force_due = log_elapsed_s >= max(
+            float(getattr(self, "_file_watch_log_force_interval_s", 8.0) or 8.0),
+            float(log_refresh_s) * 3.0,
         )
-        self._refresh_log_file_to_text(
-            self.supervisor_log_path,
-            self.supervisor_text,
-            "_last_supervisor_log_sig",
-            max_lines=500,
-            prefix_path=self.runner_launch_log_path,
-        )
-        self._refresh_log_file_to_text(
-            self.trader_log_path,
-            self.trader_text,
-            "_last_trader_log_sig",
-            max_lines=500,
-        )
+        log_refresh_due = log_elapsed_s >= float(log_refresh_s) and (log_dirty_hint or log_force_due)
+        if log_refresh_due:
+            self._last_log_panel_refresh_ts = now
+            self._drain_queue_to_text(self.runner_log_q, self.supervisor_text)
+            self._drain_queue_to_text(self.trader_log_q, self.trader_text)
+            self._refresh_log_file_to_text(
+                self.runner_log_path,
+                self.runner_text,
+                "_last_runner_log_sig",
+                max_lines=300,
+            )
+            self._refresh_log_file_to_text(
+                self.supervisor_log_path,
+                self.supervisor_text,
+                "_last_supervisor_log_sig",
+                max_lines=300,
+                prefix_path=self.runner_launch_log_path,
+            )
+            self._refresh_log_file_to_text(
+                self.trader_log_path,
+                self.trader_text,
+                "_last_trader_log_sig",
+                max_lines=300,
+            )
 
         # trainer logs: show selected trainer output
         try:
@@ -17768,14 +17817,22 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             pass
 
-        self._refresh_chart_legend_panel()
+        if (now - float(getattr(self, "_last_chart_legend_refresh_ts", 0.0) or 0.0)) >= float(
+            getattr(self, "_chart_legend_refresh_interval_s", 1.5) or 1.5
+        ):
+            self._last_chart_legend_refresh_ts = now
+            self._refresh_chart_legend_panel()
         self._refresh_neural_overview_visibility()
         try:
             active_market = str(self.market_nb.tab(self.market_nb.select(), "text") or "Crypto")
         except Exception:
             active_market = "Crypto"
         self.status.config(text=f"{_now_str()} | View={active_market} | hub_dir={self.hub_dir} | Ctrl+, Settings")
-        self.after(int(float(self.settings.get("ui_refresh_seconds", 1.0)) * 1000), self._tick)
+        try:
+            next_tick_s = max(1.0, float(self.settings.get("ui_refresh_seconds", 1.0) or 1.0))
+        except Exception:
+            next_tick_s = 1.0
+        self.after(int(next_tick_s * 1000), self._tick)
 
 
 
@@ -18429,7 +18486,7 @@ class PowerTraderHub(tk.Tk):
             return rows
         for ln in lines[-max(1, int(limit)):]:
             try:
-                row = json.loads(ln)
+                row = fast_json_loads(ln, default=None)
             except Exception:
                 continue
             if isinstance(row, dict):
@@ -18446,7 +18503,7 @@ class PowerTraderHub(tk.Tk):
             req: Dict[str, Any] = {}
             try:
                 with open(req_path, "r", encoding="utf-8") as f:
-                    req = json.load(f) or {}
+                    req = fast_json_load(f, default={}) or {}
             except Exception:
                 req = {}
             req_id = str(req.get("id", os.path.basename(req_path)) or os.path.basename(req_path)).strip()
@@ -18916,7 +18973,7 @@ class PowerTraderHub(tk.Tk):
             _ensure_dir(self.crypto_manual_orders_dir)
             tmp = f"{req_path}.tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2)
+                fast_json_dump(payload, f, indent=2, ensure_ascii=False)
             os.replace(tmp, req_path)
             self._manual_sell_last_request_id = req_id
             self._set_manual_sell_status(f"Queued: sell ${amount:.2f} of {coin}.", level="ok")
@@ -18935,6 +18992,16 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             return None
         return None
+
+    def _read_optional_float_file_with_age(self, path: str) -> Tuple[Optional[float], Optional[float]]:
+        val = self._read_optional_float_file(path)
+        if val is None:
+            return None, None
+        try:
+            age_s = max(0.0, float(time.time() - os.path.getmtime(path)))
+        except Exception:
+            age_s = None
+        return float(val), age_s
 
     def _crypto_coin_folder_path(self, coin: str) -> str:
         base = str(self.settings.get("main_neural_dir", self.project_dir) or self.project_dir).strip() or self.project_dir
@@ -18968,6 +19035,11 @@ class PowerTraderHub(tk.Tk):
                 qty = 0.0
             if qty > 0.0:
                 held.add(str(sym or "").strip().upper())
+        tracked_coins = {
+            str(c or "").strip().upper()
+            for c in list(self.settings.get("coins", []) or [])
+            if str(c or "").strip()
+        }
 
         try:
             min_edge = float(dynamic.get("min_projected_edge_pct", self.settings.get("crypto_dynamic_min_projected_edge_pct", 0.25)) or 0.25)
@@ -18983,6 +19055,7 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             watchlist_limit = 50
         watchlist_limit = max(5, min(250, watchlist_limit))
+        watch_price_max_age_s = 300.0
         buy_trigger_txt = f"Trained + edge >= {min_edge:.3f}% + short=S0 + long>=L{start_level}"
 
         rows: List[Dict[str, Any]] = []
@@ -19007,6 +19080,7 @@ class PowerTraderHub(tk.Tk):
             short_sig = read_int_from_file(os.path.join(folder, "short_dca_signal.txt"))
 
             ask = 0.0
+            ask_age_s: Optional[float] = None
             if isinstance(positions.get(coin, {}), dict):
                 try:
                     ask = float((positions.get(coin, {}) or {}).get("current_buy_price", 0.0) or 0.0)
@@ -19014,11 +19088,23 @@ class PowerTraderHub(tk.Tk):
                     ask = 0.0
             if ask <= 0.0:
                 ask_file = os.path.join(self.crypto_current_prices_dir, f"{coin}.txt")
-                ask_opt = self._read_optional_float_file(ask_file)
-                ask = float(ask_opt or 0.0)
+                ask_opt, ask_age_s = self._read_optional_float_file_with_age(ask_file)
+                if (
+                    (ask_opt is not None)
+                    and (ask_age_s is not None)
+                    and (ask_age_s <= float(watch_price_max_age_s))
+                ):
+                    ask = float(ask_opt)
 
             low_levels = read_price_levels_from_html(os.path.join(folder, "low_bound_prices.html"))
             high_levels = read_price_levels_from_html(os.path.join(folder, "high_bound_prices.html"))
+            level_anchor_vals = [float(v) for v in (list(low_levels[:2]) + list(high_levels[:2])) if float(v) > 0.0]
+            if ask > 0.0 and level_anchor_vals:
+                anchor = float(sum(level_anchor_vals) / max(1, len(level_anchor_vals)))
+                if anchor > 0.0:
+                    ratio = float(ask) / float(anchor)
+                    if ratio < 0.2 or ratio > 5.0:
+                        ask = 0.0
 
             projected_entry = 0.0
             if ask > 0.0:
@@ -19063,7 +19149,12 @@ class PowerTraderHub(tk.Tk):
             elif long_sig < start_level:
                 blocker = f"Entry signal L{long_sig} below start L{start_level}."
             elif projected_entry <= 0.0:
-                blocker = "Missing live/derived entry price."
+                if (ask_age_s is not None) and (ask_age_s > float(watch_price_max_age_s)):
+                    blocker = f"Live price cache is stale ({int(ask_age_s)}s); waiting for refresh."
+                elif coin not in tracked_coins:
+                    blocker = "On deck: auto-rotation will activate this coin when it qualifies."
+                else:
+                    blocker = "Missing live/derived entry price."
             else:
                 blocker = "Eligible now; waiting for next trader cycle."
 
@@ -19143,13 +19234,19 @@ class PowerTraderHub(tk.Tk):
             except Exception:
                 exit_val = 0.0
             gain_pct = ((exit_val / entry_val) - 1.0) * 100.0 if (entry_val > 0.0 and exit_val > 0.0) else 0.0
+            score_txt = f"{score:+.3f}%"
+            if (not math.isfinite(score)) or abs(float(score)) > 1000.0:
+                score_txt = "N/A"
+            gain_txt = "N/A"
+            if entry_val > 0.0 and exit_val > 0.0 and math.isfinite(gain_pct) and abs(float(gain_pct)) <= 250.0:
+                gain_txt = f"{gain_pct:+.2f}%"
             display_rows.append(
                 {
                     "coin": str(row.get("coin", "") or "").strip().upper(),
-                    "score": f"{score:+.3f}%",
+                    "score": score_txt,
                     "entry": _fmt_price(entry_val) if entry_val > 0.0 else "N/A",
                     "exit": _fmt_price(exit_val) if exit_val > 0.0 else "N/A",
-                    "gain": f"{gain_pct:+.2f}%",
+                    "gain": gain_txt,
                     "status": str(row.get("status", "WAIT") or "WAIT").strip().upper(),
                     "why": str(row.get("blocker", "") or "").strip(),
                     "logic": str(row.get("logic", "") or "").strip(),
@@ -19305,6 +19402,82 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             pass
 
+    def _trade_history_aggregates(self) -> Tuple[Dict[str, int], Dict[str, float]]:
+        try:
+            mtime = os.path.getmtime(self.trade_history_path)
+        except Exception:
+            mtime = None
+        now_ts = float(time.time())
+        refresh_s = max(5.0, float(getattr(self, "_trade_history_agg_refresh_s", 20.0) or 20.0))
+        if (
+            mtime is not None
+            and getattr(self, "_trade_history_agg_mtime", object()) == mtime
+            and (now_ts - float(getattr(self, "_trade_history_agg_last_calc_ts", 0.0) or 0.0)) < refresh_s
+        ):
+            return dict(getattr(self, "_trade_history_agg_dca24h", {}) or {}), dict(
+                getattr(self, "_trade_history_agg_realized", {}) or {}
+            )
+
+        dca_24h_by_coin: Dict[str, int] = {}
+        realized_by_coin: Dict[str, float] = {}
+        if not os.path.isfile(self.trade_history_path):
+            self._trade_history_agg_mtime = mtime
+            self._trade_history_agg_last_calc_ts = now_ts
+            self._trade_history_agg_dca24h = {}
+            self._trade_history_agg_realized = {}
+            return dca_24h_by_coin, realized_by_coin
+
+        trades = _read_trade_history_jsonl(self.trade_history_path) if self.trade_history_path else []
+        window_floor = now_ts - (24 * 3600)
+        last_sell_ts: Dict[str, float] = {}
+        for tr in trades:
+            sym = str(tr.get("symbol", "")).upper().strip()
+            base = sym.split("-")[0].strip() if sym else ""
+            if not base:
+                continue
+            side = str(tr.get("side", "")).lower().strip()
+            if side != "sell":
+                continue
+            try:
+                tsf = float(tr.get("ts", 0) or 0.0)
+            except Exception:
+                tsf = 0.0
+            if tsf <= 0.0:
+                continue
+            prev = float(last_sell_ts.get(base, 0.0) or 0.0)
+            if tsf > prev:
+                last_sell_ts[base] = tsf
+
+        for tr in trades:
+            sym = str(tr.get("symbol", "")).upper().strip()
+            base = sym.split("-")[0].strip() if sym else ""
+            if not base:
+                continue
+            side = str(tr.get("side", "")).lower().strip()
+            if side == "buy":
+                tag = str(tr.get("tag") or "").upper().strip()
+                if tag == "DCA":
+                    try:
+                        tsf = float(tr.get("ts", 0) or 0.0)
+                    except Exception:
+                        tsf = 0.0
+                    if tsf > 0.0:
+                        start_ts = max(window_floor, float(last_sell_ts.get(base, 0.0) or 0.0))
+                        if tsf >= start_ts:
+                            dca_24h_by_coin[base] = int(dca_24h_by_coin.get(base, 0) or 0) + 1
+            try:
+                realized = float(tr.get("realized_profit_usd", 0.0) or 0.0)
+            except Exception:
+                realized = 0.0
+            if abs(realized) > 0.0:
+                realized_by_coin[base] = float(realized_by_coin.get(base, 0.0) or 0.0) + realized
+
+        self._trade_history_agg_mtime = mtime
+        self._trade_history_agg_last_calc_ts = now_ts
+        self._trade_history_agg_dca24h = dict(dca_24h_by_coin)
+        self._trade_history_agg_realized = dict(realized_by_coin)
+        return dca_24h_by_coin, realized_by_coin
+
 
     def _refresh_trader_status(self) -> None:
         # mtime cache: rebuilding the whole tree every tick is expensive with many rows
@@ -19341,11 +19514,6 @@ class PowerTraderHub(tk.Tk):
                 self.lbl_selected_coin_summary.config(text="Selected: ACCOUNT")
             except Exception:
                 pass
-            try:
-                self._sync_crypto_max_open_positions_editor()
-            except Exception:
-                pass
-
             # clear tree (once; subsequent ticks are mtime-short-circuited)
             self._set_trades_table_rows([])
             self._sync_manual_sell_coin_choices({})
@@ -19387,6 +19555,21 @@ class PowerTraderHub(tk.Tk):
             status_note = (status_note + " | " if status_note else "") + issue_note
         if checks_note:
             status_note = (status_note + " | " if status_note else "") + checks_note
+        policy = detail.get("automation_policy", {}) if isinstance(detail.get("automation_policy", {}), dict) else {}
+        if policy:
+            pol_summary = str(policy.get("summary", "") or "").strip()
+            if pol_summary:
+                status_note = (status_note + " | " if status_note else "") + pol_summary
+            trust = policy.get("runtime_trust", {}) if isinstance(policy.get("runtime_trust", {}), dict) else {}
+            try:
+                trust_score = float(trust.get("score", 0.0) or 0.0)
+            except Exception:
+                trust_score = 0.0
+            if trust_score > 0.0:
+                status_note = (status_note + " | " if status_note else "") + f"Trust {trust_score:.0f}/100"
+        gate_reason = str(detail.get("entry_eval_top_reason", "") or "").strip()
+        if gate_reason:
+            status_note = (status_note + " | " if status_note else "") + f"Gate: {gate_reason}"
         state_txt = str(runtime.get("state", "") or "").upper().strip()
         heartbeat_stale = False
         try:
@@ -19428,10 +19611,6 @@ class PowerTraderHub(tk.Tk):
                 self.lbl_acct_dca_spread.config(text="N/A")
                 self.lbl_acct_dca_single.config(text="N/A")
                 self.lbl_selected_coin_summary.config(text="Selected: ACCOUNT")
-            except Exception:
-                pass
-            try:
-                self._sync_crypto_max_open_positions_editor()
             except Exception:
                 pass
             self._last_positions = {}
@@ -19539,77 +19718,11 @@ class PowerTraderHub(tk.Tk):
             self.lbl_acct_open_positions.config(text=str(open_positions_count))
         except Exception:
             pass
+        # Cached aggregation avoids rescanning trade history on every status tick.
         try:
-            self._sync_crypto_max_open_positions_editor()
+            dca_24h_by_coin, realized_by_coin = self._trade_history_aggregates()
         except Exception:
-            pass
-
-        # --- precompute per-coin DCA count in rolling 24h (and after last SELL for that coin) ---
-        dca_24h_by_coin: Dict[str, int] = {}
-        realized_by_coin: Dict[str, float] = {}
-        try:
-            now = time.time()
-            window_floor = now - (24 * 3600)
-
-            trades = _read_trade_history_jsonl(self.trade_history_path) if self.trade_history_path else []
-
-            last_sell_ts: Dict[str, float] = {}
-            for tr in trades:
-                sym = str(tr.get("symbol", "")).upper().strip()
-                base = sym.split("-")[0].strip() if sym else ""
-                if not base:
-                    continue
-
-                side = str(tr.get("side", "")).lower().strip()
-                if side != "sell":
-                    continue
-
-                try:
-                    tsf = float(tr.get("ts", 0))
-                except Exception:
-                    continue
-
-                prev = float(last_sell_ts.get(base, 0.0))
-                if tsf > prev:
-                    last_sell_ts[base] = tsf
-
-            for tr in trades:
-                sym = str(tr.get("symbol", "")).upper().strip()
-                base = sym.split("-")[0].strip() if sym else ""
-                if not base:
-                    continue
-
-                side = str(tr.get("side", "")).lower().strip()
-                if side != "buy":
-                    continue
-
-                tag = str(tr.get("tag") or "").upper().strip()
-                if tag != "DCA":
-                    continue
-
-                try:
-                    tsf = float(tr.get("ts", 0))
-                except Exception:
-                    continue
-
-                start_ts = max(window_floor, float(last_sell_ts.get(base, 0.0)))
-                if tsf >= start_ts:
-                    dca_24h_by_coin[base] = int(dca_24h_by_coin.get(base, 0)) + 1
-
-            for tr in trades:
-                sym = str(tr.get("symbol", "")).upper().strip()
-                base = sym.split("-")[0].strip() if sym else ""
-                if not base:
-                    continue
-                try:
-                    realized = float(tr.get("realized_profit_usd", 0.0) or 0.0)
-                except Exception:
-                    realized = 0.0
-                if abs(realized) > 0.0:
-                    realized_by_coin[base] = float(realized_by_coin.get(base, 0.0) or 0.0) + realized
-        except Exception:
-            dca_24h_by_coin = {}
-            realized_by_coin = {}
+            dca_24h_by_coin, realized_by_coin = {}, {}
 
         # rebuild table rows (only when file changes)
         table_rows = []
@@ -19814,7 +19927,7 @@ class PowerTraderHub(tk.Tk):
             if not line:
                 continue
             try:
-                obj = json.loads(line)
+                obj = fast_json_loads(line, default=None)
                 ts = obj.get("ts", None)
                 tss = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if isinstance(ts, (int, float)) else "?"
                 side = str(obj.get("side", "")).upper()
@@ -19917,6 +20030,10 @@ class PowerTraderHub(tk.Tk):
             prev_set = set([str(c).strip().upper() for c in (prev_coins or []) if str(c).strip()])
             if prev_set != set(self.coins):
                 self._rebuild_coin_chart_tabs()
+        except Exception:
+            pass
+        try:
+            self._start_file_watch()
         except Exception:
             pass
 
@@ -20509,7 +20626,7 @@ class PowerTraderHub(tk.Tk):
 
         setting_help: Dict[str, str] = {
             "Configuration mode:": "Preset Managed auto-fills and locks configurable fields. Self Managed lets you edit each setting manually.",
-            "Preset profile:": "Guarded prioritizes safety, Balanced is default, Performance increases aggressiveness and opportunity capture.",
+            "Preset profile:": "Safe prioritizes protection, Balanced is default, Aggressive increases opportunity capture, and Max Growth pushes highest legal automation intensity.",
             "Main neural folder:": "Where per-coin model folders live. Example: moving this to a slow drive can slow training/startup.",
             "Coins (comma):": "Active crypto list. Example: BTC,ETH,SOL. Removing a coin stops active trading but keeps prior training files.",
             "Trade start level (1-7):": "Lower enters earlier with weaker confidence; higher waits for stronger confidence and trades less often.",
@@ -20938,17 +21055,19 @@ class PowerTraderHub(tk.Tk):
         }
         _label_to_mode = {v: k for k, v in _mode_to_label.items()}
         _profile_to_label = {
-            "guarded": "Guarded",
+            "safe": "Safe",
             "balanced": "Balanced",
-            "performance": "Performance",
+            "aggressive": "Aggressive",
+            "max_growth": "Max Growth",
         }
         _label_to_profile = {v: k for k, v in _profile_to_label.items()}
         _settings_mode_raw = str(self.settings.get("settings_control_mode", DEFAULT_SETTINGS.get("settings_control_mode", "self_managed")) or "self_managed").strip().lower()
         if _settings_mode_raw not in _mode_to_label:
             _settings_mode_raw = "self_managed"
-        _settings_profile_raw = str(self.settings.get("settings_profile", DEFAULT_SETTINGS.get("settings_profile", "balanced")) or "balanced").strip().lower()
-        if _settings_profile_raw not in _profile_to_label:
-            _settings_profile_raw = "balanced"
+        _settings_profile_raw = normalize_settings_profile(
+            self.settings.get("settings_profile", DEFAULT_SETTINGS.get("settings_profile", "balanced")),
+            default="balanced",
+        )
         settings_mode_var = tk.StringVar(value=_mode_to_label.get(_settings_mode_raw, "Self Managed"))
         settings_profile_var = tk.StringVar(value=_profile_to_label.get(_settings_profile_raw, "Balanced"))
         alpaca_status_var = tk.StringVar(value="")
@@ -21080,7 +21199,7 @@ class PowerTraderHub(tk.Tk):
         }
 
         profile_overrides: Dict[str, Dict[str, Any]] = {
-            "guarded": {
+            "safe": {
                 "trade_start_level": 5,
                 "start_allocation_pct": 0.25,
                 "dca_levels": [-2.5, -5.0, -8.0, -12.0, -18.0],
@@ -21179,7 +21298,8 @@ class PowerTraderHub(tk.Tk):
                 "market_fallback_snapshot_max_age_s": 1200.0,
             },
             "balanced": {},
-            "performance": {
+            "aggressive": {},
+            "max_growth": {
                 "trade_start_level": 2,
                 "start_allocation_pct": 0.8,
                 "dca_levels": [-2.0, -4.0, -6.0, -9.0, -13.0, -18.0],
@@ -21304,9 +21424,7 @@ class PowerTraderHub(tk.Tk):
             var.set(str(value))
 
         def _apply_profile_to_form(profile_key: str) -> None:
-            pkey = str(profile_key or "balanced").strip().lower()
-            if pkey not in {"guarded", "balanced", "performance"}:
-                pkey = "balanced"
+            pkey = normalize_settings_profile(profile_key, default="balanced")
             base: Dict[str, Any] = {}
             for key in profile_var_map.keys():
                 base[key] = DEFAULT_SETTINGS.get(key, self.settings.get(key))
@@ -21330,9 +21448,7 @@ class PowerTraderHub(tk.Tk):
             return str(left or "").strip() == str(right or "").strip()
 
         def _apply_account_tuning_to_manual_form(profile_key: str) -> None:
-            pkey = str(profile_key or "balanced").strip().lower()
-            if pkey not in {"guarded", "balanced", "performance"}:
-                return
+            pkey = normalize_settings_profile(profile_key, default="balanced")
             raw_profile = dict(profile_overrides.get(pkey, {}))
             tuned_profile = self._resolve_account_aware_profile_overrides(
                 pkey,
@@ -21348,27 +21464,69 @@ class PowerTraderHub(tk.Tk):
                 if _vars_equivalent(key, cur_value, raw_profile.get(key)):
                     _set_var_from_profile(key, tuned_value)
 
+        def _profile_effective_summary_text(profile_key: str) -> str:
+            pkey = normalize_settings_profile(profile_key, default="balanced")
+            tuned = self._resolve_account_aware_profile_overrides(
+                pkey,
+                profile_overrides.get(pkey, {}),
+                settings_source=self.settings,
+            )
+            if not isinstance(tuned, dict) or not tuned:
+                return ""
+            try:
+                stock_notional = float(tuned.get("stock_trade_notional_usd", self.settings.get("stock_trade_notional_usd", 0.0)) or 0.0)
+            except Exception:
+                stock_notional = 0.0
+            try:
+                stock_open = int(float(tuned.get("stock_max_open_positions", self.settings.get("stock_max_open_positions", 1)) or 1))
+            except Exception:
+                stock_open = 1
+            try:
+                forex_units = int(float(tuned.get("forex_trade_units", self.settings.get("forex_trade_units", 1000)) or 1000))
+            except Exception:
+                forex_units = 1000
+            try:
+                forex_open = int(float(tuned.get("forex_max_open_positions", self.settings.get("forex_max_open_positions", 1)) or 1))
+            except Exception:
+                forex_open = 1
+            try:
+                stock_day = int(float(tuned.get("stock_max_day_trades", self.settings.get("stock_max_day_trades", 3)) or 3))
+            except Exception:
+                stock_day = 3
+            return (
+                f"Effective policy now: Stocks ${stock_notional:.0f}/trade, max {stock_open} open, max {stock_day} day-trades; "
+                f"Forex {forex_units} units/trade, max {forex_open} open."
+            )
+
         def _sync_settings_mode_ui(*_args: Any) -> None:
             mode_key = _label_to_mode.get(str(settings_mode_var.get() or "").strip(), "self_managed")
             profile_key = _label_to_profile.get(str(settings_profile_var.get() or "").strip(), "balanced")
             role_key = str(ui_role_mode_var.get() or "").strip().lower()
             if role_key not in {"basic", "advanced", "admin"}:
                 role_key = "basic"
+            effective_summary = _profile_effective_summary_text(profile_key)
             is_preset = bool(mode_key == "preset_managed")
             effective_locked = bool(is_preset)
             if is_preset:
                 _apply_profile_to_form(profile_key)
                 settings_mode_hint_var.set(
-                    f"Preset Managed is active: {str(settings_profile_var.get() or '').strip()} profile values are account-sized and locked."
+                    (
+                        f"Preset Managed is active: {str(settings_profile_var.get() or '').strip()} profile values are account-sized and locked."
+                        + (f" {effective_summary}" if effective_summary else "")
+                    )
                 )
             else:
                 _apply_account_tuning_to_manual_form(profile_key)
                 if role_key == "basic":
                     settings_mode_hint_var.set(
                         "Self Managed is active: fields are editable. Role mode is Basic; switch to Advanced/Admin if you need extra controls."
+                        + (f" {effective_summary}" if effective_summary else "")
                     )
                 else:
-                    settings_mode_hint_var.set("Self Managed is active: you can edit all configurable fields manually.")
+                    settings_mode_hint_var.set(
+                        "Self Managed is active: you can edit all configurable fields manually."
+                        + (f" {effective_summary}" if effective_summary else "")
+                    )
             for widget, restore_state in list(managed_controls):
                 try:
                     if not widget.winfo_exists():
@@ -21522,7 +21680,7 @@ class PowerTraderHub(tk.Tk):
                     int(float(self.settings.get("twelvedata_scan_symbol_cap", DEFAULT_SETTINGS.get("twelvedata_scan_symbol_cap", 8)) or 8)),
                 )
                 if use_twelvedata:
-                    profile_key = str(self.settings.get("settings_profile", "balanced") or "balanced").strip().lower()
+                    profile_key = normalize_settings_profile(self.settings.get("settings_profile", "balanced"), default="balanced")
                     tuned = self._resolve_account_aware_profile_overrides(profile_key, settings_source=self.settings)
                     for key in ("market_bg_stocks_interval_s", "stock_scan_max_symbols"):
                         if key in tuned:
@@ -21613,7 +21771,7 @@ class PowerTraderHub(tk.Tk):
             r,
             "Preset profile:",
             settings_profile_var,
-            ["Guarded", "Balanced", "Performance"],
+            list(_profile_to_label.values()),
             managed=False,
         ); r += 1
         ttk.Label(
@@ -23274,6 +23432,10 @@ class PowerTraderHub(tk.Tk):
             pass
         try:
             self._audit_operator_action("app_close", {})
+        except Exception:
+            pass
+        try:
+            self._stop_file_watch()
         except Exception:
             pass
         self.destroy()

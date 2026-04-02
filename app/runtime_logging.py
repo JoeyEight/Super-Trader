@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import queue
 import tempfile
@@ -8,6 +7,8 @@ import threading
 import time
 from typing import Any, Dict, Iterable, List
 
+from app.json_codec import dump as json_dump
+from app.json_codec import dumps as json_dumps
 from app.time_utils import now_ts
 
 
@@ -26,7 +27,7 @@ def atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
     tmp = _atomic_tmp_path(path)
     try:
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
+            json_dump(payload, f, indent=2, ensure_ascii=False)
         os.replace(tmp, path)
     finally:
         try:
@@ -84,7 +85,7 @@ def _get_async_writer(path: str) -> _AsyncJsonlWriter:
 def append_jsonl(path: str, payload: Dict[str, Any], async_mode: bool = False) -> None:
     try:
         clean_payload = redact_payload(payload)
-        line = json.dumps(clean_payload, separators=(",", ":")) + "\n"
+        line = json_dumps(clean_payload, separators=(",", ":"), ensure_ascii=False) + "\n"
         if bool(async_mode):
             if _get_async_writer(path).enqueue(line):
                 return
