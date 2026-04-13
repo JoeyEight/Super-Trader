@@ -69,6 +69,45 @@ class TestMarketsLoopStatus(unittest.TestCase):
                 self.assertGreaterEqual(len(list(payload.get("active", []) or [])), 1)
                 self.assertGreaterEqual(mock_incident.call_count, 1)
 
+    def test_update_scan_cadence_drift_requires_consecutive_late_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "scanner_cadence_drift.json")
+            with patch.object(pt_markets, "CADENCE_DRIFT_PATH", path), patch.object(pt_markets, "_incident") as mock_incident:
+                settings = {
+                    "runtime_alert_cadence_min_samples": 3,
+                    "runtime_alert_cadence_late_warn_pct": 50.0,
+                    "runtime_alert_cadence_late_crit_pct": 100.0,
+                    "runtime_alert_cadence_cooldown_s": 1,
+                }
+                pt_markets._update_scan_cadence_drift("stocks", 100, 10.0, settings, "READY")
+                pt_markets._update_scan_cadence_drift("stocks", 130, 10.0, settings, "READY")
+                third = pt_markets._update_scan_cadence_drift("stocks", 160, 10.0, settings, "READY")
+                self.assertEqual(int(third.get("late_streak", 0) or 0), 2)
+                self.assertEqual(mock_incident.call_count, 0)
+                fourth = pt_markets._update_scan_cadence_drift("stocks", 190, 10.0, settings, "READY")
+                self.assertTrue(bool(fourth.get("triggered", False)))
+                self.assertGreaterEqual(mock_incident.call_count, 1)
+
+    def test_update_scan_cadence_drift_resets_streak_on_on_time_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "scanner_cadence_drift.json")
+            with patch.object(pt_markets, "CADENCE_DRIFT_PATH", path), patch.object(pt_markets, "_incident") as mock_incident:
+                settings = {
+                    "runtime_alert_cadence_min_samples": 2,
+                    "runtime_alert_cadence_late_warn_pct": 50.0,
+                    "runtime_alert_cadence_late_crit_pct": 100.0,
+                    "runtime_alert_cadence_cooldown_s": 1,
+                }
+                pt_markets._update_scan_cadence_drift("stocks", 100, 10.0, settings, "READY")
+                pt_markets._update_scan_cadence_drift("stocks", 130, 10.0, settings, "READY")
+                reset = pt_markets._update_scan_cadence_drift("stocks", 140, 10.0, settings, "READY")
+                self.assertFalse(bool(reset.get("late", False)))
+                self.assertEqual(int(reset.get("late_streak", -1)), 0)
+                pt_markets._update_scan_cadence_drift("stocks", 170, 10.0, settings, "READY")
+                before_trigger = pt_markets._update_scan_cadence_drift("stocks", 200, 10.0, settings, "READY")
+                self.assertTrue(bool(before_trigger.get("triggered", False)))
+                self.assertEqual(mock_incident.call_count, 1)
+
     def test_cached_status_fallback_age_guard(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "status.json")

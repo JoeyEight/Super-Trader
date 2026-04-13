@@ -6,11 +6,14 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
+from app.automation_policy import build_market_automation_policy
 from app.credential_utils import get_oanda_creds
 from app.http_utils import parse_retry_after_value
+from app.opportunity_allocator import evaluate_cross_market_allocation
 from app.path_utils import resolve_runtime_paths
 from app.runtime_logging import runtime_event
 from app.scanner_quality import effective_reject_pressure
+from app.trade_quality import evaluate_trade_quality
 from brokers.broker_oanda import OandaBrokerClient
 
 BASE_DIR, _SETTINGS_PATH, HUB_DATA_DIR, _BOOT_SETTINGS = resolve_runtime_paths(__file__, "forex_trader")
@@ -258,19 +261,41 @@ def _safe_float_from_dict(d: Dict[str, Any], keys: List[str]) -> float:
     return 0.0
 
 
+def _trader_data_account(hub_dir: str) -> Dict[str, Any]:
+    data = _safe_read_json(os.path.join(hub_dir, "trader_data.json"))
+    if not isinstance(data, dict):
+        return {}
+    account = data.get("account", {})
+    return account if isinstance(account, dict) else {}
+
+
 def _crypto_holdings_usd(hub_dir: str) -> float:
-    data = _safe_read_json(os.path.join(hub_dir, "trader_status.json"))
+    account = _trader_data_account(hub_dir)
+    if isinstance(account, dict) and account:
+        return _safe_float_from_dict(
+            account,
+            [
+                "holdings_sell_value",
+                "holdings_buy_value",
+                "holdings_value",
+                "holdings_usd",
+                "total_holdings_value",
+            ],
+        )
+    data = _safe_read_json(os.path.join(hub_dir, "trader_data.json"))
     if not isinstance(data, dict):
         return 0.0
-    return _safe_float_from_dict(
-        data,
-        [
-            "total_holdings_value",
-            "holdings_value",
-            "holdingsValue",
-            "holdings_usd",
-        ],
-    )
+    return _safe_float_from_dict(data, ["exposure_usd", "holdings_value", "total_holdings_value", "holdings_usd"])
+
+
+def _crypto_account_value_usd(hub_dir: str) -> float:
+    account = _trader_data_account(hub_dir)
+    if isinstance(account, dict) and account:
+        return _safe_float_from_dict(account, ["total_account_value", "account_value_usd", "equity", "nav"])
+    data = _safe_read_json(os.path.join(hub_dir, "trader_data.json"))
+    if not isinstance(data, dict):
+        return 0.0
+    return _safe_float_from_dict(data, ["account_value_usd", "equity", "nav"])
 
 
 def _market_status_exposure_usd(hub_dir: str, market_key: str) -> float:
@@ -284,6 +309,49 @@ def _market_status_exposure_usd(hub_dir: str, market_key: str) -> float:
     if not isinstance(data, dict):
         return 0.0
     return _safe_float_from_dict(data, ["exposure_usd", "total_positions_value_usd", "positions_value_usd"])
+
+
+def _market_status_account_value_usd(hub_dir: str, market_key: str) -> float:
+    if market_key == "crypto":
+        return _crypto_account_value_usd(hub_dir)
+    if market_key == "stocks":
+        path = os.path.join(hub_dir, "stocks", "stock_trader_status.json")
+    elif market_key == "forex":
+        path = os.path.join(hub_dir, "forex", "forex_trader_status.json")
+    else:
+        path = os.path.join(hub_dir, market_key, f"{market_key}_trader_status.json")
+    data = _safe_read_json(path)
+    if not isinstance(data, dict):
+        return 0.0
+    account = data.get("account", {})
+    account_dict = account if isinstance(account, dict) else {}
+    return max(
+        0.0,
+        _safe_float_from_dict(
+            data,
+            [
+                "account_value_usd",
+                "equity",
+                "nav",
+            ],
+        ),
+        _safe_float_from_dict(account_dict, ["total_account_value", "equity", "nav", "account_value_usd"]),
+    )
+
+
+def _portfolio_account_value_usd(
+    hub_dir: str,
+    *,
+    current_market: str,
+    current_account_value_usd: float,
+) -> float:
+    current_key = str(current_market or "").strip().lower()
+    total = max(0.0, float(current_account_value_usd or 0.0))
+    for mk in ("crypto", "stocks", "forex"):
+        if mk == current_key:
+            continue
+        total += max(0.0, _market_status_account_value_usd(hub_dir, mk))
+    return float(total)
 
 
 def _forex_unit_notional_usd(instrument: str, mid: float, pricing_row: Dict[str, Any] | None = None) -> float:
@@ -332,6 +400,7 @@ def _risk_capped_units(
     max_total_exposure_pct: float,
     max_pos_usd: float,
     global_cap_pct: float,
+    global_cap_account_value_usd: float,
 ) -> Tuple[int, float]:
     units_abs = abs(int(desired_units or 0))
     if units_abs <= 0:
@@ -354,10 +423,11 @@ def _risk_capped_units(
         margin_allowance = min(margin_allowance, margin_util_allowance)
     if unit_margin > 0.0:
         max_units = min(max_units, max(0, int(margin_allowance / unit_margin)))
-    if global_cap_pct > 0.0 and nav > 0.0:
+    global_cap_base = max(0.0, float(global_cap_account_value_usd or 0.0), float(nav or 0.0))
+    if global_cap_pct > 0.0 and global_cap_base > 0.0:
         allowed_global_notional = max(
             0.0,
-            (float(nav) * float(global_cap_pct) / 100.0)
+            (float(global_cap_base) * float(global_cap_pct) / 100.0)
             - (float(total_exposure_usd) + float(crypto_exposure_usd) + float(stocks_exposure_usd)),
         )
         max_units = min(max_units, max(0, int(allowed_global_notional / unit_notional)))
@@ -461,6 +531,66 @@ def _effective_reject_pressure(settings: Dict[str, Any], thinker: Dict[str, Any]
     return effective, raw_rate
 
 
+def _forex_alignment_snapshot(
+    instrument: str,
+    *,
+    position_side: str,
+    candidate_lookup: Dict[str, Dict[str, Any]],
+    required_score: float,
+) -> Dict[str, Any]:
+    pair = str(instrument or "").strip().upper()
+    cand = candidate_lookup.get(pair, {}) if isinstance(candidate_lookup, dict) else {}
+    reasons: List[str] = []
+    side = "watch"
+    score = 0.0
+    eligible = False
+    data_quality_ok = True
+    entry_gate_reason = ""
+    if not isinstance(cand, dict) or (not cand):
+        reasons.append("pair is no longer in the active forex scanner set")
+        return {
+            "aligned": False,
+            "reasons": reasons,
+            "side": side,
+            "score": score,
+            "eligible_for_entry": eligible,
+            "data_quality_ok": data_quality_ok,
+            "entry_gate_reason": entry_gate_reason,
+        }
+    side = str(cand.get("side", "watch") or "watch").strip().lower()
+    try:
+        score = float(cand.get("score", 0.0) or 0.0)
+    except Exception:
+        score = 0.0
+    eligible = bool(cand.get("eligible_for_entry", True))
+    data_quality_ok = bool(cand.get("data_quality_ok", True))
+    entry_gate_reason = str(cand.get("entry_gate_reason", "") or "").strip()
+    pos_side = str(position_side or "flat").strip().lower()
+    if side not in {"long", "short"}:
+        reasons.append("scanner side is WATCH")
+    elif side != pos_side:
+        reasons.append(f"scanner side flipped to {side.upper()} while position is {pos_side.upper()}")
+    if abs(float(score)) < float(required_score):
+        reasons.append(
+            f"absolute score {abs(float(score)):.4f} is below active threshold {float(required_score):.4f}"
+        )
+    if not eligible:
+        reasons.append("scanner marked pair as not eligible for entry")
+    if not data_quality_ok:
+        reasons.append("scanner marked pair data quality as degraded")
+    if entry_gate_reason:
+        reasons.append(f"entry gate active: {entry_gate_reason}")
+    return {
+        "aligned": bool(len(reasons) == 0),
+        "reasons": reasons,
+        "side": side,
+        "score": float(score),
+        "eligible_for_entry": bool(eligible),
+        "data_quality_ok": bool(data_quality_ok),
+        "entry_gate_reason": entry_gate_reason,
+    }
+
+
 def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     forex_dir = os.path.join(hub_dir, "forex")
     os.makedirs(forex_dir, exist_ok=True)
@@ -483,6 +613,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     max_pos_usd = max(0.0, float(settings.get("forex_max_position_usd_per_pair", 0.0) or 0.0))
     max_daily_loss_usd = max(0.0, float(settings.get("forex_max_daily_loss_usd", 0.0) or 0.0))
     max_daily_loss_pct = max(0.0, float(settings.get("forex_max_daily_loss_pct", 0.0) or 0.0))
+    max_loss_streak_setting = max(0, int(float(settings.get("forex_max_loss_streak", 3) or 3)))
     block_cached_scan = bool(settings.get("forex_block_entries_on_cached_scan", True))
     require_data_quality_ok = bool(settings.get("forex_require_data_quality_ok_for_entries", True))
     try:
@@ -527,7 +658,17 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     thinker = _safe_read_json(thinker_path)
     candidate_rows = _forex_candidates_from_thinker(thinker)
     candidate_rows = sorted(candidate_rows, key=_forex_entry_priority, reverse=True)
+    candidate_lookup: Dict[str, Dict[str, Any]] = {}
+    for row in candidate_rows:
+        pair = str((row or {}).get("pair", "") or "").strip().upper()
+        if pair and pair not in candidate_lookup:
+            candidate_lookup[pair] = row
     top_pick = candidate_rows[0] if candidate_rows else {}
+    adaptive_thr_hint = float(thinker.get("adaptive_threshold", score_threshold) or score_threshold)
+    alignment_required_score = (
+        (adaptive_thr_hint if adaptive_thr_hint > 0 else score_threshold)
+        * (guarded_score_mult if live_guarded else 1.0)
+    )
 
     state = _safe_read_json(state_path)
     trail_state = state.get("trail", {}) or {}
@@ -537,6 +678,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     last_divergence_msg = str(state.get("last_divergence_msg", "") or "")
     open_meta = state.get("open_meta", {}) or {}
     pending = state.get("pending", {}) or {}
+    stale_alignment_streaks_raw = state.get("stale_alignment_streaks", {}) or {}
     if not isinstance(trail_state, dict):
         trail_state = {}
     if not isinstance(cooldown_until, dict):
@@ -545,8 +687,21 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         open_meta = {}
     if not isinstance(pending, dict):
         pending = {}
+    if not isinstance(stale_alignment_streaks_raw, dict):
+        stale_alignment_streaks_raw = {}
     cooldown_until = {str(k).upper(): float(v) for k, v in cooldown_until.items() if str(k).strip()}
     open_meta = {str(k).upper(): (v if isinstance(v, dict) else {}) for k, v in open_meta.items() if str(k).strip()}
+    stale_alignment_streaks: Dict[str, int] = {}
+    for k, v in stale_alignment_streaks_raw.items():
+        inst = str(k or "").strip().upper()
+        if not inst:
+            continue
+        try:
+            streak = max(0, int(float(v) or 0))
+        except Exception:
+            streak = 0
+        if streak > 0:
+            stale_alignment_streaks[inst] = int(streak)
     loss_size_scale = max(loss_size_floor_pct, 1.0 - (loss_size_step_pct * float(max(0, loss_streak))))
     trade_units_effective = max(1, int(round(abs(float(trade_units)) * float(loss_size_scale))))
     fallback_active = bool(thinker.get("fallback_cached", False)) if isinstance(thinker, dict) else False
@@ -555,6 +710,8 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     except Exception:
         fallback_age_s = 0
     thinker_reject_rate_pct, thinker_reject_rate_raw_pct = _effective_reject_pressure(settings, thinker if isinstance(thinker, dict) else {})
+    runtime_state = _safe_read_json(os.path.join(hub_dir, "runtime_state.json"))
+    runtime_alerts = runtime_state.get("alerts", {}) if isinstance(runtime_state.get("alerts", {}), dict) else {}
     entry_size_scale = 1.0
     if fallback_active and (not block_cached_scan):
         entry_size_scale = float(cached_scan_entry_size_mult)
@@ -563,6 +720,11 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     actions: List[str] = []
     thinker_health = thinker.get("health", {}) if isinstance(thinker, dict) else {}
     thinker_data_ok = bool((thinker_health or {}).get("data_ok", True))
+    signal_age_policy_s = max(0, int(now_ts - int(float(thinker.get("updated_at", now_ts) or now_ts))))
+    max_signal_age_policy_s = max(30, int(float(settings.get("forex_max_signal_age_seconds", 300) or 300)))
+    stale_alignment_data_ok = bool(thinker_data_ok) and (signal_age_policy_s <= max_signal_age_policy_s)
+    if fallback_active and fallback_age_s > cached_scan_hard_block_age_s:
+        stale_alignment_data_ok = False
     drift_warning = False
     all_instruments = set(positions.keys())
     top_inst = str(top_pick.get("pair", "") or "").strip().upper()
@@ -638,6 +800,62 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     if margin_rate_est <= 0.0:
         margin_rate_est = 0.05
     margin_rate_est = max(0.001, min(1.0, float(margin_rate_est)))
+    policy = build_market_automation_policy(
+        market="forex",
+        settings=settings,
+        profile_key=settings.get("settings_profile", "balanced"),
+        broker_mode=_broker_mode_label(settings),
+        account_value_usd=nav,
+        buying_power_usd=margin_available,
+        open_positions=len(positions),
+        runtime_alerts=runtime_alerts,
+        market_health=thinker_health,
+        compliance_state={},
+        reject_rate_pct=thinker_reject_rate_pct,
+        reject_rate_limit_pct=reject_rate_gate_pct,
+        fallback_active=fallback_active,
+        fallback_age_s=fallback_age_s,
+        fallback_hard_block_age_s=cached_scan_hard_block_age_s,
+        loss_streak=loss_streak,
+        max_loss_streak=max_loss_streak_setting,
+    )
+    policy_size_scale = max(0.2, float(policy.get("size_multiplier", 1.0) or 1.0))
+    trade_units_entry = max(1, int(round(float(trade_units_entry) * float(policy_size_scale))))
+    policy_block_reason = ""
+    if not bool(policy.get("allow_new_entries", True)):
+        policy_block_reason = "Runtime trust is degraded; pausing new forex entries"
+    try:
+        stale_exit_enabled = bool(settings.get("forex_stale_exit_enabled", True))
+    except Exception:
+        stale_exit_enabled = True
+    try:
+        stale_exit_grace_cycles = max(1, int(float(settings.get("forex_stale_alignment_grace_cycles", 2) or 2)))
+    except Exception:
+        stale_exit_grace_cycles = 2
+    try:
+        stale_exit_max_per_cycle = max(1, int(float(settings.get("forex_stale_max_exits_per_cycle", 2) or 2)))
+    except Exception:
+        stale_exit_max_per_cycle = 2
+    try:
+        stale_exit_min_notional_usd = max(1.0, float(settings.get("forex_stale_min_notional_usd", 5.0) or 5.0))
+    except Exception:
+        stale_exit_min_notional_usd = 5.0
+    try:
+        stale_exit_min_hold_s = max(0, int(float(settings.get("forex_stale_min_hold_seconds", 1800) or 1800)))
+    except Exception:
+        stale_exit_min_hold_s = 1800
+    try:
+        stale_exit_loss_cut_pct = float(settings.get("forex_stale_loss_cut_pct", -0.35) or -0.35)
+    except Exception:
+        stale_exit_loss_cut_pct = -0.35
+    try:
+        stale_exit_reverse_score_mult = max(1.0, float(settings.get("forex_stale_reverse_score_mult", 1.25) or 1.25))
+    except Exception:
+        stale_exit_reverse_score_mult = 1.25
+    stale_exit_events: List[Dict[str, Any]] = []
+    stale_exit_count = 0
+    skip_new_entries_this_cycle = False
+    stale_exit_refresh_msg = ""
 
     today = time.strftime("%Y-%m-%d", time.localtime(now_ts))
     if pending:
@@ -673,6 +891,136 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         if pnl >= profit_target_pct:
             armed = True
             peak = max(peak, pnl)
+        align_snapshot = _forex_alignment_snapshot(
+            inst,
+            position_side=side,
+            candidate_lookup=candidate_lookup,
+            required_score=float(alignment_required_score),
+        )
+        align_reasons = [str(x) for x in list(align_snapshot.get("reasons", []) or []) if str(x).strip()]
+        if bool(stale_alignment_data_ok):
+            if bool(align_snapshot.get("aligned", True)):
+                stale_alignment_streaks.pop(inst, None)
+            else:
+                stale_alignment_streaks[inst] = int(stale_alignment_streaks.get(inst, 0) or 0) + 1
+        stale_streak = int(stale_alignment_streaks.get(inst, 0) or 0)
+        should_force_stale_exit = (
+            bool(stale_alignment_data_ok)
+            and bool(stale_exit_enabled)
+            and (not bool(align_snapshot.get("aligned", True)))
+            and stale_streak >= int(stale_exit_grace_cycles)
+            and stale_exit_count < int(stale_exit_max_per_cycle)
+        )
+        if should_force_stale_exit:
+            close_side = "long" if side == "long" else "short"
+            pricing_row = pricing_details.get(inst, {}) if isinstance(pricing_details.get(inst, {}), dict) else {}
+            unit_notional_usd = _forex_unit_notional_usd(inst, mid_px, pricing_row)
+            est_notional_usd = abs(float(units)) * max(0.0, float(unit_notional_usd))
+            reason_text = "; ".join([str(r) for r in align_reasons[:2]]) or "position no longer matches current forex strategy"
+            entry_age_s = max(0, int(now_ts - entry_ts))
+            align_side = str(align_snapshot.get("side", "watch") or "watch").strip().lower()
+            try:
+                align_score_abs = abs(float(align_snapshot.get("score", 0.0) or 0.0))
+            except Exception:
+                align_score_abs = 0.0
+            hard_reverse = (
+                align_side in {"long", "short"}
+                and align_side != str(side or "").strip().lower()
+                and align_score_abs >= (float(alignment_required_score) * float(stale_exit_reverse_score_mult))
+            )
+            mild_loss = (float(pnl) < 0.0) and (float(pnl) > float(stale_exit_loss_cut_pct))
+            hold_guard_active = (
+                entry_age_s < int(stale_exit_min_hold_s)
+                and mild_loss
+                and (not hard_reverse)
+            )
+            if hold_guard_active:
+                stale_exit_events.append(
+                    {
+                        "instrument": str(inst),
+                        "ok": False,
+                        "reason": "stale_exit_hold_loss_guard",
+                        "detail": (
+                            f"Alignment stale but holding {inst} to avoid a churn exit at mild loss "
+                            f"({float(pnl):+.3f}% > {float(stale_exit_loss_cut_pct):+.3f}%) "
+                            f"during the first {int(stale_exit_min_hold_s)}s."
+                        ),
+                        "streak": int(stale_streak),
+                        "age_s": int(entry_age_s),
+                        "reasons": [str(r) for r in align_reasons[:3]],
+                    }
+                )
+                trail_state[inst] = {"armed": armed, "peak_pct": peak, "last_pnl_pct": pnl, "updated_at": now_ts}
+                continue
+            if est_notional_usd < float(stale_exit_min_notional_usd):
+                stale_exit_events.append(
+                    {
+                        "instrument": str(inst),
+                        "ok": False,
+                        "reason": "stale_exit_notional_guard",
+                        "detail": (
+                            f"Alignment stale but notional guard blocked exit "
+                            f"({est_notional_usd:.2f} USD < {float(stale_exit_min_notional_usd):.2f} USD)."
+                        ),
+                        "streak": int(stale_streak),
+                        "reasons": [str(r) for r in align_reasons[:3]],
+                    }
+                )
+                trail_state[inst] = {"armed": armed, "peak_pct": peak, "last_pnl_pct": pnl, "updated_at": now_ts}
+                continue
+            ok, msg, payload = client.close_position(inst, side=close_side)
+            realized_close_pnl = _realized_pnl_from_close_payload(payload if isinstance(payload, dict) else {})
+            pnl_for_audit = float(realized_close_pnl) if realized_close_pnl is not None else float(pnl_usd)
+            actions.append(f"POLICY STALE EXIT {inst} {close_side} | {'OK' if ok else 'FAIL'} | {msg}")
+            _append_jsonl(
+                audit_path,
+                {
+                    "ts": now_ts,
+                    "date": today,
+                    "event": "exit" if ok else "exit_fail",
+                    "source": "policy_stale_exit",
+                    "instrument": inst,
+                    "side": close_side,
+                    "units": units,
+                    "price": mid_px,
+                    "pnl_pct": pnl,
+                    "pnl_usd": pnl_for_audit,
+                    "pnl_usd_est": float(pnl_usd),
+                    "realized_pnl": pnl_for_audit if ok else None,
+                    "mfe_pct": round(mfe, 4),
+                    "mae_pct": round(mae, 4),
+                    "hold_s": max(0, int(now_ts - entry_ts)),
+                    "stale_alignment_streak": int(stale_streak),
+                    "stale_alignment_reasons": [str(r) for r in align_reasons[:3]],
+                    "ok": ok,
+                    "msg": msg,
+                    "payload": payload if isinstance(payload, dict) else {},
+                },
+            )
+            if ok:
+                stale_exit_count += 1
+                skip_new_entries_this_cycle = True
+                trail_state.pop(inst, None)
+                open_meta.pop(inst, None)
+                stale_alignment_streaks.pop(inst, None)
+                if pnl_for_audit < 0:
+                    loss_streak += 1
+                    cooldown_until[inst] = float(now_ts + max(60, int(float(settings.get("forex_loss_cooldown_seconds", 1800) or 1800))))
+                else:
+                    loss_streak = 0
+            else:
+                trail_state[inst] = {"armed": armed, "peak_pct": peak, "last_pnl_pct": pnl, "updated_at": now_ts}
+            stale_exit_events.append(
+                {
+                    "instrument": str(inst),
+                    "ok": bool(ok),
+                    "reason": ("policy_stale_exit" if ok else "broker_close_failed"),
+                    "detail": reason_text,
+                    "streak": int(stale_streak),
+                    "reasons": [str(r) for r in align_reasons[:3]],
+                }
+            )
+            continue
         if armed:
             peak = max(peak, pnl)
             if pnl <= (peak - trailing_gap_pct):
@@ -715,24 +1063,41 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                     trail_state[inst] = {"armed": armed, "peak_pct": peak, "last_pnl_pct": pnl, "updated_at": now_ts}
                 continue
         trail_state[inst] = {"armed": armed, "peak_pct": peak, "last_pnl_pct": pnl, "updated_at": now_ts}
+    for tracked_inst in list(stale_alignment_streaks.keys()):
+        if str(tracked_inst or "").strip().upper() not in positions:
+            stale_alignment_streaks.pop(str(tracked_inst or "").strip().upper(), None)
+    if stale_exit_count > 0:
+        stale_exit_refresh_msg = (
+            f"Exited {stale_exit_count} stale forex position(s); waiting one cycle before new entries."
+        )
 
     signal_inst = top_inst
     signal_side = str(top_pick.get("side", "watch") or "watch").strip().lower()
     signal_score = float(top_pick.get("score", 0.0) or 0.0)
     entry_fail_reasons: List[str] = []
+    trade_quality_eval: Dict[str, Any] = {}
+    opportunity_eval: Dict[str, Any] = {}
     entry_msg = "Auto-trade disabled"
     if auto_enabled:
         signal_age_s = max(0, int(now_ts - int(float(thinker.get("updated_at", now_ts) or now_ts))))
         max_signal_age_s = max(30, int(float(settings.get("forex_max_signal_age_seconds", 300) or 300)))
         min_bars_required = max(8, int(float(settings.get("forex_min_bars_required", 24) or 24)))
         min_samples_guarded = max(0, int(float(settings.get("forex_min_samples_live_guarded", 5) or 5)))
-        adaptive_thr = float(thinker.get("adaptive_threshold", score_threshold) or score_threshold)
-        required_score = ((adaptive_thr if adaptive_thr > 0 else score_threshold) * (guarded_score_mult if live_guarded else 1.0))
+        required_score = float(alignment_required_score)
         max_slippage_bps = max(0.0, float(settings.get("forex_max_slippage_bps", 6.0) or 6.0))
-        max_loss_streak = max(0, int(float(settings.get("forex_max_loss_streak", 3) or 3)))
         global_cap_pct = max(0.0, float(settings.get("market_max_total_exposure_pct", 0.0) or 0.0))
         crypto_exposure_usd = _crypto_holdings_usd(hub_dir)
         stocks_exposure_usd = _market_status_exposure_usd(hub_dir, "stocks")
+        cross_market_exposure_usd = (
+            float(total_exposure_usd)
+            + float(max(0.0, crypto_exposure_usd))
+            + float(max(0.0, stocks_exposure_usd))
+        )
+        cross_market_cap_basis_usd = _portfolio_account_value_usd(
+            hub_dir,
+            current_market="forex",
+            current_account_value_usd=float(nav),
+        )
         if signal_age_s > max_signal_age_s:
             entry_msg = f"Signal stale ({signal_age_s}s > {max_signal_age_s}s)"
         elif require_data_quality_ok and (not thinker_data_ok):
@@ -743,8 +1108,12 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             entry_msg = f"Thinker cached fallback too old ({fallback_age_s}s > {cached_scan_hard_block_age_s}s)"
         elif block_cached_scan and fallback_active:
             entry_msg = f"Thinker cached fallback active ({fallback_age_s}s); blocking new entries"
-        elif max_loss_streak > 0 and loss_streak >= max_loss_streak:
-            entry_msg = f"Loss-streak guard active ({loss_streak}/{max_loss_streak})"
+        elif max_loss_streak_setting > 0 and loss_streak >= max_loss_streak_setting:
+            entry_msg = f"Loss-streak guard active ({loss_streak}/{max_loss_streak_setting})"
+        elif policy_block_reason:
+            entry_msg = policy_block_reason
+        elif skip_new_entries_this_cycle:
+            entry_msg = stale_exit_refresh_msg or "Stale forex exit cooldown: waiting one cycle before new entries"
         elif nav <= 0.0:
             entry_msg = "NAV unavailable; blocking new entries for safety"
         elif _session_blocked(settings):
@@ -766,6 +1135,8 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             selected_spread_bps = 0.0
             selected_units = 0
             selected_risk_cap_size_scale = 1.0
+            selected_quality_eval: Dict[str, Any] = {}
+            selected_opportunity_eval: Dict[str, Any] = {}
             for cand in candidate_rows:
                 pair = str((cand or {}).get("pair", "") or "").strip().upper()
                 if not pair:
@@ -779,9 +1150,9 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 pricing_row = pricing_details.get(pair, {}) if isinstance(pricing_details.get(pair, {}), dict) else {}
                 mid = float(pricing_row.get("mid", 0.0) or 0.0)
                 spread_bps = float(pricing_row.get("spread_bps", 0.0) or 0.0)
-                units = int(trade_units_entry)
+                raw_units = int(trade_units_entry)
                 if side == "short":
-                    units = -units
+                    raw_units = -raw_units
                 if live_guarded and (calib_prob <= 0.0):
                     calib_prob = 0.5
                 unit_notional_usd = _forex_unit_notional_usd(
@@ -789,22 +1160,6 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                     (mid if mid > 0.0 else float(prices.get(pair, 0.0) or 0.0)),
                     pricing_row,
                 )
-                units, pair_risk_cap_size_scale = _risk_capped_units(
-                    units,
-                    unit_notional_usd=unit_notional_usd,
-                    unit_margin_usd=(unit_notional_usd * margin_rate_est),
-                    nav=nav,
-                    total_exposure_usd=total_exposure_usd,
-                    total_margin_used_usd=total_margin_used_usd,
-                    margin_available_usd=margin_available,
-                    crypto_exposure_usd=crypto_exposure_usd,
-                    stocks_exposure_usd=stocks_exposure_usd,
-                    max_total_exposure_pct=(max_total_exposure_pct if enable_risk_caps else 0.0),
-                    max_pos_usd=(max_pos_usd if enable_risk_caps else 0.0),
-                    global_cap_pct=global_cap_pct,
-                )
-                est_entry_notional = abs(float(units)) * unit_notional_usd
-                est_entry_margin = abs(float(units)) * (unit_notional_usd * margin_rate_est)
                 fail = ""
                 if bars_count > 0 and bars_count < min_bars_required:
                     fail = f"Bars preflight failed for {pair} ({bars_count} < {min_bars_required})"
@@ -818,8 +1173,10 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                     fail = f"Data quality gate blocked {pair}"
                 elif mid <= 0.0:
                     fail = f"Quote preflight failed for {pair}"
-                elif abs(int(units)) <= 0:
-                    fail = f"Risk cap: no tradable size fits current margin/exposure for {pair}"
+                elif pair in positions:
+                    fail = f"Already in position: {pair}"
+                elif len(positions) >= max_open_positions:
+                    fail = f"Max open positions reached ({len(positions)}/{max_open_positions})"
                 elif live_guarded and sample_count < min_samples_guarded:
                     fail = f"Calibration sample gate for {pair} ({sample_count} < {min_samples_guarded})"
                 elif live_guarded and calib_prob < float(settings.get("forex_min_calib_prob_live_guarded", 0.56) or 0.56):
@@ -829,22 +1186,138 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 elif float(cooldown_until.get(pair, 0.0) or 0.0) > float(now_ts):
                     cd_left = int(float(cooldown_until.get(pair, 0.0) - now_ts))
                     fail = f"Cooldown active for {pair} ({cd_left}s)"
-                elif len(positions) >= max_open_positions and pair not in positions:
-                    fail = f"Max open positions reached ({len(positions)}/{max_open_positions})"
-                elif pair in positions:
-                    fail = f"Already in position: {pair}"
-                elif max_slippage_bps > 0.0 and spread_bps > max_slippage_bps:
-                    fail = f"Slippage guard for {pair}: spread {spread_bps:.2f}bps > {max_slippage_bps:.2f}bps"
-                elif enable_risk_caps and max_pos_usd > 0.0 and pair not in positions and est_entry_notional > max_pos_usd:
-                    fail = f"Risk cap: projected pair notional exceeds ${max_pos_usd:.2f}"
-                elif enable_risk_caps and max_total_exposure_pct > 0.0 and nav > 0.0 and pair not in positions:
-                    projected_margin_pct = ((total_margin_used_usd + max(0.0, est_entry_margin)) / nav) * 100.0
-                    if projected_margin_pct > max_total_exposure_pct:
-                        fail = f"Risk cap: projected margin utilization exceeds {max_total_exposure_pct:.2f}%"
-                elif global_cap_pct > 0.0 and nav > 0.0:
-                    projected_global_exposure = total_exposure_usd + max(0.0, est_entry_notional) + crypto_exposure_usd + stocks_exposure_usd
-                    if ((projected_global_exposure / nav) * 100.0) > global_cap_pct:
-                        fail = f"Global cap: projected cross-market exposure exceeds {global_cap_pct:.2f}%"
+                units = int(raw_units)
+                pair_risk_cap_size_scale = 1.0
+                est_entry_notional = abs(float(units)) * unit_notional_usd
+                est_entry_margin = abs(float(units)) * (unit_notional_usd * margin_rate_est)
+                if not fail:
+                    units, pair_risk_cap_size_scale = _risk_capped_units(
+                        units,
+                        unit_notional_usd=unit_notional_usd,
+                        unit_margin_usd=(unit_notional_usd * margin_rate_est),
+                        nav=nav,
+                        total_exposure_usd=total_exposure_usd,
+                        total_margin_used_usd=total_margin_used_usd,
+                        margin_available_usd=margin_available,
+                        crypto_exposure_usd=crypto_exposure_usd,
+                        stocks_exposure_usd=stocks_exposure_usd,
+                        max_total_exposure_pct=(max_total_exposure_pct if enable_risk_caps else 0.0),
+                        max_pos_usd=(max_pos_usd if enable_risk_caps else 0.0),
+                        global_cap_pct=global_cap_pct,
+                        global_cap_account_value_usd=cross_market_cap_basis_usd,
+                    )
+                    est_entry_notional = abs(float(units)) * unit_notional_usd
+                    est_entry_margin = abs(float(units)) * (unit_notional_usd * margin_rate_est)
+                    if max_slippage_bps > 0.0 and spread_bps > max_slippage_bps:
+                        fail = f"Slippage guard for {pair}: spread {spread_bps:.2f}bps > {max_slippage_bps:.2f}bps"
+                    elif abs(int(units)) <= 0:
+                        if global_cap_pct > 0.0 and cross_market_cap_basis_usd > 0.0:
+                            allowed_global_notional = (float(cross_market_cap_basis_usd) * float(global_cap_pct) / 100.0)
+                            consumed_global_notional = float(cross_market_exposure_usd)
+                            if consumed_global_notional >= allowed_global_notional:
+                                fail = (
+                                    f"Global cap: cross-market exposure already uses "
+                                    f"${consumed_global_notional:.2f}/${allowed_global_notional:.2f}"
+                                )
+                        if not fail:
+                            fail = f"Risk cap: no tradable size fits current margin/exposure for {pair}"
+                    elif enable_risk_caps and max_pos_usd > 0.0 and est_entry_notional > max_pos_usd:
+                        fail = f"Risk cap: projected pair notional exceeds ${max_pos_usd:.2f}"
+                    elif enable_risk_caps and max_total_exposure_pct > 0.0 and nav > 0.0:
+                        projected_margin_pct = ((total_margin_used_usd + max(0.0, est_entry_margin)) / nav) * 100.0
+                        if projected_margin_pct > max_total_exposure_pct:
+                            fail = f"Risk cap: projected margin utilization exceeds {max_total_exposure_pct:.2f}%"
+                    elif global_cap_pct > 0.0 and cross_market_cap_basis_usd > 0.0:
+                        projected_global_exposure = cross_market_exposure_usd + max(0.0, est_entry_notional)
+                        if ((projected_global_exposure / cross_market_cap_basis_usd) * 100.0) > global_cap_pct:
+                            fail = f"Global cap: projected cross-market exposure exceeds {global_cap_pct:.2f}%"
+                quality_eval: Dict[str, Any] = {}
+                if not fail:
+                    projected_exposure_pct = ((total_exposure_usd + max(0.0, est_entry_notional)) / nav) * 100.0 if nav > 0.0 else 0.0
+                    quality_eval = evaluate_trade_quality(
+                        market="forex",
+                        signal_score=score,
+                        required_score=required_score,
+                        data_quality_ok=bool(cand.get("data_quality_ok", True)) and bool(thinker_data_ok),
+                        broker_ok=True,
+                        runtime_trust_score=float(
+                            (
+                                (policy.get("runtime_trust", {}) if isinstance(policy.get("runtime_trust", {}), dict) else {}).get(
+                                    "score",
+                                    0.0,
+                                )
+                            )
+                            or 0.0
+                        ),
+                        runtime_alert_severity=str(runtime_alerts.get("severity", "ok") or "ok"),
+                        compliance_allowed=bool(policy.get("allow_new_entries", True)),
+                        compliance_reason=str(policy_block_reason or "Forex runtime trust protection active"),
+                        fallback_active=bool(fallback_active),
+                        fallback_age_s=int(fallback_age_s),
+                        fallback_hard_block_age_s=int(cached_scan_hard_block_age_s),
+                        reject_rate_pct=float(thinker_reject_rate_pct),
+                        reject_rate_limit_pct=float(reject_rate_gate_pct),
+                        spread_bps=float(spread_bps),
+                        max_slippage_bps=float(max_slippage_bps),
+                        loss_streak=int(loss_streak),
+                        max_loss_streak=int(max_loss_streak_setting),
+                        exposure_usage_pct=float(projected_exposure_pct),
+                        min_runtime_trust_score=34.0,
+                        min_confidence_score=38.0,
+                    )
+                    if str(quality_eval.get("decision", "block") or "block").strip().lower() != "allow":
+                        q_reasons = quality_eval.get("block_reasons", []) if isinstance(quality_eval.get("block_reasons", []), list) else []
+                        q_reason = str((q_reasons[0] if q_reasons else "trade quality gate blocked entry") or "").strip()
+                        trade_quality_eval = dict(quality_eval)
+                        fail = f"Trade-quality gate: {q_reason}"
+                    else:
+                        quality_units_mult = max(0.20, min(1.0, float(quality_eval.get("size_multiplier", 1.0) or 1.0)))
+                        units_abs = int(round(abs(float(units)) * quality_units_mult))
+                        if units_abs <= 0:
+                            fail = f"Trade-quality gate: no tradable size remains for {pair}"
+                        else:
+                            units = units_abs if int(units) >= 0 else (-1 * units_abs)
+                            selected_quality_eval = dict(quality_eval)
+                            trade_quality_eval = dict(quality_eval)
+                if not fail:
+                    est_notional_for_allocator = abs(float(units)) * unit_notional_usd
+                    allocator_eval = evaluate_cross_market_allocation(
+                        hub_dir=hub_dir,
+                        settings=settings,
+                        market="forex",
+                        candidate_id=pair,
+                        candidate_side=side,
+                        signal_score=float(score),
+                        required_score=float(required_score),
+                        trade_quality=quality_eval if isinstance(quality_eval, dict) else {},
+                        automation_policy=policy,
+                        projected_trade_value_usd=float(max(0.0, est_notional_for_allocator)),
+                        market_exposure_usd=float(total_exposure_usd),
+                        account_value_usd=float(nav),
+                        buying_power_usd=float(margin_available),
+                        spread_bps=float(spread_bps),
+                        max_slippage_bps=float(max_slippage_bps),
+                        candidate_age_s=int(signal_age_s),
+                        loss_streak=int(loss_streak),
+                        max_loss_streak=int(max_loss_streak_setting),
+                        now_ts=int(now_ts),
+                    )
+                    allocator_decision = str(allocator_eval.get("decision", "allow") or "allow").strip().lower()
+                    if allocator_decision != "allow":
+                        opportunity_eval = dict(allocator_eval)
+                        alloc_reason = str(
+                            allocator_eval.get("summary", "")
+                            or (
+                                (allocator_eval.get("reasons", []) if isinstance(allocator_eval.get("reasons", []), list) else [""])
+                                or [""]
+                            )[0]
+                            or "portfolio allocator deprioritized this entry"
+                        ).strip()
+                        fail = f"Portfolio allocator: {alloc_reason}"
+                        trade_quality_eval = dict(quality_eval) if isinstance(quality_eval, dict) else {}
+                    else:
+                        selected_opportunity_eval = dict(allocator_eval)
+                        opportunity_eval = dict(allocator_eval)
                 if fail:
                     fail_reasons.append(fail)
                     continue
@@ -882,6 +1355,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                         "units": int(selected_units),
                         "configured_units": int(abs(trade_units)),
                         "entry_size_scale": float(round(entry_size_scale, 4)),
+                        "policy_size_scale": float(round(policy_size_scale, 4)),
                         "score": selected_score,
                         "calib_prob": selected_calib_prob,
                         "samples": selected_samples,
@@ -889,6 +1363,8 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                         "bars_count": selected_bars,
                         "spread_bps": selected_spread_bps,
                         "risk_cap_size_scale": float(round(risk_cap_size_scale, 4)),
+                        "trade_quality": selected_quality_eval if isinstance(selected_quality_eval, dict) else {},
+                        "opportunity_allocator": selected_opportunity_eval if isinstance(selected_opportunity_eval, dict) else {},
                         "ok": True,
                         "msg": "shadow_only stage",
                     },
@@ -933,6 +1409,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                         "side": selected_side,
                         "units": selected_units,
                         "entry_size_scale": float(round(entry_size_scale, 4)),
+                        "policy_size_scale": float(round(policy_size_scale, 4)),
                         "score": selected_score,
                         "calib_prob": selected_calib_prob,
                         "samples": selected_samples,
@@ -941,6 +1418,8 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                         "price": selected_mid,
                         "spread_bps": selected_spread_bps,
                         "risk_cap_size_scale": float(round(risk_cap_size_scale, 4)),
+                        "trade_quality": selected_quality_eval if isinstance(selected_quality_eval, dict) else {},
+                        "opportunity_allocator": selected_opportunity_eval if isinstance(selected_opportunity_eval, dict) else {},
                         "client_order_id": client_id,
                         "order_id": oid,
                         "retry_after_wait_s": float(round(retry_after_wait_s, 3)),
@@ -971,6 +1450,82 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     if auto_enabled and ("Entry placed" not in str(entry_msg)):
         entry_fail_reasons.append(str(entry_msg))
     entry_eval_top_reason, entry_eval_reason_counts = _fail_reason_summary(entry_fail_reasons)
+    runtime_trust = policy.get("runtime_trust", {}) if isinstance(policy.get("runtime_trust", {}), dict) else {}
+    quality_layers = trade_quality_eval.get("layers", {}) if isinstance(trade_quality_eval.get("layers", {}), dict) else {}
+    trade_quality_evaluated = bool(isinstance(trade_quality_eval, dict) and trade_quality_eval)
+    allocator_evaluated = bool(isinstance(opportunity_eval, dict) and opportunity_eval)
+    allocator_reasons = opportunity_eval.get("reasons", []) if isinstance(opportunity_eval.get("reasons", []), list) else []
+    allocator_top_reason = str((allocator_reasons[0] if allocator_reasons else "") or "").strip()
+    trade_confidence_score = float(trade_quality_eval.get("confidence_score", 0.0) or 0.0) if isinstance(trade_quality_eval, dict) else 0.0
+    quality_size_scale = float(trade_quality_eval.get("size_multiplier", 1.0) or 1.0) if isinstance(trade_quality_eval, dict) else 1.0
+    if auto_enabled:
+        cross_market_exposure_effective_usd = float(cross_market_exposure_usd)
+        cross_market_cap_basis_effective_usd = float(cross_market_cap_basis_usd)
+    else:
+        cross_market_exposure_effective_usd = (
+            float(total_exposure_usd)
+            + float(_crypto_holdings_usd(hub_dir))
+            + float(_market_status_exposure_usd(hub_dir, "stocks"))
+        )
+        cross_market_cap_basis_effective_usd = float(
+            _portfolio_account_value_usd(
+                hub_dir,
+                current_market="forex",
+                current_account_value_usd=float(nav),
+            )
+        )
+    cross_market_exposure_effective_pct = (
+        (cross_market_exposure_effective_usd / max(1e-6, cross_market_cap_basis_effective_usd)) * 100.0
+    )
+    entry_gate_flags = {
+        "data_quality_required": bool(require_data_quality_ok),
+        "data_quality_ok": bool(thinker_data_ok),
+        "reject_rate_pct": float(round(thinker_reject_rate_pct, 4)),
+        "reject_rate_raw_pct": float(round(thinker_reject_rate_raw_pct, 4)),
+        "reject_rate_max_pct": float(round(reject_rate_gate_pct, 4)),
+        "cached_fallback_active": bool(fallback_active),
+        "cached_fallback_age_s": int(fallback_age_s),
+        "cached_fallback_hard_block_age_s": int(cached_scan_hard_block_age_s),
+        "stale_alignment_data_ok": bool(stale_alignment_data_ok),
+        "stale_alignment_signal_age_s": int(signal_age_policy_s),
+        "stale_alignment_max_signal_age_s": int(max_signal_age_policy_s),
+        "runtime_trust_score": float(round(float(runtime_trust.get("score", 0.0) or 0.0), 4)),
+        "runtime_trust_mode": str(runtime_trust.get("mode", "") or ""),
+        "policy_mode": str(policy.get("mode", "") or ""),
+        "policy_profile": str(policy.get("profile", "") or ""),
+        "policy_size_scale": float(round(policy_size_scale, 4)),
+        "trade_quality_evaluated": bool(trade_quality_evaluated),
+        "trade_quality_decision": str(
+            trade_quality_eval.get("decision", "not_evaluated") if trade_quality_evaluated else "not_evaluated"
+        ),
+        "trade_confidence_score": float(round(trade_confidence_score, 4)),
+        "trade_quality_size_scale": float(round(quality_size_scale, 4)),
+        "portfolio_allocator_evaluated": bool(allocator_evaluated),
+        "portfolio_allocator_decision": str(
+            opportunity_eval.get("decision", "not_evaluated") if allocator_evaluated else "not_evaluated"
+        ),
+        "portfolio_allocator_best_market": str(opportunity_eval.get("best_market", "") or ""),
+        "portfolio_allocator_score": float(round(float(opportunity_eval.get("current_market_score", 0.0) or 0.0), 4)),
+        "portfolio_allocator_top_reason": allocator_top_reason,
+        "portfolio_allocator_capital_constrained": bool(opportunity_eval.get("capital_constrained", False)) if allocator_evaluated else False,
+        "signal_quality_pass": bool(quality_layers.get("signal_quality", False)),
+        "execution_quality_pass": bool(quality_layers.get("execution_quality", False)),
+        "compliance_permission_pass": bool(quality_layers.get("compliance_permission", False)),
+        "runtime_trust_pass": bool(quality_layers.get("runtime_trust", False)),
+        "alignment_required_score": float(round(float(alignment_required_score), 6)),
+        "stale_exit_enabled": bool(stale_exit_enabled),
+        "stale_exit_grace_cycles": int(stale_exit_grace_cycles),
+        "stale_exit_count": int(stale_exit_count),
+        "stale_exit_max_per_cycle": int(stale_exit_max_per_cycle),
+        "stale_exit_min_notional_usd": float(round(float(stale_exit_min_notional_usd), 4)),
+        "stale_exit_min_hold_s": int(stale_exit_min_hold_s),
+        "stale_exit_loss_cut_pct": float(round(float(stale_exit_loss_cut_pct), 4)),
+        "stale_exit_reverse_score_mult": float(round(float(stale_exit_reverse_score_mult), 4)),
+        "skip_new_entries_this_cycle": bool(skip_new_entries_this_cycle),
+        "cross_market_exposure_usd": float(round(cross_market_exposure_effective_usd, 4)),
+        "cross_market_cap_basis_usd": float(round(cross_market_cap_basis_effective_usd, 4)),
+        "cross_market_exposure_pct": float(round(cross_market_exposure_effective_pct, 4)),
+    }
 
     out_state = {
         "trail": trail_state,
@@ -978,24 +1533,21 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "loss_streak": int(loss_streak),
         "open_meta": open_meta,
         "pending": pending,
+        "stale_alignment_streaks": dict(stale_alignment_streaks),
         "last_divergence_ts": int(last_divergence_ts),
         "last_divergence_msg": str(last_divergence_msg),
         "entry_eval_total": int(len(entry_fail_reasons)),
         "entry_eval_top_reason": str(entry_eval_top_reason),
         "entry_eval_reason_counts": dict(entry_eval_reason_counts),
-        "entry_gate_flags": {
-            "data_quality_required": bool(require_data_quality_ok),
-            "data_quality_ok": bool(thinker_data_ok),
-            "reject_rate_pct": float(round(thinker_reject_rate_pct, 4)),
-            "reject_rate_raw_pct": float(round(thinker_reject_rate_raw_pct, 4)),
-            "reject_rate_max_pct": float(round(reject_rate_gate_pct, 4)),
-            "cached_fallback_active": bool(fallback_active),
-            "cached_fallback_age_s": int(fallback_age_s),
-            "cached_fallback_hard_block_age_s": int(cached_scan_hard_block_age_s),
-        },
+        "automation_policy": policy if isinstance(policy, dict) else {},
+        "trade_quality": trade_quality_eval if isinstance(trade_quality_eval, dict) else {},
+        "opportunity_allocator": opportunity_eval if isinstance(opportunity_eval, dict) else {},
+        "entry_gate_flags": dict(entry_gate_flags),
         "trade_units_entry": int(trade_units_entry),
         "entry_size_scale": round(float(entry_size_scale), 4),
         "risk_cap_size_scale": round(float(risk_cap_size_scale), 4),
+        "stale_exit_count": int(stale_exit_count),
+        "stale_exit_events": list(stale_exit_events[:24]),
         "last_actions": actions[-80:],
         "updated_at": now_ts,
     }
@@ -1012,14 +1564,26 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     )
 
     msg_parts = [entry_msg]
+    if stale_exit_refresh_msg and str(stale_exit_refresh_msg).strip() and (str(stale_exit_refresh_msg) not in msg_parts):
+        msg_parts.append(str(stale_exit_refresh_msg))
     if shadow_only:
         msg_parts.append("rollout shadow_only: real entries suppressed")
     elif not enable_exec_v2:
         msg_parts.append(f"rollout {stage}: execution disabled")
+    if str(policy.get("summary", "") or "").strip():
+        msg_parts.append(str(policy.get("summary", "")))
     if trade_units_effective < abs(trade_units):
         msg_parts.append(f"size x{loss_size_scale:.2f}")
     if trade_units_entry < trade_units_effective:
         msg_parts.append(f"scan-size x{entry_size_scale:.2f}")
+    if abs(float(policy_size_scale) - 1.0) >= 0.01:
+        msg_parts.append(f"policy-size x{policy_size_scale:.2f}")
+    if trade_quality_eval and abs(float(quality_size_scale) - 1.0) >= 0.01:
+        msg_parts.append(f"quality-size x{quality_size_scale:.2f}")
+    if allocator_evaluated:
+        allocator_summary = str(opportunity_eval.get("summary", "") or "").strip()
+        if allocator_summary:
+            msg_parts.append(allocator_summary)
     if risk_cap_size_scale < 0.999:
         msg_parts.append(f"risk-cap-size x{risk_cap_size_scale:.2f}")
     if actions:
@@ -1071,21 +1635,19 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "position_values_usd": dict(position_values_usd),
         "crypto_exposure_usd": round(crypto_exposure_usd, 4) if auto_enabled else round(_crypto_holdings_usd(hub_dir), 4),
         "other_market_exposure_usd": round(stocks_exposure_usd, 4) if auto_enabled else round(_market_status_exposure_usd(hub_dir, "stocks"), 4),
+        "cross_market_exposure_usd": round(cross_market_exposure_effective_usd, 4),
+        "cross_market_cap_basis_usd": round(cross_market_cap_basis_effective_usd, 4),
         "account_value_usd": round(nav, 4),
         "entry_eval_total": int(len(entry_fail_reasons)),
         "entry_eval_failed": int(len(entry_fail_reasons) > 0),
         "entry_eval_top_reason": str(entry_eval_top_reason),
         "entry_eval_reason_counts": dict(entry_eval_reason_counts),
-        "entry_gate_flags": {
-            "data_quality_required": bool(require_data_quality_ok),
-            "data_quality_ok": bool(thinker_data_ok),
-            "reject_rate_pct": float(round(thinker_reject_rate_pct, 4)),
-            "reject_rate_raw_pct": float(round(thinker_reject_rate_raw_pct, 4)),
-            "reject_rate_max_pct": float(round(reject_rate_gate_pct, 4)),
-            "cached_fallback_active": bool(fallback_active),
-            "cached_fallback_age_s": int(fallback_age_s),
-            "cached_fallback_hard_block_age_s": int(cached_scan_hard_block_age_s),
-        },
+        "automation_policy": policy if isinstance(policy, dict) else {},
+        "trade_quality": trade_quality_eval if isinstance(trade_quality_eval, dict) else {},
+        "opportunity_allocator": opportunity_eval if isinstance(opportunity_eval, dict) else {},
+        "entry_gate_flags": dict(entry_gate_flags),
+        "stale_exit_count": int(stale_exit_count),
+        "stale_exit_events": list(stale_exit_events[:24]),
         "updated_at": now_ts,
         "health": {"data_ok": thinker_data_ok, "broker_ok": True, "orders_ok": True, "drift_warning": drift_warning},
     }

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from app.settings_utils import recommend_market_profile_overrides, sanitize_settings
+from app.settings_utils import normalize_settings_profile, recommend_market_profile_overrides, sanitize_settings
 
 
 class TestSettingsSanitize(unittest.TestCase):
@@ -60,6 +60,7 @@ class TestSettingsSanitize(unittest.TestCase):
             "forex_replay_adaptive_enabled": "no",
             "forex_replay_adaptive_weight": "-5",
             "forex_replay_adaptive_step_cap_pct": "200",
+            "forex_mtf_confirm_max_pairs": "999",
             "runtime_alert_cadence_warn_count": "0",
             "runtime_alert_cadence_crit_count": "0",
             "runtime_alert_cadence_late_warn_pct": "1",
@@ -132,6 +133,7 @@ class TestSettingsSanitize(unittest.TestCase):
         self.assertFalse(bool(out["forex_replay_adaptive_enabled"]))
         self.assertEqual(float(out["forex_replay_adaptive_weight"]), 0.0)
         self.assertEqual(float(out["forex_replay_adaptive_step_cap_pct"]), 90.0)
+        self.assertEqual(int(out["forex_mtf_confirm_max_pairs"]), 128)
         self.assertEqual(int(out["runtime_alert_cadence_warn_count"]), 1)
         self.assertEqual(int(out["runtime_alert_cadence_crit_count"]), 1)
         self.assertEqual(float(out["runtime_alert_cadence_late_warn_pct"]), 10.0)
@@ -158,10 +160,12 @@ class TestSettingsSanitize(unittest.TestCase):
         self.assertTrue(str(out["script_trader"]).endswith("pt_trader.py"))
         self.assertEqual(str(out.get("settings_control_mode", "")), "self_managed")
         self.assertEqual(str(out.get("settings_profile", "")), "balanced")
+        self.assertEqual(int(out.get("forex_mtf_confirm_max_pairs", 0) or 0), 10)
         self.assertEqual(int(out.get("stock_symbol_cooldown_minutes", 0) or 0), 15)
         self.assertEqual(int(out.get("stock_symbol_cooldown_min_hits", 0) or 0), 3)
         self.assertEqual(str(out.get("stock_symbol_cooldown_reject_reasons", "")), "data_quality,insufficient_bars")
         self.assertTrue(bool(out.get("news_event_enabled", False)))
+        self.assertGreaterEqual(float(out.get("crypto_max_spread_bps", 0.0) or 0.0), 90.0)
         self.assertGreaterEqual(
             float(out.get("news_event_stale_max_s", 0.0) or 0.0),
             float(out.get("news_event_refresh_s", 0.0) or 0.0),
@@ -169,7 +173,7 @@ class TestSettingsSanitize(unittest.TestCase):
 
     def test_market_profile_overrides_are_account_aware(self) -> None:
         overrides = recommend_market_profile_overrides(
-            "performance",
+            "max_growth",
             settings={"stock_scan_max_symbols": 240},
             crypto_status={
                 "equity": "102.78",
@@ -196,15 +200,105 @@ class TestSettingsSanitize(unittest.TestCase):
         self.assertGreaterEqual(int(overrides["crypto_dynamic_target_count"]), 9)
         self.assertLessEqual(float(overrides["crypto_dynamic_scan_interval_s"]), 120.0)
         self.assertLess(float(overrides["crypto_dynamic_min_projected_edge_pct"]), 0.20)
+        self.assertGreaterEqual(float(overrides["crypto_max_spread_bps"]), 150.0)
         self.assertEqual(int(overrides["stock_max_open_positions"]), 8)
         self.assertGreater(float(overrides["stock_trade_notional_usd"]), 200.0)
-        self.assertEqual(int(overrides["forex_trade_units"]), 25)
+        self.assertGreaterEqual(int(overrides["forex_trade_units"]), 35)
         self.assertEqual(float(overrides["market_max_total_exposure_pct"]), 0.0)
-        self.assertEqual(float(overrides["market_bg_stocks_interval_s"]), 20.0)
+        self.assertEqual(float(overrides["stock_max_total_exposure_pct"]), 55.0)
+        self.assertEqual(float(overrides["forex_max_total_exposure_pct"]), 35.0)
+        self.assertEqual(float(overrides["stock_max_daily_loss_pct"]), 0.0)
+        self.assertEqual(float(overrides["forex_max_daily_loss_pct"]), 1.5)
+        self.assertGreaterEqual(float(overrides["market_bg_stocks_interval_s"]), 12.0)
+        self.assertLessEqual(float(overrides["market_bg_stocks_interval_s"]), 20.0)
+        self.assertLessEqual(int(overrides.get("stock_scan_max_symbols", 0) or 0), 220)
+        self.assertGreaterEqual(int(overrides.get("stock_scan_symbol_fallback_limit", 0) or 0), 12)
         self.assertEqual(int(overrides["stock_max_day_trades"]), 1)
         self.assertGreater(float(overrides["stock_profit_target_pct"]), 1.0)
         self.assertTrue(bool(overrides["stock_opening_plan_enabled"]))
         self.assertLessEqual(float(overrides["forex_score_threshold"]), 0.10)
+
+    def test_market_profile_overrides_reduce_stock_scan_for_small_accounts(self) -> None:
+        overrides = recommend_market_profile_overrides(
+            "max_growth",
+            settings={"stock_scan_max_symbols": 200},
+            stock_status={"equity": 95.0, "buying_power": 95.0, "open_positions": 0},
+            stock_trader={"account_value_usd": 95.0, "open_positions": 0},
+        )
+        self.assertLessEqual(int(overrides.get("stock_scan_max_symbols", 0) or 0), 48)
+        self.assertLessEqual(int(overrides.get("stock_mtf_confirm_max_symbols", 0) or 0), 8)
+        self.assertLessEqual(int(overrides.get("stock_scan_symbol_fallback_limit", 0) or 0), 24)
+
+    def test_max_growth_small_live_accounts_enable_daily_loss_and_exposure_backstops(self) -> None:
+        overrides = recommend_market_profile_overrides(
+            "max_growth",
+            settings={
+                "market_rollout_stage": "live",
+                "alpaca_paper_mode": False,
+                "oanda_practice_mode": False,
+            },
+            crypto_status={"equity": 320.0, "buying_power": 260.0, "open_positions": 0},
+            crypto_trader={"account_value_usd": 320.0, "open_positions": 0},
+            stock_status={"equity": 850.0, "buying_power": 600.0, "open_positions": 0},
+            stock_trader={"account_value_usd": 850.0, "open_positions": 0},
+            forex_status={"nav": 900.0, "buying_power": 650.0, "open_positions": 0},
+            forex_trader={"account_value_usd": 900.0, "open_positions": 0},
+        )
+        self.assertEqual(float(overrides["max_total_exposure_pct"]), 55.0)
+        self.assertEqual(float(overrides["stock_max_total_exposure_pct"]), 35.0)
+        self.assertEqual(float(overrides["forex_max_total_exposure_pct"]), 35.0)
+        self.assertEqual(float(overrides["market_max_total_exposure_pct"]), 40.0)
+        self.assertEqual(float(overrides["stock_max_daily_loss_pct"]), 1.5)
+        self.assertEqual(float(overrides["forex_max_daily_loss_pct"]), 1.5)
+        self.assertEqual(float(overrides["stock_max_daily_loss_usd"]), 0.0)
+        self.assertEqual(float(overrides["forex_max_daily_loss_usd"]), 0.0)
+        self.assertEqual(float(overrides["forex_stale_min_notional_usd"]), 1.0)
+        self.assertGreaterEqual(int(overrides["forex_trade_units"]), 80)
+
+    def test_max_growth_large_live_accounts_keep_permissive_limits(self) -> None:
+        overrides = recommend_market_profile_overrides(
+            "max_growth",
+            settings={
+                "market_rollout_stage": "live",
+                "alpaca_paper_mode": False,
+                "oanda_practice_mode": False,
+            },
+            crypto_status={"equity": 35_000.0, "buying_power": 20_000.0, "open_positions": 2},
+            crypto_trader={"account_value_usd": 35_000.0, "open_positions": 2},
+            stock_status={"equity": 120_000.0, "buying_power": 80_000.0, "open_positions": 3},
+            stock_trader={"account_value_usd": 120_000.0, "open_positions": 3},
+            forex_status={"nav": 22_500.0, "buying_power": 16_000.0, "open_positions": 2},
+            forex_trader={"account_value_usd": 22_500.0, "open_positions": 2},
+        )
+        self.assertGreaterEqual(float(overrides["max_total_exposure_pct"]), 65.0)
+        self.assertEqual(float(overrides["stock_max_total_exposure_pct"]), 55.0)
+        self.assertEqual(float(overrides["forex_max_total_exposure_pct"]), 55.0)
+        self.assertEqual(float(overrides["market_max_total_exposure_pct"]), 0.0)
+        self.assertEqual(float(overrides["stock_max_daily_loss_pct"]), 0.0)
+        self.assertEqual(float(overrides["forex_max_daily_loss_pct"]), 0.0)
+        self.assertEqual(float(overrides["forex_stale_min_notional_usd"]), 3.0)
+
+    def test_settings_profile_aliases_and_new_presets(self) -> None:
+        self.assertEqual(normalize_settings_profile("guarded"), "safe")
+        self.assertEqual(normalize_settings_profile("performance"), "max_growth")
+        self.assertEqual(normalize_settings_profile("aggressive"), "aggressive")
+        self.assertEqual(normalize_settings_profile("max-growth"), "max_growth")
+        out = sanitize_settings({"settings_profile": "performance"})
+        self.assertEqual(str(out.get("settings_profile", "")), "max_growth")
+        out2 = sanitize_settings({"settings_profile": "guarded"})
+        self.assertEqual(str(out2.get("settings_profile", "")), "safe")
+        aggressive = recommend_market_profile_overrides(
+            "aggressive",
+            settings={"stock_scan_max_symbols": 120},
+            stock_status={"equity": 15000.0, "buying_power": 8000.0, "open_positions": 1},
+            stock_trader={"account_value_usd": 15000.0, "open_positions": 1},
+            forex_status={"nav": 4000.0, "buying_power": 2500.0, "open_positions": 1},
+            forex_trader={"account_value_usd": 4000.0, "open_positions": 1},
+        )
+        self.assertEqual(int(aggressive.get("trade_start_level", 0) or 0), 2)
+        self.assertGreater(float(aggressive.get("stock_profit_target_pct", 0.0) or 0.0), 1.0)
+        self.assertGreater(float(aggressive.get("forex_replay_adaptive_weight", 0.0) or 0.0), 0.45)
+        self.assertGreaterEqual(float(aggressive.get("crypto_max_spread_bps", 0.0) or 0.0), 150.0)
 
 
 if __name__ == "__main__":

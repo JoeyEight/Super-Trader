@@ -231,7 +231,7 @@ def _incident_is_active(row: Dict[str, Any], runtime_state: Dict[str, Any]) -> b
         return market in _active_drift_markets(runtime_state)
     if evt == "runner_startup_check":
         return _startup_checks_active(runtime_state)
-    if evt in {"runner_watchdog_restart", "runner_child_exit"}:
+    if evt in {"runner_watchdog_restart", "runner_child_exit", "runner_child_crash_loop", "runner_child_start_failed"}:
         return _runner_restart_incident_active(row, runtime_state)
     if evt in {"runner_market_loop_status_stale", "runner_market_loop_restart"}:
         return _market_loop_issue_active(runtime_state)
@@ -660,6 +660,98 @@ def _action_for_incident_row(row: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
+def _automation_policy_rows(runtime_state: Dict[str, Any], ts_now: int) -> List[Dict[str, Any]]:
+    rs = runtime_state if isinstance(runtime_state, dict) else {}
+    payload = rs.get("automation_policy", {}) if isinstance(rs.get("automation_policy", {}), dict) else {}
+    rows: List[Dict[str, Any]] = []
+    for market in ("crypto", "stocks", "forex"):
+        row = payload.get(market, {}) if isinstance(payload.get(market, {}), dict) else {}
+        summary = str(row.get("summary", "") or "").strip()
+        if not summary:
+            continue
+        trust_score = _f(row.get("runtime_trust_score", 0.0), 0.0)
+        allow_entries = bool(row.get("allow_new_entries", True))
+        compliance_status = str(row.get("compliance_status", "") or "").strip()
+        severity = "info"
+        if not allow_entries:
+            severity = "warning"
+        if trust_score > 0.0 and trust_score < 35.0:
+            severity = "critical"
+        title = f"{str(_market_label(market)).title()} automation policy"
+        message_bits = [summary]
+        if compliance_status and compliance_status.lower() not in summary.lower():
+            message_bits.append(compliance_status)
+        message = " | ".join([part for part in message_bits if str(part or "").strip()][:2])
+        rows.append(
+            {
+                "id": f"{market}_automation_policy_{ts_now}",
+                "ts": int(ts_now),
+                "severity": severity,
+                "market": market,
+                "source": "automation_policy",
+                "title": title,
+                "message": message[:220],
+            }
+        )
+    return rows
+
+
+def _cross_market_opportunity_rows(runtime_state: Dict[str, Any], ts_now: int) -> List[Dict[str, Any]]:
+    rs = runtime_state if isinstance(runtime_state, dict) else {}
+    payload = rs.get("cross_market_opportunity", {}) if isinstance(rs.get("cross_market_opportunity", {}), dict) else {}
+    if not payload or not bool(payload.get("active", False)):
+        return []
+    summary = str(payload.get("summary", "") or "").strip()
+    best_market = str(payload.get("best_market", "") or "").strip().lower()
+    decisions = payload.get("decisions", {}) if isinstance(payload.get("decisions", {}), dict) else {}
+    deprioritized = payload.get("deprioritized_markets", []) if isinstance(payload.get("deprioritized_markets", []), list) else []
+    severity = "info"
+    if any(str((row or {}).get("decision", "") or "").strip().lower() == "block" for row in deprioritized if isinstance(row, dict)):
+        severity = "warning"
+    if not summary and best_market:
+        summary = f"Best current opportunity: {str(_market_label(best_market)).title()}"
+    if not summary:
+        return []
+    best_label = str(_market_label(best_market)).title() if best_market else "Portfolio"
+    rows: List[Dict[str, Any]] = [
+        {
+            "id": f"cross_market_opportunity_{ts_now}",
+            "ts": int(ts_now),
+            "severity": severity,
+            "market": "global",
+            "source": "opportunity_allocator",
+            "title": f"{best_label} opportunity priority",
+            "message": summary[:220],
+        }
+    ]
+    for row in deprioritized[:2]:
+        if not isinstance(row, dict):
+            continue
+        mk = str(row.get("market", "") or "").strip().lower()
+        decision = str(row.get("decision", "") or "").strip().lower()
+        message = str(row.get("summary", "") or "").strip()
+        if not mk or not message:
+            continue
+        sev = "warning" if decision == "block" else "info"
+        rows.append(
+            {
+                "id": f"cross_market_{mk}_{ts_now}",
+                "ts": int(ts_now),
+                "severity": sev,
+                "market": mk,
+                "source": "opportunity_allocator",
+                "title": f"{str(_market_label(mk)).title()} candidate {decision or 'deprioritized'}",
+                "message": message[:220],
+            }
+        )
+    # Include decisions map only when there is no explicit deprioritized row.
+    if not deprioritized and decisions:
+        top_decision = str(decisions.get(best_market, "") or "").strip().lower() if best_market else ""
+        if top_decision:
+            rows[0]["message"] = f"{rows[0]['message']} | Decision: {top_decision}"
+    return rows
+
+
 def build_notification_center_payload(
     runtime_state: Dict[str, Any],
     incidents_rows: Iterable[Dict[str, Any]] | None = None,
@@ -690,6 +782,8 @@ def build_notification_center_payload(
         out_rows.append(
             row
         )
+    out_rows.extend(_automation_policy_rows(rs, ts_now))
+    out_rows.extend(_cross_market_opportunity_rows(rs, ts_now))
 
     trends = rs.get("market_trends", {}) if isinstance(rs.get("market_trends", {}), dict) else {}
     for market in ("stocks", "forex"):

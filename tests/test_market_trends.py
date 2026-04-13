@@ -158,6 +158,56 @@ class TestMarketTrends(unittest.TestCase):
             self.assertAlmostEqual(float(quality_agg.get("reject_rate_pct", 0.0) or 0.0), 60.0, places=2)
             self.assertAlmostEqual(float(quality_agg.get("reject_rate_raw_pct", 0.0) or 0.0), 100.0, places=2)
 
+    def test_build_market_trend_summary_market_closed_zeros_reject_pressure(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            stocks_dir = os.path.join(td, "stocks")
+            os.makedirs(stocks_dir, exist_ok=True)
+            with open(os.path.join(stocks_dir, "execution_audit.jsonl"), "w", encoding="utf-8") as f:
+                f.write("")
+            with open(os.path.join(stocks_dir, "scanner_rankings.jsonl"), "w", encoding="utf-8") as f:
+                f.write("")
+            with open(os.path.join(stocks_dir, "stock_trader_status.json"), "w", encoding="utf-8") as f:
+                json.dump({"state": "READY", "msg": "ok"}, f)
+            with open(os.path.join(stocks_dir, "stock_thinker_status.json"), "w", encoding="utf-8") as f:
+                json.dump({"top_chart_map": {}}, f)
+            with open(os.path.join(stocks_dir, "scan_diagnostics.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "state": "READY",
+                        "market_open": False,
+                        "leaders_total": 0,
+                        "scores_total": 0,
+                        "reject_summary": {
+                            "reject_rate_pct": 0.0,
+                            "dominant_reason": "market_closed",
+                        },
+                    },
+                    f,
+                )
+            with open(os.path.join(stocks_dir, "universe_quality.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        # Simulate stale open-session quality stats still on disk.
+                        "reject_rate_pct": 100.0,
+                        "reject_rate_raw_pct": 100.0,
+                        "leaders_total": 1,
+                        "scores_total": 2,
+                        "rejection_reasons": [{"reason": "data_quality", "count": 20, "pct": 100.0}],
+                    },
+                    f,
+                )
+            with open(os.path.join(td, "scanner_cadence_drift.json"), "w", encoding="utf-8") as f:
+                json.dump({"markets": {}, "active": []}, f)
+
+            out = build_market_trend_summary(td, "stocks")
+            quality_agg = out.get("quality_aggregates", {}) if isinstance(out.get("quality_aggregates", {}), dict) else {}
+            reliability = out.get("data_source_reliability", {}) if isinstance(out.get("data_source_reliability", {}), dict) else {}
+            self.assertEqual(str(quality_agg.get("dominant_reason", "")), "market_closed")
+            self.assertAlmostEqual(float(quality_agg.get("reject_rate_pct", -1.0)), 0.0, places=2)
+            self.assertAlmostEqual(float(quality_agg.get("reject_rate_raw_pct", -1.0)), 0.0, places=2)
+            self.assertEqual(str(reliability.get("level", "")), "high")
+            self.assertAlmostEqual(float(reliability.get("score", -1.0)), 100.0, places=2)
+
     def test_build_trends_payload_contains_aggregate_fields(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             for market, trader_file in (("stocks", "stock_trader_status.json"), ("forex", "forex_trader_status.json")):

@@ -23,6 +23,7 @@ from app.market_trends import build_trends_payload
 from app.path_utils import read_settings_file, resolve_runtime_paths, resolve_settings_path
 from app.regime_classifier import build_all_market_regimes
 from app.runtime_logging import append_jsonl, atomic_write_json, runtime_event
+from app.scanner_quality import effective_reject_pressure
 from app.settings_utils import sanitize_settings
 from app.shadow_scorecard import build_shadow_scorecards
 from app.time_utils import now_date_local
@@ -185,6 +186,10 @@ def _update_scan_reject_drift(market: str, reject_rate_pct: float, settings: Dic
                 {"market": market, "reject_rate_pct": rr, "baseline_pct": baseline, "delta_pct": delta, "ratio": ratio},
                 cooldown_key=f"scanner_reject_spike:{market}",
             )
+        elif rr < min_rate:
+            # Auto-clear stale active reject-spike flags once pressure recovers.
+            market_key = str(market or "").strip().lower()
+            active = [a for a in active if str(a.get("market", "") or "").strip().lower() != market_key]
 
         cutoff = now - 1800
         active = [a for a in active if int(a.get("ts", 0) or 0) >= cutoff]
@@ -230,9 +235,39 @@ def _scanner_reject_rate_for_alerts(scan_payload: Dict[str, Any]) -> float:
     except Exception:
         rs = {}
     try:
-        return max(0.0, min(100.0, float(rs.get("reject_rate_pct", 0.0) or 0.0)))
+        reject_raw = max(0.0, min(100.0, float(rs.get("reject_rate_pct", 0.0) or 0.0)))
     except Exception:
-        return 0.0
+        reject_raw = 0.0
+    dominant_reason = str(rs.get("dominant_reason", "") or "").strip().lower()
+    try:
+        dominant_ratio = float(rs.get("dominant_ratio_pct", rs.get("dominant_ratio", 0.0)) or 0.0)
+    except Exception:
+        dominant_ratio = 0.0
+    leaders_val = scan_payload.get(
+        "leaders_total",
+        uq.get("leaders_total", len(scan_payload.get("leaders", []) if isinstance(scan_payload.get("leaders", []), list) else [])),
+    )
+    scores_val = scan_payload.get(
+        "scores_total",
+        uq.get("scores_total", len(scan_payload.get("scores", []) if isinstance(scan_payload.get("scores", []), list) else [])),
+    )
+    try:
+        leaders_total = int(leaders_val or 0)
+    except Exception:
+        leaders_total = 0
+    try:
+        scores_total = int(scores_val or 0)
+    except Exception:
+        scores_total = 0
+    return float(
+        effective_reject_pressure(
+            reject_raw,
+            dominant_reason=dominant_reason,
+            dominant_ratio_pct=dominant_ratio,
+            leaders_total=leaders_total,
+            scores_total=scores_total,
+        )
+    )
 
 
 def _update_scan_cadence_drift(

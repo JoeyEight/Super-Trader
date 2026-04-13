@@ -7,11 +7,14 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List
 from zoneinfo import ZoneInfo
 
+from app.automation_policy import build_market_automation_policy, stock_compliance_state
+from app.opportunity_allocator import evaluate_cross_market_allocation
 from app.credential_utils import get_alpaca_creds
 from app.http_utils import parse_retry_after_value
 from app.path_utils import resolve_runtime_paths
 from app.runtime_logging import runtime_event
 from app.scanner_quality import effective_reject_pressure
+from app.trade_quality import evaluate_trade_quality
 from brokers.broker_alpaca import AlpacaBrokerClient
 
 BASE_DIR, _SETTINGS_PATH, HUB_DATA_DIR, _BOOT_SETTINGS = resolve_runtime_paths(__file__, "stock_trader")
@@ -103,6 +106,72 @@ def _now_et() -> datetime:
     return datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York"))
 
 
+def _nth_weekday_of_month(year: int, month: int, weekday: int, n: int) -> date:
+    base = date(int(year), int(month), 1)
+    offset = (int(weekday) - int(base.weekday())) % 7
+    day_num = 1 + offset + (max(1, int(n)) - 1) * 7
+    return date(int(year), int(month), int(day_num))
+
+
+def _last_weekday_of_month(year: int, month: int, weekday: int) -> date:
+    if int(month) == 12:
+        nxt = date(int(year) + 1, 1, 1)
+    else:
+        nxt = date(int(year), int(month) + 1, 1)
+    cur = nxt - timedelta(days=1)
+    while cur.weekday() != int(weekday):
+        cur -= timedelta(days=1)
+    return cur
+
+
+def _easter_sunday(year: int) -> date:
+    # Anonymous Gregorian algorithm
+    y = int(year)
+    a = y % 19
+    b = y // 100
+    c = y % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return date(y, month, day)
+
+
+def _observed_fixed_holiday(year: int, month: int, day: int) -> date:
+    d = date(int(year), int(month), int(day))
+    if d.weekday() == 5:
+        return d - timedelta(days=1)
+    if d.weekday() == 6:
+        return d + timedelta(days=1)
+    return d
+
+
+def _is_us_stock_holiday(day_value: date) -> bool:
+    day = day_value if isinstance(day_value, date) else date.today()
+    y = int(day.year)
+    holidays = {
+        _observed_fixed_holiday(y, 1, 1),  # New Year's Day (observed)
+        _nth_weekday_of_month(y, 1, 0, 3),  # Martin Luther King Jr. Day
+        _nth_weekday_of_month(y, 2, 0, 3),  # Presidents Day
+        _easter_sunday(y) - timedelta(days=2),  # Good Friday
+        _last_weekday_of_month(y, 5, 0),  # Memorial Day
+        _observed_fixed_holiday(y, 6, 19),  # Juneteenth (observed)
+        _observed_fixed_holiday(y, 7, 4),  # Independence Day (observed)
+        _nth_weekday_of_month(y, 9, 0, 1),  # Labor Day
+        _nth_weekday_of_month(y, 11, 3, 4),  # Thanksgiving
+        _observed_fixed_holiday(y, 12, 25),  # Christmas (observed)
+        _observed_fixed_holiday(y + 1, 1, 1),  # Handles Dec 31 observed close when Jan 1 falls on Saturday.
+    }
+    return day in holidays
+
+
 def _et_date_from_ts(ts: float | int) -> date:
     try:
         val = float(ts or 0.0)
@@ -171,9 +240,15 @@ def _count_events_in_window(events: List[int], start_ts: int, end_ts: int) -> in
     return int(count)
 
 
-def _market_open_now() -> bool:
-    now = _now_et()
+def _market_open_now(now_value: datetime | None = None) -> bool:
+    now = now_value if isinstance(now_value, datetime) else _now_et()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=ZoneInfo("America/New_York"))
+    else:
+        now = now.astimezone(ZoneInfo("America/New_York"))
     if now.weekday() >= 5:
+        return False
+    if _is_us_stock_holiday(now.date()):
         return False
     mins = (now.hour * 60) + now.minute
     return (9 * 60 + 30) <= mins < (16 * 60)
@@ -251,20 +326,41 @@ def _safe_float_from_dict(d: Dict[str, Any], keys: List[str]) -> float:
     return 0.0
 
 
+def _trader_data_account(hub_dir: str) -> Dict[str, Any]:
+    data = _safe_read_json(os.path.join(hub_dir, "trader_data.json"))
+    if not isinstance(data, dict):
+        return {}
+    account = data.get("account", {})
+    return account if isinstance(account, dict) else {}
+
+
 def _crypto_holdings_usd(hub_dir: str) -> float:
-    path = os.path.join(hub_dir, "trader_status.json")
-    data = _safe_read_json(path)
+    account = _trader_data_account(hub_dir)
+    if isinstance(account, dict) and account:
+        return _safe_float_from_dict(
+            account,
+            [
+                "holdings_sell_value",
+                "holdings_buy_value",
+                "holdings_value",
+                "holdings_usd",
+                "total_holdings_value",
+            ],
+        )
+    data = _safe_read_json(os.path.join(hub_dir, "trader_data.json"))
     if not isinstance(data, dict):
         return 0.0
-    return _safe_float_from_dict(
-        data,
-        [
-            "total_holdings_value",
-            "holdings_value",
-            "holdingsValue",
-            "holdings_usd",
-        ],
-    )
+    return _safe_float_from_dict(data, ["exposure_usd", "holdings_value", "total_holdings_value", "holdings_usd"])
+
+
+def _crypto_account_value_usd(hub_dir: str) -> float:
+    account = _trader_data_account(hub_dir)
+    if isinstance(account, dict) and account:
+        return _safe_float_from_dict(account, ["total_account_value", "account_value_usd", "equity", "nav"])
+    data = _safe_read_json(os.path.join(hub_dir, "trader_data.json"))
+    if not isinstance(data, dict):
+        return 0.0
+    return _safe_float_from_dict(data, ["account_value_usd", "equity", "nav"])
 
 
 def _market_status_exposure_usd(hub_dir: str, market_key: str) -> float:
@@ -278,6 +374,41 @@ def _market_status_exposure_usd(hub_dir: str, market_key: str) -> float:
     if not isinstance(data, dict):
         return 0.0
     return _safe_float_from_dict(data, ["exposure_usd", "total_positions_value_usd", "positions_value_usd"])
+
+
+def _market_status_account_value_usd(hub_dir: str, market_key: str) -> float:
+    mk = str(market_key or "").strip().lower()
+    if mk == "crypto":
+        return _crypto_account_value_usd(hub_dir)
+    if mk == "forex":
+        path = os.path.join(hub_dir, "forex", "forex_trader_status.json")
+    else:
+        path = os.path.join(hub_dir, "stocks", "stock_trader_status.json")
+    data = _safe_read_json(path)
+    if not isinstance(data, dict):
+        return 0.0
+    account = data.get("account", {})
+    account_dict = account if isinstance(account, dict) else {}
+    return max(
+        0.0,
+        _safe_float_from_dict(data, ["account_value_usd", "equity", "nav"]),
+        _safe_float_from_dict(account_dict, ["total_account_value", "account_value_usd", "equity", "nav"]),
+    )
+
+
+def _portfolio_account_value_usd(
+    hub_dir: str,
+    *,
+    current_market: str,
+    current_account_value_usd: float,
+) -> float:
+    current_key = str(current_market or "").strip().lower()
+    total = max(0.0, float(current_account_value_usd or 0.0))
+    for mk in ("crypto", "stocks", "forex"):
+        if mk == current_key:
+            continue
+        total += max(0.0, _market_status_account_value_usd(hub_dir, mk))
+    return float(total)
 
 
 def _stock_candidates_from_thinker(thinker: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -369,6 +500,128 @@ def _effective_reject_pressure(settings: Dict[str, Any], thinker: Dict[str, Any]
     return effective, raw_rate
 
 
+def _stock_alignment_snapshot(
+    symbol: str,
+    candidate_lookup: Dict[str, Dict[str, Any]],
+    required_score: float,
+) -> Dict[str, Any]:
+    sym = str(symbol or "").strip().upper()
+    cand = candidate_lookup.get(sym, {}) if isinstance(candidate_lookup, dict) else {}
+    reasons: List[str] = []
+    side = "watch"
+    score = 0.0
+    eligible = False
+    data_quality_ok = True
+    entry_gate_reason = ""
+    if not isinstance(cand, dict) or (not cand):
+        reasons.append("symbol is no longer in the active stock scanner set")
+        return {
+            "aligned": False,
+            "reasons": reasons,
+            "side": side,
+            "score": score,
+            "eligible_for_entry": eligible,
+            "data_quality_ok": data_quality_ok,
+            "entry_gate_reason": entry_gate_reason,
+        }
+    side = str(cand.get("side", "watch") or "watch").strip().lower()
+    try:
+        score = float(cand.get("score", 0.0) or 0.0)
+    except Exception:
+        score = 0.0
+    eligible = bool(cand.get("eligible_for_entry", True))
+    data_quality_ok = bool(cand.get("data_quality_ok", True))
+    entry_gate_reason = str(cand.get("entry_gate_reason", "") or "").strip()
+    if side != "long":
+        reasons.append(f"scanner side is {side.upper()}")
+    if score < float(required_score):
+        reasons.append(f"score {score:.4f} is below active threshold {float(required_score):.4f}")
+    if not eligible:
+        reasons.append("scanner marked symbol as not eligible for entry")
+    if not data_quality_ok:
+        reasons.append("scanner marked symbol data quality as degraded")
+    if entry_gate_reason:
+        reasons.append(f"entry gate active: {entry_gate_reason}")
+    return {
+        "aligned": bool(len(reasons) == 0),
+        "reasons": reasons,
+        "side": side,
+        "score": float(score),
+        "eligible_for_entry": bool(eligible),
+        "data_quality_ok": bool(data_quality_ok),
+        "entry_gate_reason": entry_gate_reason,
+    }
+
+
+def _stock_exit_gate_decision(
+    *,
+    symbol: str,
+    entry_ts: float,
+    now_ts: int,
+    pnl_pct: float,
+    mfe_pct: float,
+    candidate_lookup: Dict[str, Dict[str, Any]],
+    min_hold_minutes: int,
+    same_day_exception_enabled: bool,
+    same_day_exception_min_hold_minutes: int,
+    same_day_exception_min_pnl_pct: float,
+    same_day_exception_min_pullback_pct: float,
+    same_day_exception_require_score_flip: bool,
+    same_day_score_floor: float,
+    pdt_restricted: bool,
+    pdt_max_day_trades_rolling_5d: int,
+    day_trades_rolling_5d: int,
+) -> Dict[str, Any]:
+    hold_s = max(0, int(float(now_ts) - float(entry_ts or now_ts)))
+    same_day_roundtrip = _same_et_day(entry_ts, now_ts)
+    hold_gate_block = ""
+    intraday_exception_used = False
+    if same_day_roundtrip and hold_s < (max(0, int(min_hold_minutes)) * 60):
+        min_exc_hold_s = max(0, int(same_day_exception_min_hold_minutes)) * 60
+        if not bool(same_day_exception_enabled):
+            hold_gate_block = f"Exit delayed to next session due to stock day-trade protection ({symbol})"
+        elif hold_s < min_exc_hold_s:
+            hold_gate_block = (
+                f"Exit delayed to next session due to stock day-trade protection "
+                f"({symbol} held {int(hold_s // 60)}m; need >= {int(same_day_exception_min_hold_minutes)}m)"
+            )
+        elif bool(pdt_restricted) and int(pdt_max_day_trades_rolling_5d) > 0 and int(day_trades_rolling_5d) >= int(pdt_max_day_trades_rolling_5d):
+            hold_gate_block = (
+                "Exit delayed to next session due to stock day-trade protection "
+                f"(rolling cap {int(day_trades_rolling_5d)}/{int(pdt_max_day_trades_rolling_5d)})"
+            )
+        elif float(pnl_pct) < float(same_day_exception_min_pnl_pct):
+            hold_gate_block = (
+                f"PDT hold gate: boom exception needs pnl >= {float(same_day_exception_min_pnl_pct):.2f}% for {symbol}"
+            )
+        elif (float(mfe_pct) - float(pnl_pct)) < float(same_day_exception_min_pullback_pct):
+            hold_gate_block = (
+                f"PDT hold gate: boom exception needs pullback >= {float(same_day_exception_min_pullback_pct):.2f}% for {symbol}"
+            )
+        else:
+            cand = candidate_lookup.get(symbol, {}) if isinstance(candidate_lookup.get(symbol, {}), dict) else {}
+            cand_side = str(cand.get("side", "watch") or "watch").strip().lower()
+            try:
+                cand_score = float(cand.get("score", 0.0) or 0.0)
+            except Exception:
+                cand_score = 0.0
+            score_flip_confirmed = bool((cand_side != "long") or (cand_score < float(same_day_score_floor)))
+            if bool(same_day_exception_require_score_flip) and (not score_flip_confirmed):
+                hold_gate_block = (
+                    "PDT hold gate: momentum still long; no dip-risk confirmation "
+                    f"for {symbol} (score {cand_score:.4f} >= floor {float(same_day_score_floor):.4f})"
+                )
+            else:
+                intraday_exception_used = True
+    return {
+        "hold_s": int(hold_s),
+        "same_day_roundtrip": bool(same_day_roundtrip),
+        "blocked": bool(hold_gate_block),
+        "block_reason": str(hold_gate_block),
+        "intraday_exception_used": bool(intraday_exception_used),
+    }
+
+
 def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     stocks_dir = os.path.join(hub_dir, "stocks")
     os.makedirs(stocks_dir, exist_ok=True)
@@ -421,6 +674,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     max_total_exposure_pct = max(0.0, float(settings.get("stock_max_total_exposure_pct", 0.0) or 0.0))
     max_daily_loss_usd = max(0.0, float(settings.get("stock_max_daily_loss_usd", 0.0) or 0.0))
     max_daily_loss_pct = max(0.0, float(settings.get("stock_max_daily_loss_pct", 0.0) or 0.0))
+    max_loss_streak_setting = max(0, int(float(settings.get("stock_max_loss_streak", 3) or 3)))
     block_cached_scan = bool(settings.get("stock_block_entries_on_cached_scan", True))
     require_data_quality_ok = bool(settings.get("stock_require_data_quality_ok_for_entries", True))
     try:
@@ -472,6 +726,10 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     top_pick = candidate_rows[0] if candidate_rows else {}
     adaptive_thr_hint = float(thinker.get("adaptive_threshold", score_threshold) or score_threshold)
     same_day_score_floor = max(0.0, float(adaptive_thr_hint) * float(same_day_exception_score_floor_mult))
+    alignment_required_score = (
+        (adaptive_thr_hint if adaptive_thr_hint > 0 else score_threshold)
+        * (guarded_score_mult if live_guarded else 1.0)
+    )
 
     today = time.strftime("%Y-%m-%d", time.localtime(now_ts))
     state = _safe_read_json(state_path)
@@ -485,6 +743,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     last_divergence_msg = str(state.get("last_divergence_msg", "") or "")
     open_meta = state.get("open_meta", {}) or {}
     pending = state.get("pending", {}) or {}
+    stale_alignment_streaks_raw = state.get("stale_alignment_streaks", {}) or {}
     if not isinstance(trail_state, dict):
         trail_state = {}
     if not isinstance(opened_today, dict):
@@ -497,6 +756,8 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         open_meta = {}
     if not isinstance(pending, dict):
         pending = {}
+    if not isinstance(stale_alignment_streaks_raw, dict):
+        stale_alignment_streaks_raw = {}
     legacy_day_trades_today = int(float(day_trades.get(today, 0) or 0))
     day_trades_today = max(legacy_day_trades_today, _count_events_on_et_day(day_trade_events, now_ts))
     day_trades = {today: day_trades_today}
@@ -517,6 +778,17 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     opened_today = normalized_opened_today
     cooldown_until = {str(k).upper(): float(v) for k, v in cooldown_until.items() if str(k).strip()}
     open_meta = {str(k).upper(): (v if isinstance(v, dict) else {}) for k, v in open_meta.items() if str(k).strip()}
+    stale_alignment_streaks: Dict[str, int] = {}
+    for k, v in stale_alignment_streaks_raw.items():
+        symbol = str(k or "").strip().upper()
+        if not symbol:
+            continue
+        try:
+            streak = max(0, int(float(v) or 0))
+        except Exception:
+            streak = 0
+        if streak > 0:
+            stale_alignment_streaks[symbol] = int(streak)
     loss_size_scale = max(loss_size_floor_pct, 1.0 - (loss_size_step_pct * float(max(0, loss_streak))))
     trade_notional_effective = max(1.0, float(trade_notional) * float(loss_size_scale))
     fallback_active = bool(thinker.get("fallback_cached", False)) if isinstance(thinker, dict) else False
@@ -525,6 +797,8 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     except Exception:
         fallback_age_s = 0
     thinker_reject_rate_pct, thinker_reject_rate_raw_pct = _effective_reject_pressure(settings, thinker if isinstance(thinker, dict) else {})
+    runtime_state = _safe_read_json(os.path.join(hub_dir, "runtime_state.json"))
+    runtime_alerts = runtime_state.get("alerts", {}) if isinstance(runtime_state.get("alerts", {}), dict) else {}
     entry_size_scale = 1.0
     if fallback_active and (not block_cached_scan):
         entry_size_scale = float(cached_scan_entry_size_mult)
@@ -541,14 +815,73 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     prices = client.get_mid_prices(sorted(all_symbols))
     acct = client.get_account_summary()
     equity = float(acct.get("equity", 0.0) or 0.0) if isinstance(acct, dict) else 0.0
+    buying_power_usd = float(acct.get("buying_power", 0.0) or 0.0) if isinstance(acct, dict) else 0.0
     total_positions_value = sum(max(0.0, float(pos.get("market_value", 0.0) or 0.0)) for pos in positions.values())
     pdt_window_start_ts = _pdt_window_start_ts(now_ts, trading_days=5)
     day_trades_rolling_5d = _count_events_in_window(day_trade_events, pdt_window_start_ts, now_ts)
-    pdt_restricted = bool(pdt_equity_threshold_usd > 0.0 and equity > 0.0 and equity < pdt_equity_threshold_usd)
-
-    actions: List[str] = []
     thinker_health = thinker.get("health", {}) if isinstance(thinker, dict) else {}
     thinker_data_ok = bool((thinker_health or {}).get("data_ok", True))
+    signal_age_policy_s = max(0, int(now_ts - int(float(thinker.get("updated_at", now_ts) or now_ts))))
+    max_signal_age_policy_s = max(30, int(float(settings.get("stock_max_signal_age_seconds", 300) or 300)))
+    stale_alignment_data_ok = bool(thinker_data_ok) and (signal_age_policy_s <= max_signal_age_policy_s)
+    if fallback_active and fallback_age_s > cached_scan_hard_block_age_s:
+        stale_alignment_data_ok = False
+    compliance_state = stock_compliance_state(
+        acct if isinstance(acct, dict) else {},
+        equity_usd=equity,
+        pdt_equity_threshold_usd=pdt_equity_threshold_usd,
+        day_trades_rolling_5d=day_trades_rolling_5d,
+        pdt_max_day_trades_rolling_5d=pdt_max_day_trades_rolling_5d,
+    )
+    pdt_restricted = bool(compliance_state.get("pdt_restricted", False))
+    policy = build_market_automation_policy(
+        market="stocks",
+        settings=settings,
+        profile_key=settings.get("settings_profile", "balanced"),
+        broker_mode=_broker_mode_label(settings),
+        account_value_usd=equity,
+        buying_power_usd=buying_power_usd,
+        open_positions=len(positions),
+        runtime_alerts=runtime_alerts,
+        market_health=thinker_health,
+        compliance_state=compliance_state,
+        reject_rate_pct=thinker_reject_rate_pct,
+        reject_rate_limit_pct=reject_rate_gate_pct,
+        fallback_active=fallback_active,
+        fallback_age_s=fallback_age_s,
+        fallback_hard_block_age_s=cached_scan_hard_block_age_s,
+        loss_streak=loss_streak,
+        max_loss_streak=max_loss_streak_setting,
+    )
+    policy_size_scale = max(0.2, float(policy.get("size_multiplier", 1.0) or 1.0))
+    trade_notional_entry = max(1.0, float(trade_notional_entry) * float(policy_size_scale))
+    policy_block_reason = ""
+    if not bool(policy.get("allow_new_entries", True)):
+        policy_block_reason = str(compliance_state.get("entry_block_reason", "") or "").strip()
+        if not policy_block_reason:
+            policy_block_reason = "Runtime trust is degraded; pausing new stock entries"
+    try:
+        stale_exit_enabled = bool(settings.get("stock_stale_exit_enabled", True))
+    except Exception:
+        stale_exit_enabled = True
+    try:
+        stale_exit_grace_cycles = max(1, int(float(settings.get("stock_stale_alignment_grace_cycles", 2) or 2)))
+    except Exception:
+        stale_exit_grace_cycles = 2
+    try:
+        stale_exit_max_per_cycle = max(1, int(float(settings.get("stock_stale_max_exits_per_cycle", 1) or 1)))
+    except Exception:
+        stale_exit_max_per_cycle = 1
+    try:
+        stale_exit_min_notional_usd = max(1.0, float(settings.get("stock_stale_min_notional_usd", 5.0) or 5.0))
+    except Exception:
+        stale_exit_min_notional_usd = 5.0
+    stale_exit_events: List[Dict[str, Any]] = []
+    stale_exit_count = 0
+    skip_new_entries_this_cycle = False
+    stale_exit_refresh_msg = ""
+
+    actions: List[str] = []
     drift_warning = False
     # Reconciliation for prior pending submissions.
     if pending:
@@ -584,47 +917,169 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         if pnl >= profit_target_pct:
             armed = True
             peak = max(peak, pnl)
+        align_snapshot = _stock_alignment_snapshot(
+            symbol,
+            candidate_lookup=candidate_lookup,
+            required_score=float(alignment_required_score),
+        )
+        align_reasons = [str(x) for x in list(align_snapshot.get("reasons", []) or []) if str(x).strip()]
+        if bool(stale_alignment_data_ok):
+            if bool(align_snapshot.get("aligned", True)):
+                stale_alignment_streaks.pop(symbol, None)
+            else:
+                stale_alignment_streaks[symbol] = int(stale_alignment_streaks.get(symbol, 0) or 0) + 1
+        stale_streak = int(stale_alignment_streaks.get(symbol, 0) or 0)
+        should_force_stale_exit = (
+            bool(stale_alignment_data_ok)
+            and bool(stale_exit_enabled)
+            and (not bool(align_snapshot.get("aligned", True)))
+            and stale_streak >= int(stale_exit_grace_cycles)
+            and stale_exit_count < int(stale_exit_max_per_cycle)
+        )
+        if should_force_stale_exit:
+            reason_text = "; ".join([str(r) for r in align_reasons[:2]]) or "position no longer matches current stock strategy"
+            hold_gate = _stock_exit_gate_decision(
+                symbol=symbol,
+                entry_ts=entry_ts,
+                now_ts=now_ts,
+                pnl_pct=pnl,
+                mfe_pct=mfe,
+                candidate_lookup=candidate_lookup,
+                min_hold_minutes=min_hold_minutes,
+                same_day_exception_enabled=same_day_exception_enabled,
+                same_day_exception_min_hold_minutes=same_day_exception_min_hold_minutes,
+                same_day_exception_min_pnl_pct=same_day_exception_min_pnl_pct,
+                same_day_exception_min_pullback_pct=same_day_exception_min_pullback_pct,
+                same_day_exception_require_score_flip=same_day_exception_require_score_flip,
+                same_day_score_floor=same_day_score_floor,
+                pdt_restricted=pdt_restricted,
+                pdt_max_day_trades_rolling_5d=pdt_max_day_trades_rolling_5d,
+                day_trades_rolling_5d=day_trades_rolling_5d,
+            )
+            hold_s = int(hold_gate.get("hold_s", 0) or 0)
+            same_day_roundtrip = bool(hold_gate.get("same_day_roundtrip", False))
+            hold_gate_block = str(hold_gate.get("block_reason", "") or "")
+            intraday_exception_used = bool(hold_gate.get("intraday_exception_used", False))
+            if hold_gate_block:
+                actions.append(f"HOLD {symbol} | {hold_gate_block}")
+                trail_state[symbol] = {"armed": armed, "peak_pct": peak, "last_pnl_pct": pnl, "updated_at": now_ts}
+                stale_exit_events.append(
+                    {
+                        "symbol": str(symbol),
+                        "ok": False,
+                        "reason": "stale_exit_hold_gate",
+                        "detail": hold_gate_block,
+                        "streak": int(stale_streak),
+                        "reasons": [str(r) for r in align_reasons[:3]],
+                    }
+                )
+                continue
+            position_value_usd = max(0.0, float(qty) * float(mid))
+            if position_value_usd < float(stale_exit_min_notional_usd):
+                stale_exit_events.append(
+                    {
+                        "symbol": str(symbol),
+                        "ok": False,
+                        "reason": "stale_exit_notional_guard",
+                        "detail": (
+                            f"Alignment stale but notional guard blocked exit "
+                            f"({position_value_usd:.2f} USD < {float(stale_exit_min_notional_usd):.2f} USD)."
+                        ),
+                        "streak": int(stale_streak),
+                        "reasons": [str(r) for r in align_reasons[:3]],
+                    }
+                )
+                trail_state[symbol] = {"armed": armed, "peak_pct": peak, "last_pnl_pct": pnl, "updated_at": now_ts}
+                continue
+            if intraday_exception_used:
+                actions.append(
+                    f"INTRADAY EXIT EXCEPTION {symbol} | pnl {pnl:.2f}% from peak {mfe:.2f}% "
+                    f"(pullback {max(0.0, mfe - pnl):.2f}%)"
+                )
+            ok, msg, payload = client.close_position(symbol)
+            actions.append(f"POLICY STALE EXIT {symbol} | {'OK' if ok else 'FAIL'} | {msg}")
+            _append_jsonl(
+                audit_path,
+                {
+                    "ts": now_ts,
+                    "date": today,
+                    "event": "exit" if ok else "exit_fail",
+                    "source": "policy_stale_exit",
+                    "symbol": symbol,
+                    "side": "sell",
+                    "qty": qty,
+                    "avg_entry_price": avg,
+                    "price": mid,
+                    "pnl_pct": pnl,
+                    "pnl_usd": pnl_usd,
+                    "mfe_pct": round(mfe, 4),
+                    "mae_pct": round(mae, 4),
+                    "hold_s": hold_s,
+                    "same_day_roundtrip": bool(same_day_roundtrip),
+                    "intraday_exception_used": bool(intraday_exception_used),
+                    "stale_alignment_streak": int(stale_streak),
+                    "stale_alignment_reasons": [str(r) for r in align_reasons[:3]],
+                    "ok": ok,
+                    "msg": msg,
+                    "payload": payload if isinstance(payload, dict) else {},
+                },
+            )
+            if ok:
+                stale_exit_count += 1
+                skip_new_entries_this_cycle = True
+                trail_state.pop(symbol, None)
+                open_meta.pop(symbol, None)
+                stale_alignment_streaks.pop(symbol, None)
+                if same_day_roundtrip:
+                    day_trades_today += 1
+                    day_trades[today] = day_trades_today
+                    day_trade_events.append(int(now_ts))
+                    day_trade_events = _normalize_event_timestamps(day_trade_events, now_ts=now_ts, keep_days=45)
+                    day_trades_rolling_5d = _count_events_in_window(day_trade_events, pdt_window_start_ts, now_ts)
+                opened_today.pop(symbol, None)
+                if pnl_usd < 0:
+                    loss_streak += 1
+                    cooldown_until[symbol] = float(now_ts + max(60, int(float(settings.get("stock_loss_cooldown_seconds", 1800) or 1800))))
+                else:
+                    loss_streak = 0
+            else:
+                trail_state[symbol] = {"armed": armed, "peak_pct": peak, "last_pnl_pct": pnl, "updated_at": now_ts}
+            stale_exit_events.append(
+                {
+                    "symbol": str(symbol),
+                    "ok": bool(ok),
+                    "reason": ("policy_stale_exit" if ok else "broker_close_failed"),
+                    "detail": reason_text,
+                    "streak": int(stale_streak),
+                    "reasons": [str(r) for r in align_reasons[:3]],
+                }
+            )
+            continue
         if armed:
             peak = max(peak, pnl)
             if pnl <= (peak - trailing_gap_pct):
-                hold_s = max(0, int(now_ts - entry_ts))
-                same_day_roundtrip = _same_et_day(entry_ts, now_ts)
-                hold_gate_block = ""
-                intraday_exception_used = False
-                if same_day_roundtrip and hold_s < (max(0, min_hold_minutes) * 60):
-                    min_exc_hold_s = max(0, same_day_exception_min_hold_minutes) * 60
-                    if not same_day_exception_enabled:
-                        hold_gate_block = f"PDT hold gate: same-day exits disabled for {symbol}"
-                    elif hold_s < min_exc_hold_s:
-                        hold_gate_block = (
-                            f"PDT hold gate: {symbol} held {int(hold_s // 60)}m; "
-                            f"need >= {int(same_day_exception_min_hold_minutes)}m before exception"
-                        )
-                    elif pdt_restricted and pdt_max_day_trades_rolling_5d > 0 and day_trades_rolling_5d >= pdt_max_day_trades_rolling_5d:
-                        hold_gate_block = (
-                            "PDT guard: rolling 5-day day-trade cap reached "
-                            f"({day_trades_rolling_5d}/{pdt_max_day_trades_rolling_5d})"
-                        )
-                    elif pnl < same_day_exception_min_pnl_pct:
-                        hold_gate_block = (
-                            f"PDT hold gate: boom exception needs pnl >= {same_day_exception_min_pnl_pct:.2f}% for {symbol}"
-                        )
-                    elif (mfe - pnl) < same_day_exception_min_pullback_pct:
-                        hold_gate_block = (
-                            f"PDT hold gate: boom exception needs pullback >= {same_day_exception_min_pullback_pct:.2f}% for {symbol}"
-                        )
-                    else:
-                        cand = candidate_lookup.get(symbol, {}) if isinstance(candidate_lookup.get(symbol, {}), dict) else {}
-                        cand_side = str(cand.get("side", "watch") or "watch").strip().lower()
-                        cand_score = float(cand.get("score", 0.0) or 0.0)
-                        score_flip_confirmed = bool((cand_side != "long") or (cand_score < same_day_score_floor))
-                        if same_day_exception_require_score_flip and (not score_flip_confirmed):
-                            hold_gate_block = (
-                                "PDT hold gate: momentum still long; no dip-risk confirmation "
-                                f"for {symbol} (score {cand_score:.4f} >= floor {same_day_score_floor:.4f})"
-                            )
-                        else:
-                            intraday_exception_used = True
+                hold_gate = _stock_exit_gate_decision(
+                    symbol=symbol,
+                    entry_ts=entry_ts,
+                    now_ts=now_ts,
+                    pnl_pct=pnl,
+                    mfe_pct=mfe,
+                    candidate_lookup=candidate_lookup,
+                    min_hold_minutes=min_hold_minutes,
+                    same_day_exception_enabled=same_day_exception_enabled,
+                    same_day_exception_min_hold_minutes=same_day_exception_min_hold_minutes,
+                    same_day_exception_min_pnl_pct=same_day_exception_min_pnl_pct,
+                    same_day_exception_min_pullback_pct=same_day_exception_min_pullback_pct,
+                    same_day_exception_require_score_flip=same_day_exception_require_score_flip,
+                    same_day_score_floor=same_day_score_floor,
+                    pdt_restricted=pdt_restricted,
+                    pdt_max_day_trades_rolling_5d=pdt_max_day_trades_rolling_5d,
+                    day_trades_rolling_5d=day_trades_rolling_5d,
+                )
+                hold_s = int(hold_gate.get("hold_s", 0) or 0)
+                same_day_roundtrip = bool(hold_gate.get("same_day_roundtrip", False))
+                hold_gate_block = str(hold_gate.get("block_reason", "") or "")
+                intraday_exception_used = bool(hold_gate.get("intraday_exception_used", False))
                 if hold_gate_block:
                     actions.append(f"HOLD {symbol} | {hold_gate_block}")
                     trail_state[symbol] = {"armed": armed, "peak_pct": peak, "last_pnl_pct": pnl, "updated_at": now_ts}
@@ -678,24 +1133,41 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                     trail_state[symbol] = {"armed": armed, "peak_pct": peak, "last_pnl_pct": pnl, "updated_at": now_ts}
                 continue
         trail_state[symbol] = {"armed": armed, "peak_pct": peak, "last_pnl_pct": pnl, "updated_at": now_ts}
+    for tracked_symbol in list(stale_alignment_streaks.keys()):
+        if str(tracked_symbol or "").strip().upper() not in positions:
+            stale_alignment_streaks.pop(str(tracked_symbol or "").strip().upper(), None)
+    if stale_exit_count > 0:
+        stale_exit_refresh_msg = (
+            f"Exited {stale_exit_count} stale stock position(s); waiting one cycle before new entries."
+        )
 
     signal_symbol = top_symbol
     signal_side = str(top_pick.get("side", "watch") or "watch").strip().lower()
     signal_score = float(top_pick.get("score", 0.0) or 0.0)
     entry_fail_reasons: List[str] = []
+    trade_quality_eval: Dict[str, Any] = {}
+    opportunity_eval: Dict[str, Any] = {}
     entry_msg = "Auto-trade disabled (paper-safe)"
     if auto_enabled:
         signal_age_s = max(0, int(now_ts - int(float(thinker.get("updated_at", now_ts) or now_ts))))
         max_signal_age_s = max(30, int(float(settings.get("stock_max_signal_age_seconds", 300) or 300)))
         min_bars_required = max(8, int(float(settings.get("stock_min_bars_required", 24) or 24)))
         min_samples_guarded = max(0, int(float(settings.get("stock_min_samples_live_guarded", 5) or 5)))
-        adaptive_thr = float(thinker.get("adaptive_threshold", score_threshold) or score_threshold)
-        required_score = ((adaptive_thr if adaptive_thr > 0 else score_threshold) * (guarded_score_mult if live_guarded else 1.0))
+        required_score = float(alignment_required_score)
         max_slippage_bps = max(0.0, float(settings.get("stock_max_slippage_bps", 35.0) or 35.0))
-        max_loss_streak = max(0, int(float(settings.get("stock_max_loss_streak", 3) or 3)))
         global_cap_pct = max(0.0, float(settings.get("market_max_total_exposure_pct", 0.0) or 0.0))
         crypto_exposure_usd = _crypto_holdings_usd(hub_dir)
         forex_exposure_usd = _market_status_exposure_usd(hub_dir, "forex")
+        cross_market_exposure_usd = (
+            float(total_positions_value)
+            + float(max(0.0, crypto_exposure_usd))
+            + float(max(0.0, forex_exposure_usd))
+        )
+        cross_market_cap_basis_usd = _portfolio_account_value_usd(
+            hub_dir,
+            current_market="stocks",
+            current_account_value_usd=float(equity),
+        )
         if signal_age_s > max_signal_age_s:
             entry_msg = f"Signal stale ({signal_age_s}s > {max_signal_age_s}s)"
         elif require_data_quality_ok and (not thinker_data_ok):
@@ -706,10 +1178,14 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             entry_msg = f"Thinker cached fallback too old ({fallback_age_s}s > {cached_scan_hard_block_age_s}s)"
         elif block_cached_scan and fallback_active:
             entry_msg = f"Thinker cached fallback active ({fallback_age_s}s); blocking new entries"
-        elif max_loss_streak > 0 and loss_streak >= max_loss_streak:
-            entry_msg = f"Loss-streak guard active ({loss_streak}/{max_loss_streak})"
+        elif max_loss_streak_setting > 0 and loss_streak >= max_loss_streak_setting:
+            entry_msg = f"Loss-streak guard active ({loss_streak}/{max_loss_streak_setting})"
+        elif policy_block_reason:
+            entry_msg = policy_block_reason
+        elif skip_new_entries_this_cycle:
+            entry_msg = stale_exit_refresh_msg or "Stale stock exit cooldown: waiting one cycle before new entries"
         elif max_day_trades > 0 and day_trades_today >= max_day_trades:
-            entry_msg = f"PDT guard: day-trade cap reached ({day_trades_today}/{max_day_trades})"
+            entry_msg = f"Blocked to avoid PDT violation risk ({day_trades_today}/{max_day_trades} intraday round trips)"
         elif not _market_open_now():
             entry_msg = "Market hours gate: market closed"
         elif _near_close_blocked(settings):
@@ -718,7 +1194,11 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             entry_msg = "Daily loss guard active: blocking new entries"
         elif enable_risk_caps and max_total_exposure_pct > 0.0 and equity > 0.0 and (((total_positions_value + trade_notional_entry) / equity) * 100.0) > max_total_exposure_pct:
             entry_msg = f"Risk cap: projected exposure exceeds {max_total_exposure_pct:.2f}%"
-        elif global_cap_pct > 0.0 and equity > 0.0 and (((total_positions_value + trade_notional_entry + crypto_exposure_usd + forex_exposure_usd) / equity) * 100.0) > global_cap_pct:
+        elif (
+            global_cap_pct > 0.0
+            and cross_market_cap_basis_usd > 0.0
+            and (((cross_market_exposure_usd + trade_notional_entry) / cross_market_cap_basis_usd) * 100.0) > global_cap_pct
+        ):
             entry_msg = f"Global cap: projected cross-market exposure exceeds {global_cap_pct:.2f}%"
         elif not enable_exec_v2:
             entry_msg = "Execution gated by rollout stage"
@@ -734,6 +1214,9 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             selected_calib_prob = 0.0
             selected_samples = 0
             selected_bars = 0
+            selected_trade_notional = float(trade_notional_entry)
+            selected_quality_eval: Dict[str, Any] = {}
+            selected_opportunity_eval: Dict[str, Any] = {}
             for cand in candidate_rows:
                 symbol = str((cand or {}).get("symbol", "") or "").strip().upper()
                 if not symbol:
@@ -777,6 +1260,120 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                     fail = f"Slippage guard for {symbol}: spread {spread_bps:.2f}bps > {max_slippage_bps:.2f}bps"
                 elif enable_risk_caps and max_pos_usd > 0.0 and (float(positions.get(symbol, {}).get("market_value", 0.0) or 0.0) + trade_notional_entry) > max_pos_usd:
                     fail = f"Risk cap: {symbol} projected position exceeds ${max_pos_usd:.2f}"
+                quality_eval: Dict[str, Any] = {}
+                if not fail:
+                    projected_exposure_pct = (
+                        (((total_positions_value + trade_notional_entry) / equity) * 100.0) if equity > 0.0 else 0.0
+                    )
+                    quality_eval = evaluate_trade_quality(
+                        market="stocks",
+                        signal_score=score,
+                        required_score=required_score,
+                        data_quality_ok=bool(cand.get("data_quality_ok", True)) and bool(thinker_data_ok),
+                        broker_ok=True,
+                        runtime_trust_score=float(
+                            (
+                                (policy.get("runtime_trust", {}) if isinstance(policy.get("runtime_trust", {}), dict) else {}).get(
+                                    "score",
+                                    0.0,
+                                )
+                            )
+                            or 0.0
+                        ),
+                        runtime_alert_severity=str(runtime_alerts.get("severity", "ok") or "ok"),
+                        compliance_allowed=bool(policy.get("allow_new_entries", True)),
+                        compliance_reason=str(
+                            policy_block_reason
+                            or compliance_state.get("entry_block_reason", "")
+                            or compliance_state.get("status_text", "")
+                            or "Stock compliance protection active"
+                        ),
+                        fallback_active=bool(fallback_active),
+                        fallback_age_s=int(fallback_age_s),
+                        fallback_hard_block_age_s=int(cached_scan_hard_block_age_s),
+                        reject_rate_pct=float(thinker_reject_rate_pct),
+                        reject_rate_limit_pct=float(reject_rate_gate_pct),
+                        spread_bps=float(spread_bps),
+                        max_slippage_bps=float(max_slippage_bps),
+                        loss_streak=int(loss_streak),
+                        max_loss_streak=int(max_loss_streak_setting),
+                        exposure_usage_pct=float(projected_exposure_pct),
+                        min_runtime_trust_score=35.0,
+                        min_confidence_score=42.0,
+                    )
+                    if str(quality_eval.get("decision", "block") or "block").strip().lower() != "allow":
+                        q_reasons = quality_eval.get("block_reasons", []) if isinstance(quality_eval.get("block_reasons", []), list) else []
+                        q_reason = str((q_reasons[0] if q_reasons else "trade quality gate blocked entry") or "").strip()
+                        trade_quality_eval = dict(quality_eval)
+                        fail = f"Trade-quality gate: {q_reason}"
+                    else:
+                        quality_size_mult = max(0.20, min(1.0, float(quality_eval.get("size_multiplier", 1.0) or 1.0)))
+                        proposed_notional = max(1.0, float(trade_notional_entry) * quality_size_mult)
+                        if enable_risk_caps and max_pos_usd > 0.0 and (
+                            float(positions.get(symbol, {}).get("market_value", 0.0) or 0.0) + proposed_notional
+                        ) > max_pos_usd:
+                            fail = f"Risk cap: {symbol} projected position exceeds ${max_pos_usd:.2f}"
+                        elif (
+                            enable_risk_caps
+                            and max_total_exposure_pct > 0.0
+                            and equity > 0.0
+                            and (((total_positions_value + proposed_notional) / equity) * 100.0) > max_total_exposure_pct
+                        ):
+                            fail = f"Risk cap: projected exposure exceeds {max_total_exposure_pct:.2f}%"
+                        elif (
+                            global_cap_pct > 0.0
+                            and cross_market_cap_basis_usd > 0.0
+                            and (
+                                (
+                                    (cross_market_exposure_usd + proposed_notional)
+                                    / cross_market_cap_basis_usd
+                                )
+                                * 100.0
+                            )
+                            > global_cap_pct
+                        ):
+                            fail = f"Global cap: projected cross-market exposure exceeds {global_cap_pct:.2f}%"
+                        else:
+                            allocator_eval = evaluate_cross_market_allocation(
+                                hub_dir=hub_dir,
+                                settings=settings,
+                                market="stocks",
+                                candidate_id=symbol,
+                                candidate_side=side,
+                                signal_score=float(score),
+                                required_score=float(required_score),
+                                trade_quality=quality_eval,
+                                automation_policy=policy,
+                                projected_trade_value_usd=float(proposed_notional),
+                                market_exposure_usd=float(total_positions_value),
+                                account_value_usd=float(equity),
+                                buying_power_usd=float(buying_power_usd),
+                                spread_bps=float(spread_bps),
+                                max_slippage_bps=float(max_slippage_bps),
+                                candidate_age_s=int(signal_age_s),
+                                loss_streak=int(loss_streak),
+                                max_loss_streak=int(max_loss_streak_setting),
+                                now_ts=int(now_ts),
+                            )
+                            allocator_decision = str(allocator_eval.get("decision", "allow") or "allow").strip().lower()
+                            if allocator_decision != "allow":
+                                opportunity_eval = dict(allocator_eval)
+                                alloc_reason = str(
+                                    allocator_eval.get("summary", "")
+                                    or (
+                                        (allocator_eval.get("reasons", []) if isinstance(allocator_eval.get("reasons", []), list) else [""])
+                                        or [""]
+                                    )[0]
+                                    or "portfolio allocator deprioritized this entry"
+                                ).strip()
+                                fail = f"Portfolio allocator: {alloc_reason}"
+                                trade_quality_eval = dict(quality_eval)
+                            else:
+                                selected_trade_notional = float(proposed_notional)
+                                selected_quality_eval = dict(quality_eval)
+                                trade_quality_eval = dict(quality_eval)
+                                selected_opportunity_eval = dict(allocator_eval)
+                                opportunity_eval = dict(allocator_eval)
                 if fail:
                     fail_reasons.append(fail)
                     continue
@@ -797,7 +1394,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 signal_side = "long"
                 signal_score = selected_score
                 entry_msg = f"SHADOW entry simulated for {selected_symbol}"
-                actions.append(f"SHADOW ENTRY {selected_symbol} BUY ${trade_notional_entry:.2f}")
+                actions.append(f"SHADOW ENTRY {selected_symbol} BUY ${selected_trade_notional:.2f}")
                 _append_jsonl(
                     audit_path,
                     {
@@ -806,9 +1403,12 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                         "event": "shadow_entry",
                         "symbol": selected_symbol,
                         "side": "buy",
-                        "notional": trade_notional_entry,
+                        "notional": selected_trade_notional,
                         "configured_notional": trade_notional,
                         "entry_size_scale": float(round(entry_size_scale, 4)),
+                        "policy_size_scale": float(round(policy_size_scale, 4)),
+                        "trade_quality": selected_quality_eval if isinstance(selected_quality_eval, dict) else {},
+                        "opportunity_allocator": selected_opportunity_eval if isinstance(selected_opportunity_eval, dict) else {},
                         "score": selected_score,
                         "ok": True,
                         "msg": "shadow_only stage",
@@ -822,12 +1422,12 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 ok, msg, payload = client.place_market_order(
                     selected_symbol,
                     side="buy",
-                    notional=trade_notional_entry,
+                    notional=selected_trade_notional,
                     client_order_id=client_id,
                     max_retries=max(1, int(float(settings.get("stock_order_retry_count", 2) or 2))),
                     max_retry_after_s=max(1.0, float(settings.get("broker_order_retry_after_cap_s", 300.0) or 300.0)),
                 )
-                actions.append(f"ENTRY {selected_symbol} BUY ${trade_notional_entry:.2f} | {'OK' if ok else 'FAIL'} | {msg}")
+                actions.append(f"ENTRY {selected_symbol} BUY ${selected_trade_notional:.2f} | {'OK' if ok else 'FAIL'} | {msg}")
                 oid = _parse_order_id(msg, payload if isinstance(payload, dict) else {})
                 retry_after_wait_s = parse_retry_after_value(str(msg or ""), max_wait_s=3600.0)
                 if retry_after_wait_s > 0.0:
@@ -852,9 +1452,12 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                         "event": "entry" if ok else "entry_fail",
                         "symbol": selected_symbol,
                         "side": "buy",
-                        "notional": trade_notional_entry,
+                        "notional": selected_trade_notional,
                         "configured_notional": trade_notional,
                         "entry_size_scale": float(round(entry_size_scale, 4)),
+                        "policy_size_scale": float(round(policy_size_scale, 4)),
+                        "trade_quality": selected_quality_eval if isinstance(selected_quality_eval, dict) else {},
+                        "opportunity_allocator": selected_opportunity_eval if isinstance(selected_opportunity_eval, dict) else {},
                         "score": selected_score,
                         "calib_prob": selected_calib_prob,
                         "samples": selected_samples,
@@ -892,6 +1495,87 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     if auto_enabled and ("Entry placed" not in str(entry_msg)):
         entry_fail_reasons.append(str(entry_msg))
     entry_eval_top_reason, entry_eval_reason_counts = _fail_reason_summary(entry_fail_reasons)
+    runtime_trust = policy.get("runtime_trust", {}) if isinstance(policy.get("runtime_trust", {}), dict) else {}
+    quality_layers = trade_quality_eval.get("layers", {}) if isinstance(trade_quality_eval.get("layers", {}), dict) else {}
+    trade_quality_evaluated = bool(isinstance(trade_quality_eval, dict) and trade_quality_eval)
+    allocator_evaluated = bool(isinstance(opportunity_eval, dict) and opportunity_eval)
+    allocator_reasons = opportunity_eval.get("reasons", []) if isinstance(opportunity_eval.get("reasons", []), list) else []
+    allocator_top_reason = str((allocator_reasons[0] if allocator_reasons else "") or "").strip()
+    trade_confidence_score = float(trade_quality_eval.get("confidence_score", 0.0) or 0.0) if isinstance(trade_quality_eval, dict) else 0.0
+    quality_size_scale = float(trade_quality_eval.get("size_multiplier", 1.0) or 1.0) if isinstance(trade_quality_eval, dict) else 1.0
+    if auto_enabled:
+        cross_market_exposure_effective_usd = float(cross_market_exposure_usd)
+        cross_market_cap_basis_effective_usd = float(cross_market_cap_basis_usd)
+    else:
+        cross_market_exposure_effective_usd = (
+            float(total_positions_value)
+            + float(_crypto_holdings_usd(hub_dir))
+            + float(_market_status_exposure_usd(hub_dir, "forex"))
+        )
+        cross_market_cap_basis_effective_usd = float(
+            _portfolio_account_value_usd(
+                hub_dir,
+                current_market="stocks",
+                current_account_value_usd=float(equity),
+            )
+        )
+    cross_market_exposure_effective_pct = (
+        (cross_market_exposure_effective_usd / max(1e-6, cross_market_cap_basis_effective_usd)) * 100.0
+    )
+    entry_gate_flags = {
+        "data_quality_required": bool(require_data_quality_ok),
+        "data_quality_ok": bool(thinker_data_ok),
+        "reject_rate_pct": float(round(thinker_reject_rate_pct, 4)),
+        "reject_rate_raw_pct": float(round(thinker_reject_rate_raw_pct, 4)),
+        "reject_rate_max_pct": float(round(reject_rate_gate_pct, 4)),
+        "cached_fallback_active": bool(fallback_active),
+        "cached_fallback_age_s": int(fallback_age_s),
+        "cached_fallback_hard_block_age_s": int(cached_scan_hard_block_age_s),
+        "stale_alignment_data_ok": bool(stale_alignment_data_ok),
+        "stale_alignment_signal_age_s": int(signal_age_policy_s),
+        "stale_alignment_max_signal_age_s": int(max_signal_age_policy_s),
+        "pdt_restricted": bool(pdt_restricted),
+        "pdt_equity_threshold_usd": float(round(pdt_equity_threshold_usd, 4)),
+        "day_trades_rolling_5d": int(day_trades_rolling_5d),
+        "pdt_max_day_trades_rolling_5d": int(pdt_max_day_trades_rolling_5d),
+        "same_day_exit_min_hold_minutes": int(min_hold_minutes),
+        "compliance_mode": str(compliance_state.get("mode", "") or ""),
+        "compliance_status": str(compliance_state.get("status_text", "") or ""),
+        "compliance_entry_blocked": bool(compliance_state.get("entry_blocked", False)),
+        "runtime_trust_score": float(round(float(runtime_trust.get("score", 0.0) or 0.0), 4)),
+        "runtime_trust_mode": str(runtime_trust.get("mode", "") or ""),
+        "policy_mode": str(policy.get("mode", "") or ""),
+        "policy_profile": str(policy.get("profile", "") or ""),
+        "policy_size_scale": float(round(policy_size_scale, 4)),
+        "trade_quality_evaluated": bool(trade_quality_evaluated),
+        "trade_quality_decision": str(
+            trade_quality_eval.get("decision", "not_evaluated") if trade_quality_evaluated else "not_evaluated"
+        ),
+        "trade_confidence_score": float(round(trade_confidence_score, 4)),
+        "trade_quality_size_scale": float(round(quality_size_scale, 4)),
+        "portfolio_allocator_evaluated": bool(allocator_evaluated),
+        "portfolio_allocator_decision": str(
+            opportunity_eval.get("decision", "not_evaluated") if allocator_evaluated else "not_evaluated"
+        ),
+        "portfolio_allocator_best_market": str(opportunity_eval.get("best_market", "") or ""),
+        "portfolio_allocator_score": float(round(float(opportunity_eval.get("current_market_score", 0.0) or 0.0), 4)),
+        "portfolio_allocator_top_reason": allocator_top_reason,
+        "portfolio_allocator_capital_constrained": bool(opportunity_eval.get("capital_constrained", False)) if allocator_evaluated else False,
+        "signal_quality_pass": bool(quality_layers.get("signal_quality", False)),
+        "execution_quality_pass": bool(quality_layers.get("execution_quality", False)),
+        "compliance_permission_pass": bool(quality_layers.get("compliance_permission", False)),
+        "runtime_trust_pass": bool(quality_layers.get("runtime_trust", False)),
+        "alignment_required_score": float(round(float(alignment_required_score), 6)),
+        "stale_exit_enabled": bool(stale_exit_enabled),
+        "stale_exit_grace_cycles": int(stale_exit_grace_cycles),
+        "stale_exit_count": int(stale_exit_count),
+        "stale_exit_max_per_cycle": int(stale_exit_max_per_cycle),
+        "stale_exit_min_notional_usd": float(round(float(stale_exit_min_notional_usd), 4)),
+        "skip_new_entries_this_cycle": bool(skip_new_entries_this_cycle),
+        "cross_market_exposure_usd": float(round(cross_market_exposure_effective_usd, 4)),
+        "cross_market_cap_basis_usd": float(round(cross_market_cap_basis_effective_usd, 4)),
+        "cross_market_exposure_pct": float(round(cross_market_exposure_effective_pct, 4)),
+    }
 
     out_state = {
         "trail": trail_state,
@@ -903,28 +1587,20 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "loss_streak": int(loss_streak),
         "open_meta": open_meta,
         "pending": pending,
+        "stale_alignment_streaks": dict(stale_alignment_streaks),
         "last_divergence_ts": int(last_divergence_ts),
         "last_divergence_msg": str(last_divergence_msg),
         "entry_eval_total": int(len(entry_fail_reasons)),
         "entry_eval_top_reason": str(entry_eval_top_reason),
         "entry_eval_reason_counts": dict(entry_eval_reason_counts),
-        "entry_gate_flags": {
-            "data_quality_required": bool(require_data_quality_ok),
-            "data_quality_ok": bool(thinker_data_ok),
-            "reject_rate_pct": float(round(thinker_reject_rate_pct, 4)),
-            "reject_rate_raw_pct": float(round(thinker_reject_rate_raw_pct, 4)),
-            "reject_rate_max_pct": float(round(reject_rate_gate_pct, 4)),
-            "cached_fallback_active": bool(fallback_active),
-            "cached_fallback_age_s": int(fallback_age_s),
-            "cached_fallback_hard_block_age_s": int(cached_scan_hard_block_age_s),
-            "pdt_restricted": bool(pdt_restricted),
-            "pdt_equity_threshold_usd": float(round(pdt_equity_threshold_usd, 4)),
-            "day_trades_rolling_5d": int(day_trades_rolling_5d),
-            "pdt_max_day_trades_rolling_5d": int(pdt_max_day_trades_rolling_5d),
-            "same_day_exit_min_hold_minutes": int(min_hold_minutes),
-        },
+        "automation_policy": policy if isinstance(policy, dict) else {},
+        "trade_quality": trade_quality_eval if isinstance(trade_quality_eval, dict) else {},
+        "opportunity_allocator": opportunity_eval if isinstance(opportunity_eval, dict) else {},
+        "entry_gate_flags": dict(entry_gate_flags),
         "trade_notional_entry_usd": round(float(trade_notional_entry), 4),
         "entry_size_scale": round(float(entry_size_scale), 4),
+        "stale_exit_count": int(stale_exit_count),
+        "stale_exit_events": list(stale_exit_events[:24]),
         "last_actions": actions[-80:],
         "updated_at": now_ts,
     }
@@ -965,14 +1641,26 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     _safe_write_json(state_path, out_state)
 
     msg_parts = [entry_msg]
+    if stale_exit_refresh_msg and str(stale_exit_refresh_msg).strip() and (str(stale_exit_refresh_msg) not in msg_parts):
+        msg_parts.append(str(stale_exit_refresh_msg))
     if shadow_only:
         msg_parts.append("rollout shadow_only: real entries suppressed")
     elif not enable_exec_v2:
         msg_parts.append(f"rollout {stage}: execution disabled")
+    if str(compliance_state.get("status_text", "") or "").strip():
+        msg_parts.append(str(compliance_state.get("status_text", "")))
     if trade_notional_effective < trade_notional:
         msg_parts.append(f"size x{loss_size_scale:.2f}")
     if trade_notional_entry < trade_notional_effective:
         msg_parts.append(f"scan-size x{entry_size_scale:.2f}")
+    if abs(float(policy_size_scale) - 1.0) >= 0.01:
+        msg_parts.append(f"policy-size x{policy_size_scale:.2f}")
+    if trade_quality_eval and abs(float(quality_size_scale) - 1.0) >= 0.01:
+        msg_parts.append(f"quality-size x{quality_size_scale:.2f}")
+    if allocator_evaluated:
+        allocator_summary = str(opportunity_eval.get("summary", "") or "").strip()
+        if allocator_summary:
+            msg_parts.append(allocator_summary)
     if actions:
         msg_parts.append(actions[-1])
     return {
@@ -995,26 +1683,19 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "exposure_usd": round(total_positions_value, 4),
         "crypto_exposure_usd": round(crypto_exposure_usd, 4) if auto_enabled else round(_crypto_holdings_usd(hub_dir), 4),
         "other_market_exposure_usd": round(forex_exposure_usd, 4) if auto_enabled else round(_market_status_exposure_usd(hub_dir, "forex"), 4),
+        "cross_market_exposure_usd": round(cross_market_exposure_effective_usd, 4),
+        "cross_market_cap_basis_usd": round(cross_market_cap_basis_effective_usd, 4),
         "account_value_usd": round(equity, 4),
         "entry_eval_total": int(len(entry_fail_reasons)),
         "entry_eval_failed": int(len(entry_fail_reasons) > 0),
         "entry_eval_top_reason": str(entry_eval_top_reason),
         "entry_eval_reason_counts": dict(entry_eval_reason_counts),
-        "entry_gate_flags": {
-            "data_quality_required": bool(require_data_quality_ok),
-            "data_quality_ok": bool(thinker_data_ok),
-            "reject_rate_pct": float(round(thinker_reject_rate_pct, 4)),
-            "reject_rate_raw_pct": float(round(thinker_reject_rate_raw_pct, 4)),
-            "reject_rate_max_pct": float(round(reject_rate_gate_pct, 4)),
-            "cached_fallback_active": bool(fallback_active),
-            "cached_fallback_age_s": int(fallback_age_s),
-            "cached_fallback_hard_block_age_s": int(cached_scan_hard_block_age_s),
-            "pdt_restricted": bool(pdt_restricted),
-            "pdt_equity_threshold_usd": float(round(pdt_equity_threshold_usd, 4)),
-            "day_trades_rolling_5d": int(day_trades_rolling_5d),
-            "pdt_max_day_trades_rolling_5d": int(pdt_max_day_trades_rolling_5d),
-            "same_day_exit_min_hold_minutes": int(min_hold_minutes),
-        },
+        "automation_policy": policy if isinstance(policy, dict) else {},
+        "trade_quality": trade_quality_eval if isinstance(trade_quality_eval, dict) else {},
+        "opportunity_allocator": opportunity_eval if isinstance(opportunity_eval, dict) else {},
+        "entry_gate_flags": dict(entry_gate_flags),
+        "stale_exit_count": int(stale_exit_count),
+        "stale_exit_events": list(stale_exit_events[:24]),
         "updated_at": now_ts,
         "health": {"data_ok": thinker_data_ok, "broker_ok": True, "orders_ok": True, "drift_warning": drift_warning},
     }

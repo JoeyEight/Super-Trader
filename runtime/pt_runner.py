@@ -26,6 +26,7 @@ from app.exposure_analytics import build_exposure_payload
 from app.feature_flags import build_feature_flag_snapshot
 from app.health_rules import evaluate_runtime_alerts
 from app.http_utils import parse_retry_after_value
+from app.opportunity_allocator import summarize_allocator_snapshot
 from app.json_codec import load as json_load
 from app.json_codec import loads as json_loads
 from app.notification_center import build_notification_center_payload
@@ -461,6 +462,163 @@ def _remove_file(path: str) -> None:
         pass
 
 
+def _ps_process_rows() -> list[Dict[str, Any]]:
+    try:
+        out = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,command="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+        lines = (out.stdout or "").splitlines()
+    except Exception:
+        lines = []
+    rows: list[Dict[str, Any]] = []
+    for raw in lines:
+        line = str(raw or "").strip()
+        if not line:
+            continue
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except Exception:
+            continue
+        command = str(parts[2] or "").strip()
+        if not command:
+            continue
+        rows.append({"pid": int(pid), "ppid": int(ppid), "command": command})
+    return rows
+
+
+def _discover_runtime_processes(scripts: Dict[str, str]) -> Dict[str, Any]:
+    runner_script = os.path.abspath(os.path.join(BASE_DIR, "runtime", "pt_runner.py"))
+    targets = {
+        "thinker": os.path.abspath(str(scripts.get("thinker", ""))),
+        "trader": os.path.abspath(str(scripts.get("trader", ""))),
+        "markets": os.path.abspath(str(scripts.get("markets", ""))),
+        "autopilot": os.path.abspath(str(scripts.get("autopilot", ""))),
+    }
+    rows = _ps_process_rows()
+    pid_to_command: Dict[int, str] = {}
+    runner_pids: set[int] = set()
+    child_rows: list[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            pid = int(row.get("pid", 0) or 0)
+            ppid = int(row.get("ppid", 0) or 0)
+            command = str(row.get("command", "") or "")
+        except Exception:
+            continue
+        if pid <= 0 or (not command):
+            continue
+        pid_to_command[pid] = command
+        if runner_script and (runner_script in command):
+            runner_pids.add(pid)
+        for role, script_path in targets.items():
+            if script_path and (script_path in command):
+                child_rows.append(
+                    {
+                        "role": str(role),
+                        "pid": int(pid),
+                        "ppid": int(ppid),
+                        "command": command,
+                    }
+                )
+                break
+    return {
+        "runner_script": runner_script,
+        "runner_pids": sorted(runner_pids),
+        "children": list(child_rows),
+        "pid_to_command": pid_to_command,
+    }
+
+
+def _terminate_pid(pid: int, force: bool = False) -> bool:
+    try:
+        sig = signal.SIGKILL if force else signal.SIGTERM
+        os.kill(int(pid), sig)
+        return True
+    except Exception:
+        return False
+
+
+def _cleanup_orphan_runtime_children(scripts: Dict[str, str], keep_runner_pids: Optional[set[int]] = None) -> Dict[str, Any]:
+    keep = {int(p) for p in (keep_runner_pids or set()) if int(p) > 0}
+    proc_map = _discover_runtime_processes(scripts)
+    runner_pids = {int(p) for p in list(proc_map.get("runner_pids", []) or []) if int(p) > 0}
+    keep |= runner_pids
+    pid_to_command = proc_map.get("pid_to_command", {}) if isinstance(proc_map.get("pid_to_command"), dict) else {}
+    children = list(proc_map.get("children", []) or [])
+    stale_rows: list[Dict[str, Any]] = []
+    for row in children:
+        try:
+            pid = int(row.get("pid", 0) or 0)
+            ppid = int(row.get("ppid", 0) or 0)
+        except Exception:
+            continue
+        if pid <= 0:
+            continue
+        if ppid in keep:
+            continue
+        parent_cmd = str(pid_to_command.get(ppid, "") or "")
+        parent_is_runner = ("runtime/pt_runner.py" in parent_cmd) if parent_cmd else False
+        if parent_is_runner:
+            continue
+        parent_alive = _pid_is_alive(ppid) if ppid > 0 else False
+        if (ppid <= 1) or (not parent_alive) or (not parent_is_runner):
+            stale_rows.append(dict(row))
+
+    terminated = 0
+    forced = 0
+    stale_pids = [int(r.get("pid", 0) or 0) for r in stale_rows if int(r.get("pid", 0) or 0) > 0]
+    for pid in stale_pids:
+        if _terminate_pid(pid, force=False):
+            terminated += 1
+    if stale_pids:
+        time.sleep(0.3)
+    for pid in stale_pids:
+        if _pid_is_alive(pid):
+            if _terminate_pid(pid, force=True):
+                forced += 1
+
+    return {
+        "stale_count": int(len(stale_rows)),
+        "terminated": int(terminated),
+        "forced": int(forced),
+        "runner_pids": sorted(int(p) for p in runner_pids),
+        "stale_children": [
+            {
+                "role": str(r.get("role", "") or ""),
+                "pid": int(r.get("pid", 0) or 0),
+                "ppid": int(r.get("ppid", 0) or 0),
+            }
+            for r in stale_rows
+        ],
+    }
+
+
+def _live_runner_pids_from_discovery(discovered: Dict[str, Any], self_pid: Optional[int] = None) -> list[int]:
+    try:
+        self_pid_i = int(os.getpid() if self_pid is None else self_pid)
+    except Exception:
+        self_pid_i = -1
+    out: set[int] = set()
+    for raw_pid in list((discovered or {}).get("runner_pids", []) or []):
+        try:
+            pid = int(raw_pid)
+        except Exception:
+            continue
+        if pid <= 0 or pid == self_pid_i:
+            continue
+        if _pid_is_alive(pid):
+            out.add(pid)
+    return sorted(int(p) for p in out)
+
+
 def _settings_scripts() -> Dict[str, str]:
     settings_path = resolve_settings_path(BASE_DIR) or _SETTINGS_PATH or os.path.join(BASE_DIR, "gui_settings.json")
     data = read_settings_file(settings_path, module_name="pt_runner") or {}
@@ -695,6 +853,11 @@ class Runner:
             forex_trader if isinstance(forex_trader, dict) else {},
             crypto_trader if isinstance(crypto_trader, dict) else {},
         )
+        cross_market_opportunity = summarize_allocator_snapshot(
+            stock_trader if isinstance(stock_trader, dict) else {},
+            forex_trader if isinstance(forex_trader, dict) else {},
+            crypto_trader if isinstance(crypto_trader, dict) else {},
+        )
         status = _safe_read_json(TRADER_STATUS_PATH)
         incidents_rows = _read_jsonl_tail(INCIDENTS_PATH, limit=800)
         runtime_event_rows = _read_jsonl_tail(RUNTIME_EVENTS_PATH, limit=2000)
@@ -917,6 +1080,11 @@ class Runner:
                 "stocks": dict(automation_policy.get("stocks", {}) or {}) if isinstance(automation_policy.get("stocks", {}), dict) else {},
                 "forex": dict(automation_policy.get("forex", {}) or {}) if isinstance(automation_policy.get("forex", {}), dict) else {},
             },
+            "cross_market_opportunity": (
+                dict(cross_market_opportunity)
+                if isinstance(cross_market_opportunity, dict)
+                else {}
+            ),
         }
         payload["alerts"] = evaluate_runtime_alerts(payload, settings)
         notifications = build_notification_center_payload(payload, incidents_rows=incidents_rows, max_items=240)
@@ -1779,9 +1947,17 @@ def _install_signal_handlers(runner: Runner) -> None:
 
 
 def main() -> int:
+    scripts = _settings_scripts()
+    discovered = _discover_runtime_processes(scripts)
+    live_runner_pids = _live_runner_pids_from_discovery(discovered, self_pid=os.getpid())
+
     existing_pid = _read_pid_file(RUNNER_PID_PATH)
-    if _pid_is_alive(existing_pid):
+    if existing_pid and _pid_is_alive(existing_pid):
         _runner_log(f"runner already active pid={existing_pid}; exiting")
+        return 0
+    if live_runner_pids:
+        active_pid = int(sorted(live_runner_pids)[0])
+        _runner_log(f"runner already active pid={active_pid} (detected via process table); exiting")
         return 0
 
     stale_pid_removed = False
@@ -1790,10 +1966,18 @@ def main() -> int:
         _remove_file(RUNNER_PID_PATH)
         stale_pid_removed = True
 
+    orphan_cleanup = _cleanup_orphan_runtime_children(scripts, keep_runner_pids=set())
+    if int(orphan_cleanup.get("stale_count", 0) or 0) > 0:
+        _runner_log(
+            "cleaned stale runtime children "
+            f"(count={int(orphan_cleanup.get('stale_count', 0) or 0)} "
+            f"term={int(orphan_cleanup.get('terminated', 0) or 0)} "
+            f"force={int(orphan_cleanup.get('forced', 0) or 0)})"
+        )
+
     settings_path = resolve_settings_path(BASE_DIR) or _SETTINGS_PATH or os.path.join(BASE_DIR, "gui_settings.json")
     settings = read_settings_file(settings_path, module_name="pt_runner") or {}
     settings = sanitize_settings(settings if isinstance(settings, dict) else {})
-    scripts = _settings_scripts()
     checks = _run_startup_checks(scripts, settings, stale_pid_removed=stale_pid_removed)
     if not bool(checks.get("ok", False)):
         _runner_log("startup checks failed; refusing to start runner")

@@ -35,4 +35,13 @@ if ! "$PY_BIN" -c "import matplotlib" >/dev/null 2>&1; then
   "$PY_BIN" -m pip install -r "$PROJECT_DIR/requirements.txt"
 fi
 
+if command -v caffeinate >/dev/null 2>&1; then
+  # Keep the trading runtime active while the app is open:
+  # -i: prevent idle system sleep
+  # -s: prevent full system sleep while on AC power
+  # -m: prevent disk sleep
+  # -d: prevent display sleep side-effects from pausing active visual workflows
+  exec caffeinate -dims "$PY_BIN" -m ui.pt_hub
+fi
+
 exec "$PY_BIN" -m ui.pt_hub

@@ -8,7 +8,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List
 from zoneinfo import ZoneInfo
 
@@ -61,6 +61,9 @@ ROLLOUT_ORDER = {
     "live": 5,
     "live_guarded": 5,
 }
+_STOCK_OUTLIER_MAX_ABS_CHANGE_6H_PCT = 120.0
+_STOCK_OUTLIER_MAX_ABS_CHANGE_24H_PCT = 300.0
+_STOCK_OUTLIER_MAX_STEP_MOVE_PCT = 80.0
 
 
 def _normalize_rollout_stage(stage: Any) -> str:
@@ -188,9 +191,81 @@ def _now_et() -> datetime:
     return datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York"))
 
 
-def _market_open_now() -> bool:
-    now = _now_et()
+def _nth_weekday_of_month(year: int, month: int, weekday: int, n: int) -> date:
+    base = date(int(year), int(month), 1)
+    offset = (int(weekday) - int(base.weekday())) % 7
+    day_num = 1 + offset + (max(1, int(n)) - 1) * 7
+    return date(int(year), int(month), int(day_num))
+
+
+def _last_weekday_of_month(year: int, month: int, weekday: int) -> date:
+    if int(month) == 12:
+        nxt = date(int(year) + 1, 1, 1)
+    else:
+        nxt = date(int(year), int(month) + 1, 1)
+    cur = nxt - timedelta(days=1)
+    while cur.weekday() != int(weekday):
+        cur -= timedelta(days=1)
+    return cur
+
+
+def _easter_sunday(year: int) -> date:
+    # Anonymous Gregorian algorithm
+    y = int(year)
+    a = y % 19
+    b = y // 100
+    c = y % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return date(y, month, day)
+
+
+def _observed_fixed_holiday(year: int, month: int, day: int) -> date:
+    d = date(int(year), int(month), int(day))
+    if d.weekday() == 5:
+        return d - timedelta(days=1)
+    if d.weekday() == 6:
+        return d + timedelta(days=1)
+    return d
+
+
+def _is_us_stock_holiday(day_value: date) -> bool:
+    day = day_value if isinstance(day_value, date) else date.today()
+    y = int(day.year)
+    holidays = {
+        _observed_fixed_holiday(y, 1, 1),  # New Year's Day (observed)
+        _nth_weekday_of_month(y, 1, 0, 3),  # Martin Luther King Jr. Day
+        _nth_weekday_of_month(y, 2, 0, 3),  # Presidents Day
+        _easter_sunday(y) - timedelta(days=2),  # Good Friday
+        _last_weekday_of_month(y, 5, 0),  # Memorial Day
+        _observed_fixed_holiday(y, 6, 19),  # Juneteenth (observed)
+        _observed_fixed_holiday(y, 7, 4),  # Independence Day (observed)
+        _nth_weekday_of_month(y, 9, 0, 1),  # Labor Day
+        _nth_weekday_of_month(y, 11, 3, 4),  # Thanksgiving
+        _observed_fixed_holiday(y, 12, 25),  # Christmas (observed)
+        _observed_fixed_holiday(y + 1, 1, 1),  # Handles Dec 31 observed close when Jan 1 falls on Saturday.
+    }
+    return day in holidays
+
+
+def _market_open_now(now_value: datetime | None = None) -> bool:
+    now = now_value if isinstance(now_value, datetime) else _now_et()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=ZoneInfo("America/New_York"))
+    else:
+        now = now.astimezone(ZoneInfo("America/New_York"))
     if now.weekday() >= 5:
+        return False
+    if _is_us_stock_holiday(now.date()):
         return False
     mins = (now.hour * 60) + now.minute
     return (9 * 60 + 30) <= mins < (16 * 60)
@@ -300,6 +375,53 @@ def _compact_chart_bars(rows: List[Dict[str, Any]], limit: int = 120) -> List[Di
                 "l": float(min(low_px, o, c)),
                 "c": float(c),
                 "v": _float(bar.get("v", 0.0), 0.0),
+            }
+        )
+    return out
+
+
+def _aggregate_intraday_bars(rows: List[Dict[str, Any]], group_size: int = 4) -> List[Dict[str, Any]]:
+    take = max(2, int(group_size or 4))
+    normalized: List[Dict[str, Any]] = []
+    for raw in list(rows or []):
+        if not isinstance(raw, dict):
+            continue
+        c = _float(raw.get("c", raw.get("close", 0.0)), 0.0)
+        if c <= 0.0:
+            continue
+        o = _float(raw.get("o", c), c)
+        h = _float(raw.get("h", max(o, c)), max(o, c))
+        low_px = _float(raw.get("l", min(o, c)), min(o, c))
+        normalized.append(
+            {
+                "t": str(raw.get("t", "") or ""),
+                "o": float(o),
+                "h": float(max(h, o, c)),
+                "l": float(min(low_px, o, c)),
+                "c": float(c),
+                "v": _float(raw.get("v", raw.get("volume", 0.0)), 0.0),
+            }
+        )
+    if len(normalized) < max(8, take * 2):
+        return []
+    out: List[Dict[str, Any]] = []
+    for idx in range(0, len(normalized), take):
+        chunk = normalized[idx:idx + take]
+        if len(chunk) < max(2, int(take / 2)):
+            continue
+        first = chunk[0]
+        last = chunk[-1]
+        highs = [float(r.get("h", r.get("c", 0.0)) or 0.0) for r in chunk]
+        lows = [float(r.get("l", r.get("c", 0.0)) or 0.0) for r in chunk]
+        vols = [float(r.get("v", 0.0) or 0.0) for r in chunk]
+        out.append(
+            {
+                "t": str(last.get("t", "") or ""),
+                "o": float(first.get("o", first.get("c", 0.0)) or 0.0),
+                "h": float(max(highs) if highs else float(last.get("c", 0.0) or 0.0)),
+                "l": float(min(lows) if lows else float(last.get("c", 0.0) or 0.0)),
+                "c": float(last.get("c", 0.0) or 0.0),
+                "v": float(sum(vols) if vols else 0.0),
             }
         )
     return out
@@ -911,32 +1033,58 @@ def _fetch_bars_for_symbols(
     start_iso: str,
     end_iso: str,
     feed: str,
+    min_bars_hint: int = 24,
 ) -> Dict[str, List[Dict[str, Any]]]:
     out: Dict[str, List[Dict[str, Any]]] = {}
+    # Alpaca multi-symbol bars are sorted by symbol first, then timestamp.
+    # A low global `limit` can starve later symbols and force expensive per-symbol fallbacks.
+    per_symbol_target = max(24, int(min_bars_hint or 24) * 2)
+    max_page_limit = 10_000
+    max_pages_per_chunk = 6
     chunk = 50
     for i in range(0, len(symbols), chunk):
         part = symbols[i:i + chunk]
-        params = {
-            "symbols": ",".join(part),
-            "timeframe": "1Hour",
-            "limit": "96",
-            "adjustment": "raw",
-            "feed": feed,
-            "start": start_iso,
-            "end": end_iso,
-            # Prefer latest bars; API sorts by symbol then timestamp.
-            "sort": "desc",
-        }
-        url = f"{base_url}/v2/stocks/bars?{urllib.parse.urlencode(params)}"
-        payload = _request_json(url, headers=headers, timeout=15.0)
-        bars = payload.get("bars", {}) or {}
-        if isinstance(bars, dict):
-            for sym, rows in bars.items():
-                key = str(sym).strip().upper()
-                if key:
+        page_token = ""
+        pages = 0
+        request_limit = min(max_page_limit, max(500, len(part) * per_symbol_target))
+        while pages < max_pages_per_chunk:
+            params = {
+                "symbols": ",".join(part),
+                "timeframe": "1Hour",
+                "limit": str(int(request_limit)),
+                "adjustment": "raw",
+                "feed": feed,
+                "start": start_iso,
+                "end": end_iso,
+                # Prefer latest bars; API sorts by symbol then timestamp.
+                "sort": "desc",
+            }
+            if page_token:
+                params["page_token"] = page_token
+            url = f"{base_url}/v2/stocks/bars?{urllib.parse.urlencode(params)}"
+            payload = _request_json(url, headers=headers, timeout=15.0)
+            pages += 1
+            bars = payload.get("bars", {}) or {}
+            if isinstance(bars, dict):
+                for sym, rows in bars.items():
+                    key = str(sym).strip().upper()
+                    if not key:
+                        continue
+                    existing = out.get(key, [])
                     norm_rows = [row for row in list(rows or []) if isinstance(row, dict)]
-                    norm_rows.sort(key=lambda row: str(row.get("t", "") or ""))
-                    out[key] = norm_rows
+                    if existing:
+                        existing.extend(norm_rows)
+                        out[key] = existing
+                    else:
+                        out[key] = norm_rows
+            next_token = str(payload.get("next_page_token", "") or "").strip()
+            if not next_token:
+                break
+            page_token = next_token
+    for key, rows in list(out.items()):
+        norm_rows = [row for row in list(rows or []) if isinstance(row, dict)]
+        norm_rows.sort(key=lambda row: str(row.get("t", "") or ""))
+        out[key] = norm_rows
     return out
 
 
@@ -954,6 +1102,7 @@ def _score_bars(symbol: str, bars: List[Dict[str, Any]], spread_bps: float = 0.0
         return {
             "symbol": symbol,
             "score": -9999.0,
+            "outlier": False,
             "side": "watch",
             "last": closes[-1] if closes else 0.0,
             "change_6h_pct": 0.0,
@@ -977,7 +1126,36 @@ def _score_bars(symbol: str, bars: List[Dict[str, Any]], spread_bps: float = 0.0
         cur_px = closes[idx]
         if prev_px > 0:
             step_moves.append(abs(((cur_px - prev_px) / prev_px) * 100.0))
+    max_step_move = max(step_moves[-24:]) if step_moves else 0.0
     volatility = (sum(step_moves[-12:]) / max(1, len(step_moves[-12:]))) if step_moves else 0.0
+
+    # Guard against split/bad-bar spikes that can otherwise inflate score and leak
+    # impossible watchlist values into both UI and execution ranking.
+    if (
+        abs(float(change_6)) > float(_STOCK_OUTLIER_MAX_ABS_CHANGE_6H_PCT)
+        or abs(float(change_24)) > float(_STOCK_OUTLIER_MAX_ABS_CHANGE_24H_PCT)
+        or float(max_step_move) > float(_STOCK_OUTLIER_MAX_STEP_MOVE_PCT)
+    ):
+        reason_logic = "Outlier price jump detected; waiting for cleaner bars"
+        reason_data = (
+            f"6h {change_6:+.2f}% | 24h {change_24:+.2f}% | "
+            f"max step {max_step_move:.2f}% | spr {float(spread_bps):.2f}bps"
+        )
+        return {
+            "symbol": symbol,
+            "score": -9999.0,
+            "outlier": True,
+            "side": "watch",
+            "last": round(last_px, 6),
+            "change_6h_pct": round(change_6, 6),
+            "change_24h_pct": round(change_24, 6),
+            "volatility_pct": round(volatility, 6),
+            "spread_bps": round(float(spread_bps), 4),
+            "confidence": "LOW",
+            "reason_logic": reason_logic,
+            "reason_data": reason_data,
+            "reason": reason_logic,
+        }
 
     spread_penalty = max(0.0, float(spread_bps) / 8.0)
     score = (change_6 * 0.60) + (change_24 * 0.25) + (volatility * 0.20) - spread_penalty
@@ -1007,6 +1185,7 @@ def _score_bars(symbol: str, bars: List[Dict[str, Any]], spread_bps: float = 0.0
     return {
         "symbol": symbol,
         "score": round(score, 6),
+        "outlier": False,
         "side": side,
         "last": round(last_px, 6),
         "change_6h_pct": round(change_6, 6),
@@ -1108,6 +1287,7 @@ def _apply_stock_mtf_confirmation(
     client: AlpacaBrokerClient,
     feed: str,
     settings: Dict[str, Any],
+    bars_lookup: Dict[str, List[Dict[str, Any]]] | None = None,
 ) -> None:
     if not scored:
         return
@@ -1120,6 +1300,12 @@ def _apply_stock_mtf_confirmation(
         row["mtf_confirmed"] = None
     if max_symbols <= 0:
         return
+    use_cached_intraday = _setting_bool(settings, "stock_mtf_use_cached_intraday_bars", True)
+    try:
+        remote_fetch_budget = max(0, int(float(settings.get("stock_mtf_remote_fetch_max_symbols", max_symbols) or max_symbols)))
+    except Exception:
+        remote_fetch_budget = int(max_symbols)
+    remote_fetch_used = 0
     ranked = [
         row
         for row in scored
@@ -1132,17 +1318,44 @@ def _apply_stock_mtf_confirmation(
             continue
         spread_bps = _float(row.get("spread_bps", 0.0), 0.0)
         mtf_side = "watch"
+        mtf_source = ""
+        mtf_scored = False
+        if use_cached_intraday and isinstance(bars_lookup, dict):
+            cached_rows = list(bars_lookup.get(symbol, []) or [])
+            if len(cached_rows) >= 8:
+                data_source = str(row.get("data_source", "") or "").strip().lower()
+                if "1h" in data_source:
+                    mtf_rows = _aggregate_intraday_bars(cached_rows, group_size=4)
+                    mtf_source = "cached_4h"
+                else:
+                    mtf_rows = list(cached_rows)
+                    mtf_source = "cached_native"
+                if len(mtf_rows) >= 8:
+                    mtf = _score_bars(symbol, mtf_rows, spread_bps=spread_bps)
+                    mtf_score = float(mtf.get("score", 0.0) or 0.0)
+                    mtf_side = "long" if mtf_score > 0 else "watch"
+                    mtf_scored = True
         try:
-            bars_4h = client.get_stock_bars(symbol, timeframe="4Hour", limit=36, feed=feed)
-            if len(bars_4h) < 8:
-                bars_4h = client.get_stock_bars(symbol, timeframe="1Day", limit=36, feed=feed)
-            mtf = _score_bars(symbol, bars_4h, spread_bps=spread_bps)
-            mtf_score = float(mtf.get("score", 0.0) or 0.0)
-            mtf_side = "long" if mtf_score > 0 else "watch"
+            if (not mtf_scored) and (client is not None) and (remote_fetch_used < remote_fetch_budget):
+                bars_4h = client.get_stock_bars(symbol, timeframe="4Hour", limit=36, feed=feed)
+                if len(bars_4h) < 8:
+                    bars_4h = client.get_stock_bars(symbol, timeframe="1Day", limit=36, feed=feed)
+                    mtf_source = "remote_1d"
+                else:
+                    mtf_source = "remote_4h"
+                mtf = _score_bars(symbol, bars_4h, spread_bps=spread_bps)
+                mtf_score = float(mtf.get("score", 0.0) or 0.0)
+                mtf_side = "long" if mtf_score > 0 else "watch"
+                mtf_scored = True
+                remote_fetch_used += 1
         except Exception:
             mtf_side = "watch"
+            if not mtf_source:
+                mtf_source = "mtf_error"
         row["mtf_side"] = mtf_side
-        row["mtf_confirmed"] = bool(mtf_side == "long")
+        row["mtf_confirmed"] = (bool(mtf_side == "long") if mtf_scored else None)
+        if mtf_source:
+            row["mtf_source"] = str(mtf_source)
         if not bool(row["mtf_confirmed"]):
             row["score"] = round(float(row.get("score", 0.0) or 0.0) * 0.70, 6)
             _append_reason_parts(
@@ -1811,6 +2024,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "market_clock": dict(clock_status),
         }
     open_position_symbols = _load_open_position_symbols(hub_dir)
+    priority_watch = _parse_watchlist(settings)[:16]
     max_scan = max(8, int(float(settings.get("stock_scan_max_symbols", 120) or 120)))
     if provider == "twelvedata":
         td_cap = max(1, int(float(settings.get("twelvedata_scan_symbol_cap", 8) or 8)))
@@ -1965,6 +2179,26 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     use_daily_when_closed = _setting_bool(settings, "stock_scan_use_daily_when_closed", True)
     closed_max_stale_hours = max(1.0, float(settings.get("stock_closed_max_stale_hours", 96.0) or 96.0))
     min_bars_required = max(8, int(float(settings.get("stock_min_bars_required", 24) or 24)))
+    symbol_fallback_limit = max(0, int(float(settings.get("stock_scan_symbol_fallback_limit", 48) or 48)))
+    symbol_fallback_used = 0
+    symbol_fallback_skipped = 0
+    fallback_priority_symbols: set[str] = set()
+    for raw in list(open_position_symbols or []):
+        sym = str(raw or "").strip().upper()
+        if sym:
+            fallback_priority_symbols.add(sym)
+    for raw in list(prev_leaders or [])[:20]:
+        sym = str(raw or "").strip().upper()
+        if sym:
+            fallback_priority_symbols.add(sym)
+    for raw in list(prev_candidates or [])[:24]:
+        sym = str(raw or "").strip().upper()
+        if sym:
+            fallback_priority_symbols.add(sym)
+    for raw in list(priority_watch or []):
+        sym = str(raw or "").strip().upper()
+        if sym:
+            fallback_priority_symbols.add(sym)
 
     candidates: List[str] = []
     rejected: List[Dict[str, Any]] = []
@@ -2097,7 +2331,15 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             if provider == "twelvedata":
                 bars_by_symbol = dict(td_bars_by_symbol or {})
             elif market_open or (not use_daily_when_closed):
-                bars_by_symbol = _fetch_bars_for_symbols(base_url, headers, candidates, start_iso, end_iso, feed)
+                bars_by_symbol = _fetch_bars_for_symbols(
+                    base_url,
+                    headers,
+                    candidates,
+                    start_iso,
+                    end_iso,
+                    feed,
+                    min_bars_hint=min_bars_required,
+                )
             else:
                 bars_by_symbol = {}
             scored = []
@@ -2105,6 +2347,13 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 symbol_bars: List[Dict[str, Any]] = []
                 data_source = ""
                 open_daily_fallback = False
+                symbol_fallback_attempted = False
+                fallback_priority = str(symbol or "").strip().upper() in fallback_priority_symbols
+                fallback_budget_available = bool(
+                    symbol_fallback_limit <= 0
+                    or symbol_fallback_used < symbol_fallback_limit
+                    or fallback_priority
+                )
                 if market_open or (not use_daily_when_closed) or provider == "twelvedata":
                     symbol_bars = list(bars_by_symbol.get(symbol, []) or [])
                     data_source = "batch_1h" if provider != "twelvedata" else "twelvedata_1h"
@@ -2125,7 +2374,8 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                             data_source = "symbol_1d"
                 # Fallback path: if batch bars are sparse/missing, try symbol endpoint directly.
                 if len(symbol_bars) < min_bars_required:
-                    if provider != "twelvedata" and client is not None:
+                    if provider != "twelvedata" and client is not None and fallback_budget_available:
+                        symbol_fallback_attempted = True
                         try:
                             if market_open:
                                 symbol_bars = client.get_stock_bars(
@@ -2152,7 +2402,8 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                             symbol_bars = list(symbol_bars or [])
                 if len(symbol_bars) < min_bars_required:
                     # Last resort for thin symbols / feed limitations: daily bars.
-                    if provider != "twelvedata" and client is not None:
+                    if provider != "twelvedata" and client is not None and fallback_budget_available:
+                        symbol_fallback_attempted = True
                         try:
                             if market_open:
                                 symbol_bars = client.get_stock_bars(
@@ -2177,6 +2428,10 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                                 data_source = "symbol_1d"
                         except Exception:
                             symbol_bars = list(symbol_bars or [])
+                if symbol_fallback_attempted:
+                    symbol_fallback_used += 1
+                elif (len(symbol_bars) < min_bars_required) and (provider != "twelvedata") and (client is not None) and (not fallback_budget_available):
+                    symbol_fallback_skipped += 1
                 bars_count = int(len(symbol_bars or []))
                 if bars_count >= 2:
                     best_bars_by_symbol[symbol] = list(symbol_bars or [])
@@ -2246,20 +2501,25 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                     row["side"] = "watch"
                     continue
                 if float(row.get("score", -9999.0) or -9999.0) <= -9999.0:
+                    rejected_reason = "outlier_jump" if bool(row.get("outlier", False)) else "insufficient_bars"
                     add_rejected(
                         {
                             "symbol": symbol,
-                            "reason": "insufficient_bars",
+                            "reason": rejected_reason,
                             "bars_count": bars_count,
                             "source": f"{data_source}:{feed}",
+                            "change_6h_pct": row.get("change_6h_pct"),
+                            "change_24h_pct": row.get("change_24h_pct"),
+                            "volatility_pct": row.get("volatility_pct"),
                         }
                     )
                     if cooldown_enforced:
-                        _apply_symbol_cooldown(cooldown_map, symbol, "insufficient_bars", settings, now_ts)
+                        cooldown_reason = "data_quality" if rejected_reason == "outlier_jump" else "insufficient_bars"
+                        _apply_symbol_cooldown(cooldown_map, symbol, cooldown_reason, settings, now_ts)
                     continue
                 best_bars_by_symbol[symbol] = list(symbol_bars or [])
                 scored.append(row)
-            _apply_stock_mtf_confirmation(scored, client, feed, settings)
+            _apply_stock_mtf_confirmation(scored, client, feed, settings, bars_lookup=best_bars_by_symbol)
             bars_total = 0
             try:
                 bars_total = int(sum(len(list(v or [])) for v in best_bars_by_symbol.values()))
@@ -2434,6 +2694,9 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 "quality_summary": str(quality_report.get("summary", "") or ""),
                 "liquidity_missing_ratio_pct": round(float(liquidity_missing_ratio_pct), 3),
                 "liquidity_missing_allowed": bool(allow_missing_liquidity),
+                "symbol_fallback_limit": int(symbol_fallback_limit),
+                "symbol_fallback_used": int(symbol_fallback_used),
+                "symbol_fallback_skipped": int(symbol_fallback_skipped),
             },
         )
         hints = _market_hints_from_rejects(
@@ -2455,6 +2718,10 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 "Stock universe rotation active: "
                 f"sticky core {int(rotation_info.get('core_size', 0))}, "
                 f"rotating tail {int(rotation_info.get('tail_size', 0))}."
+            )
+        if int(symbol_fallback_skipped) > 0:
+            hints.append(
+                f"Performance mode: skipped deep bar fallback on {int(symbol_fallback_skipped)} symbols this cycle."
             )
         opening_plan = _persist_opening_plan(
             settings,
@@ -2511,6 +2778,9 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                     "quality_summary": str((dict(fallback.get("universe_quality", {})).get("summary", "") if isinstance(fallback.get("universe_quality", {}), dict) else "") or ""),
                     "liquidity_missing_ratio_pct": round(float(liquidity_missing_ratio_pct), 3),
                     "liquidity_missing_allowed": bool(allow_missing_liquidity),
+                    "symbol_fallback_limit": int(symbol_fallback_limit),
+                    "symbol_fallback_used": int(symbol_fallback_used),
+                    "symbol_fallback_skipped": int(symbol_fallback_skipped),
                     "fallback_cached": True,
                 },
             )
@@ -2536,6 +2806,9 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "leader_stability_prev_symbol": str(prev_top_symbol),
             "scan_rotation": dict(rotation_info),
             "universe_quality": quality_report,
+            "symbol_fallback_limit": int(symbol_fallback_limit),
+            "symbol_fallback_used": int(symbol_fallback_used),
+            "symbol_fallback_skipped": int(symbol_fallback_skipped),
             "opening_plan": dict(opening_plan),
             "health": {"data_ok": False, "broker_ok": True, "orders_ok": True, "drift_warning": drift_warning},
             "pdt_note": "Paper mode can still simulate PDT protections; live day-trading may be limited under $25k.",
@@ -2868,6 +3141,9 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "quality_summary": str(quality_report.get("summary", "") or ""),
             "liquidity_missing_ratio_pct": round(float(liquidity_missing_ratio_pct), 3),
             "liquidity_missing_allowed": bool(allow_missing_liquidity),
+            "symbol_fallback_limit": int(symbol_fallback_limit),
+            "symbol_fallback_used": int(symbol_fallback_used),
+            "symbol_fallback_skipped": int(symbol_fallback_skipped),
             "adaptive_threshold_base": float(base_thr),
             "adaptive_threshold_volatility": float(round(volatility_threshold, 6)),
             "adaptive_threshold_replay_recommended": float(round(replay_recommended, 6)),
@@ -2916,6 +3192,10 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         hints.append(
             f"Adaptive threshold {volatility_threshold:.3f} -> {adaptive_threshold:.3f} "
             f"(replay target {int(replay_target_entries)})."
+        )
+    if int(symbol_fallback_skipped) > 0:
+        hints.append(
+            f"Performance mode: skipped deep bar fallback on {int(symbol_fallback_skipped)} symbols this cycle."
         )
     opening_plan = _persist_opening_plan(
         settings,
@@ -2966,6 +3246,9 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "window_policy": dict(window_policy),
         "window_policy_hits": int(window_policy_hits),
         "universe_quality": quality_report,
+        "symbol_fallback_limit": int(symbol_fallback_limit),
+        "symbol_fallback_used": int(symbol_fallback_used),
+        "symbol_fallback_skipped": int(symbol_fallback_skipped),
         "news_event_context": news_event_context,
         "opening_plan": dict(opening_plan),
         "health": {"data_ok": True, "broker_ok": True, "orders_ok": True, "drift_warning": drift_warning},

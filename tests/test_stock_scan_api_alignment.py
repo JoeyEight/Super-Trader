@@ -4,6 +4,7 @@ import io
 import tempfile
 import unittest
 import urllib.error
+import urllib.parse
 from email.message import Message
 from unittest.mock import patch
 
@@ -115,6 +116,52 @@ class TestStockScanApiAlignment(unittest.TestCase):
         payload = client.fetch_snapshot()
         self.assertEqual(payload.get("realized_pnl"), "N/A")
         self.assertEqual(payload.get("equity"), "1000.00")
+
+    def test_batch_bars_fetch_uses_docs_aligned_limit_and_pagination(self) -> None:
+        calls: list[str] = []
+
+        def _fake_request(url: str, headers: dict, timeout: float = 15.0) -> dict:
+            del headers, timeout
+            calls.append(url)
+            if "page_token=tok-2" in url:
+                return {
+                    "bars": {
+                        "MSFT": [
+                            {"t": "2026-03-06T15:00:00Z", "c": 301.0},
+                            {"t": "2026-03-06T14:00:00Z", "c": 300.0},
+                        ]
+                    }
+                }
+            return {
+                "bars": {
+                    "AAPL": [
+                        {"t": "2026-03-06T15:00:00Z", "c": 201.0},
+                        {"t": "2026-03-06T14:00:00Z", "c": 200.0},
+                    ]
+                },
+                "next_page_token": "tok-2",
+            }
+
+        with patch.object(stock_thinker, "_request_json", side_effect=_fake_request):
+            out = stock_thinker._fetch_bars_for_symbols(
+                base_url="https://data.alpaca.markets",
+                headers={"APCA-API-KEY-ID": "k"},
+                symbols=["AAPL", "MSFT"],
+                start_iso="2026-03-01T00:00:00Z",
+                end_iso="2026-03-06T23:59:59Z",
+                feed="iex",
+                min_bars_hint=24,
+            )
+
+        self.assertIn("AAPL", out)
+        self.assertIn("MSFT", out)
+        self.assertEqual([str(r.get("t", "")) for r in out["AAPL"]], ["2026-03-06T14:00:00Z", "2026-03-06T15:00:00Z"])
+        self.assertEqual([str(r.get("t", "")) for r in out["MSFT"]], ["2026-03-06T14:00:00Z", "2026-03-06T15:00:00Z"])
+        self.assertTrue(any("page_token=tok-2" in c for c in calls))
+        self.assertTrue(any("sort=desc" in c for c in calls))
+        first_qs = urllib.parse.parse_qs(urllib.parse.urlparse(calls[0]).query)
+        first_limit = int((first_qs.get("limit", ["0"]) or ["0"])[0])
+        self.assertGreaterEqual(first_limit, 500)
 
 
 if __name__ == "__main__":

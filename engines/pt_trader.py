@@ -19,8 +19,12 @@ from app.credential_utils import (
 	get_robinhood_creds_from_files,
 	normalize_start_allocation_pct,
 )
+from app.automation_policy import build_market_automation_policy
 from app.http_utils import parse_retry_after_value
+from app.opportunity_allocator import evaluate_cross_market_allocation
 from app.path_utils import resolve_runtime_paths, resolve_settings_path, read_settings_file, log_once
+from app.settings_utils import normalize_settings_profile, sanitize_settings
+from app.trade_quality import evaluate_trade_quality
 
 # -----------------------------
 # GUI HUB OUTPUTS
@@ -36,6 +40,8 @@ os.makedirs(CURRENT_PRICE_DIR, exist_ok=True)
 MANUAL_CRYPTO_ORDERS_DIR = os.path.join(HUB_DATA_DIR, "crypto_manual_orders")
 MANUAL_CRYPTO_ORDER_RESULTS_PATH = os.path.join(HUB_DATA_DIR, "crypto_manual_order_results.jsonl")
 os.makedirs(MANUAL_CRYPTO_ORDERS_DIR, exist_ok=True)
+RUNTIME_STATE_PATH = os.path.join(HUB_DATA_DIR, "runtime_state.json")
+CRYPTO_DYNAMIC_STATUS_PATH = os.path.join(HUB_DATA_DIR, "crypto_dynamic_status.json")
 
 
 
@@ -533,6 +539,7 @@ class CryptoAPITrading:
         self._dca_buy_ts = {}         # { "BTC": [ts, ts, ...] } (DCA buys only)
         self._dca_last_sell_ts = {}   # { "BTC": ts_of_last_sell }
         self._seed_dca_window_from_history()
+        self._last_entry_ts = {}      # { "BTC": ts_of_last_successful_buy }
         self._last_exit_ts = {}       # { "BTC": ts_of_last_successful_sell }
         self.entry_cooldown_seconds = 30 * 60
         self._last_account_value_history_write_ts = 0.0
@@ -540,6 +547,7 @@ class CryptoAPITrading:
         self._status_note = ""
         self._loop_sleep_ok = float(CRYPTO_TRADER_LOOP_SLEEP_S)
         self._loop_sleep_error = float(CRYPTO_TRADER_ERROR_SLEEP_S)
+        self._stale_alignment_streaks: Dict[str, int] = {}
 
     def _seed_cost_basis_from_fallbacks(self) -> None:
         cost_basis = getattr(self, "cost_basis", {})
@@ -898,6 +906,278 @@ class CryptoAPITrading:
 
         return True
 
+    @staticmethod
+    def _safe_read_json_file(path: str) -> Dict[str, Any]:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                row = json.load(f) or {}
+            return row if isinstance(row, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _entry_fail_summary(reasons: List[str]) -> tuple[str, Dict[str, int]]:
+        counts: Dict[str, int] = {}
+        for reason in list(reasons or []):
+            msg = str(reason or "").strip()
+            if not msg:
+                continue
+            counts[msg] = int(counts.get(msg, 0) or 0) + 1
+        if not counts:
+            return "", {}
+        top = sorted(counts.items(), key=lambda item: item[1], reverse=True)[0][0]
+        return str(top), counts
+
+    @staticmethod
+    def _profile_quality_thresholds(profile_key: Any) -> tuple[float, float]:
+        pkey = normalize_settings_profile(profile_key, default="balanced")
+        if pkey == "safe":
+            return 38.0, 44.0
+        if pkey == "aggressive":
+            return 31.0, 35.0
+        if pkey == "max_growth":
+            return 29.0, 33.0
+        return 34.0, 39.0
+
+    @staticmethod
+    def _crypto_signal_gate_rules(
+        profile_key: Any,
+        start_level: int,
+        *,
+        policy_mode: str = "",
+    ) -> Dict[str, Any]:
+        lvl = max(1, min(int(start_level or 3), 7))
+        profile = normalize_settings_profile(profile_key, default="balanced")
+        mode = str(policy_mode or "").strip().lower()
+        min_long_count = lvl
+        max_short_count = 0
+        allow_dynamic_fallback = False
+        min_dynamic_score = 0.0
+        if profile == "max_growth":
+            min_long_count = max(1, lvl - 1)
+            if mode not in {"restricted", "safe"}:
+                allow_dynamic_fallback = True
+                min_dynamic_score = 1.05 if mode in {"aggressive_guarded", "balanced"} else 0.75
+        elif profile == "aggressive":
+            min_long_count = lvl
+            if mode not in {"restricted", "safe"}:
+                allow_dynamic_fallback = True
+                min_dynamic_score = 1.10 if mode in {"aggressive", "aggressive_rotation"} else 1.35
+        requirement_text = f"need long>={int(min_long_count)} and short<={int(max_short_count)}"
+        if bool(allow_dynamic_fallback):
+            requirement_text = (
+                f"need short<={int(max_short_count)} and "
+                f"(long>={int(min_long_count)} or dynamic_score>={float(min_dynamic_score):.2f})"
+            )
+        return {
+            "profile": str(profile),
+            "mode": str(mode),
+            "min_long_count": int(min_long_count),
+            "max_short_count": int(max_short_count),
+            "allow_dynamic_fallback": bool(allow_dynamic_fallback),
+            "min_dynamic_score": float(min_dynamic_score),
+            "requirement_text": str(requirement_text),
+        }
+
+    @classmethod
+    def _evaluate_crypto_signal_gate(
+        cls,
+        *,
+        profile_key: Any,
+        start_level: int,
+        buy_count: int,
+        sell_count: int,
+        dynamic_score: float,
+        policy_mode: str = "",
+    ) -> Dict[str, Any]:
+        rules = cls._crypto_signal_gate_rules(profile_key, start_level, policy_mode=policy_mode)
+        min_long_count = int(rules.get("min_long_count", start_level) or start_level)
+        max_short_count = int(rules.get("max_short_count", 0) or 0)
+        allow_dynamic_fallback = bool(rules.get("allow_dynamic_fallback", False))
+        min_dynamic_score = float(rules.get("min_dynamic_score", 0.0) or 0.0)
+        bcount = int(buy_count or 0)
+        scount = int(sell_count or 0)
+        dyn = float(dynamic_score or 0.0)
+        short_ok = scount <= max_short_count
+        long_ok = bcount >= min_long_count
+        dynamic_ok = bool(allow_dynamic_fallback and short_ok and dyn >= min_dynamic_score)
+        passed = bool(short_ok and (long_ok or dynamic_ok))
+        gate_mode = "long_signal" if bool(passed and long_ok) else ("dynamic_score_fallback" if bool(passed and dynamic_ok) else "blocked")
+        failure_reason = ""
+        if not passed:
+            if not short_ok:
+                failure_reason = f"short pressure active (N{scount} > N{max_short_count})"
+            elif allow_dynamic_fallback:
+                failure_reason = (
+                    f"insufficient momentum (long=N{bcount}, dynamic={dyn:.3f}, "
+                    f"need long>=N{min_long_count} or dynamic>={min_dynamic_score:.2f})"
+                )
+            else:
+                failure_reason = f"long signal below threshold (N{bcount} < N{min_long_count})"
+        return {
+            "passed": bool(passed),
+            "gate_mode": str(gate_mode),
+            "failure_reason": str(failure_reason),
+            "requirement_text": str(rules.get("requirement_text", "") or ""),
+            "min_long_count": int(min_long_count),
+            "max_short_count": int(max_short_count),
+            "allow_dynamic_fallback": bool(allow_dynamic_fallback),
+            "min_dynamic_score": float(min_dynamic_score),
+            "buy_count": int(bcount),
+            "sell_count": int(scount),
+            "dynamic_score": float(dyn),
+        }
+
+    @classmethod
+    def _evaluate_crypto_entry_alignment_gate(
+        cls,
+        *,
+        profile_key: Any,
+        start_level: int,
+        buy_count: int,
+        sell_count: int,
+        dynamic_score: float,
+        policy_mode: str = "",
+    ) -> Dict[str, Any]:
+        signal_eval = cls._evaluate_crypto_signal_gate(
+            profile_key=profile_key,
+            start_level=int(start_level),
+            buy_count=int(buy_count),
+            sell_count=int(sell_count),
+            dynamic_score=float(dynamic_score),
+            policy_mode=str(policy_mode or ""),
+        )
+        bcount = int(signal_eval.get("buy_count", buy_count) or buy_count or 0)
+        scount = int(signal_eval.get("sell_count", sell_count) or sell_count or 0)
+        dyn = float(signal_eval.get("dynamic_score", dynamic_score) or dynamic_score or 0.0)
+        min_long_count = int(signal_eval.get("min_long_count", start_level) or start_level)
+        min_dynamic_score = float(signal_eval.get("min_dynamic_score", 0.0) or 0.0)
+        allow_dynamic_fallback = bool(signal_eval.get("allow_dynamic_fallback", False))
+        gate_mode = str(signal_eval.get("gate_mode", "blocked") or "blocked")
+        profile = normalize_settings_profile(profile_key, default="balanced")
+        mode = str(policy_mode or "").strip().lower()
+
+        long_headroom = 0
+        dynamic_margin = 0.0
+        min_dynamic_long_count = 0
+        if allow_dynamic_fallback:
+            if profile == "max_growth":
+                long_headroom = 1
+                dynamic_margin = 0.35 if mode in {"aggressive", "aggressive_rotation"} else 0.30
+            elif profile == "aggressive":
+                long_headroom = 1
+                dynamic_margin = 0.25 if mode in {"aggressive", "aggressive_rotation"} else 0.20
+
+        entry_min_long_count = int(max(1, min_long_count + long_headroom))
+        entry_min_dynamic_score = float(min_dynamic_score + dynamic_margin) if allow_dynamic_fallback else float(min_dynamic_score)
+        passed = bool(signal_eval.get("passed", False))
+        failure_reason = str(signal_eval.get("failure_reason", "") or "").strip()
+        alignment_mode = "not_evaluated"
+        requirement_text = str(signal_eval.get("requirement_text", "") or "").strip()
+
+        if passed:
+            if gate_mode == "long_signal":
+                alignment_mode = "long_signal_buffer"
+                requirement_text = f"entry requires long>=N{entry_min_long_count} with short pressure clear"
+                passed = bcount >= entry_min_long_count
+                if not passed:
+                    failure_reason = (
+                        f"long signal too thin for entry stability (long=N{bcount}; need >=N{entry_min_long_count})"
+                    )
+            elif gate_mode == "dynamic_score_fallback":
+                alignment_mode = "dynamic_fallback_buffer"
+                requirement_text = (
+                    f"entry dynamic fallback requires dynamic>={entry_min_dynamic_score:.2f} "
+                    f"and long>=N{int(min_dynamic_long_count)}"
+                )
+                dynamic_ok = dyn >= entry_min_dynamic_score
+                long_floor_ok = bcount >= int(min_dynamic_long_count)
+                passed = bool(dynamic_ok and long_floor_ok)
+                if not passed:
+                    failure_reason = (
+                        f"dynamic fallback too thin for entry stability "
+                        f"(long=N{bcount}, dynamic={dyn:.3f}; need dynamic>={entry_min_dynamic_score:.2f}, "
+                        f"long>=N{int(min_dynamic_long_count)})"
+                    )
+            else:
+                alignment_mode = "blocked"
+                passed = False
+                if not failure_reason:
+                    failure_reason = "signal gate blocked"
+
+        return {
+            "passed": bool(passed),
+            "failure_reason": str(failure_reason),
+            "alignment_mode": str(alignment_mode),
+            "requirement_text": str(requirement_text),
+            "signal_gate_mode": str(gate_mode),
+            "min_long_count": int(entry_min_long_count),
+            "min_dynamic_score": float(entry_min_dynamic_score),
+            "long_headroom": int(long_headroom),
+            "dynamic_margin": float(dynamic_margin),
+            "min_dynamic_long_count": int(min_dynamic_long_count),
+            "buy_count": int(bcount),
+            "sell_count": int(scount),
+            "dynamic_score": float(dyn),
+        }
+
+    @staticmethod
+    def _signal_score_for_candidate(
+        dynamic_score: float,
+        buy_count: int,
+        start_level: int,
+    ) -> tuple[float, float]:
+        dyn = float(dynamic_score or 0.0)
+        lvl = max(1, min(int(start_level or 3), 7))
+        if dyn > 0.0:
+            required = max(0.01, dyn)
+            return dyn, required
+        proxy = float(max(0, int(buy_count or 0))) / 7.0
+        required = float(lvl) / 7.0
+        return proxy, required
+
+    def _crypto_alignment_snapshot(
+        self,
+        base_symbol: str,
+        *,
+        start_level: int,
+        dynamic_current_set: set[str],
+        profile_key: Any = "balanced",
+        dynamic_score: float = 0.0,
+        policy_mode: str = "",
+    ) -> Dict[str, Any]:
+        coin = str(base_symbol or "").strip().upper()
+        if not coin:
+            return {"aligned": True, "reasons": [], "buy_count": 0, "sell_count": 0}
+        buy_count = int(self._read_long_dca_signal(coin))
+        sell_count = int(self._read_short_dca_signal(coin))
+        reasons: List[str] = []
+        if dynamic_current_set and coin not in dynamic_current_set:
+            reasons.append("not in the active rotation set")
+        gate_eval = self._evaluate_crypto_signal_gate(
+            profile_key=profile_key,
+            start_level=int(start_level),
+            buy_count=int(buy_count),
+            sell_count=int(sell_count),
+            dynamic_score=float(dynamic_score or 0.0),
+            policy_mode=str(policy_mode or ""),
+        )
+        if not bool(gate_eval.get("passed", True)):
+            failure_reason = str(gate_eval.get("failure_reason", "") or "").strip()
+            if failure_reason:
+                reasons.append(failure_reason)
+            else:
+                reasons.append(str(gate_eval.get("requirement_text", "signal gate blocked") or "signal gate blocked"))
+        return {
+            "aligned": bool(len(reasons) == 0),
+            "reasons": reasons,
+            "buy_count": int(buy_count),
+            "sell_count": int(sell_count),
+            "dynamic_score": float(dynamic_score or 0.0),
+            "signal_gate_mode": str(gate_eval.get("gate_mode", "blocked") or "blocked"),
+            "signal_requirement": str(gate_eval.get("requirement_text", "") or ""),
+        }
+
     def _load_pnl_ledger(self) -> dict:
         try:
             if os.path.isfile(PNL_LEDGER_PATH):
@@ -1203,10 +1483,19 @@ class CryptoAPITrading:
                         if usd_used < 0.0:
                             usd_used = 0.0
 
+                        if float(pos_qty) <= 1e-12:
+                            pos["opened_ts"] = float(ts)
+                        elif ("opened_ts" not in pos) or (float(pos.get("opened_ts", 0.0) or 0.0) <= 0.0):
+                            pos["opened_ts"] = float(ts)
+                        pos["last_buy_ts"] = float(ts)
                         pos["usd_cost"] = float(pos_usd_cost) + float(usd_used)
                         pos["qty"] = float(pos_qty) + float(q if q > 0.0 else 0.0)
 
                         position_cost_after = float(pos["usd_cost"])
+                        try:
+                            self._last_entry_ts[base] = float(ts)
+                        except Exception:
+                            pass
 
                         # Save because open position changed (needs to persist across restarts)
                         self._save_pnl_ledger()
@@ -1235,6 +1524,10 @@ class CryptoAPITrading:
                         # Clean up tiny dust
                         if float(pos.get("qty", 0.0) or 0.0) <= 1e-12 or float(pos.get("usd_cost", 0.0) or 0.0) <= 1e-6:
                             open_pos.pop(base, None)
+                            try:
+                                self._last_entry_ts.pop(base, None)
+                            except Exception:
+                                pass
 
                         self._save_pnl_ledger()
 
@@ -1251,6 +1544,21 @@ class CryptoAPITrading:
             except Exception:
                 realized = None
 
+        effective_pnl_pct = pnl_pct
+        if side_l == "sell":
+            try:
+                cost_for_pct = None
+                if position_cost_used is not None and float(position_cost_used) > 0.0:
+                    cost_for_pct = float(position_cost_used)
+                elif avg_cost_basis is not None:
+                    est_cost = float(avg_cost_basis) * float(qty or 0.0)
+                    if est_cost > 0.0:
+                        cost_for_pct = est_cost
+                if realized is not None and cost_for_pct is not None and float(cost_for_pct) > 0.0:
+                    effective_pnl_pct = (float(realized) / float(cost_for_pct)) * 100.0
+            except Exception:
+                pass
+
         entry = {
             "ts": ts,
             "side": side,
@@ -1259,7 +1567,7 @@ class CryptoAPITrading:
             "qty": qty,
             "price": price,
             "avg_cost_basis": avg_cost_basis,
-            "pnl_pct": pnl_pct,
+            "pnl_pct": float(effective_pnl_pct) if effective_pnl_pct is not None else None,
             "fees_usd": fees_usd,
             "realized_profit_usd": realized,
             "order_id": order_id,
@@ -2320,6 +2628,23 @@ class CryptoAPITrading:
     def manage_trades(self):
         trades_made = False  # Flag to track if any trade was made in this iteration
         self._set_status_note("")
+        policy: Dict[str, Any] = {}
+        trade_quality_eval: Dict[str, Any] = {}
+        opportunity_eval: Dict[str, Any] = {}
+        entry_fail_reasons: List[str] = []
+        entry_eval_top_reason = ""
+        entry_eval_reason_counts: Dict[str, int] = {}
+        entry_size_scale = 1.0
+        entry_gate_flags: Dict[str, Any] = {}
+        stale_exit_events: List[Dict[str, Any]] = []
+        stale_exit_count = 0
+        stale_exit_enabled = True
+        stale_exit_grace_cycles = 2
+        stale_exit_max_per_cycle = 2
+        stale_exit_min_notional_usd = 5.0
+        skip_new_entries_this_cycle = False
+        signal_gate_debug: Dict[str, Any] = {}
+        entry_alignment_debug: Dict[str, Any] = {}
         try:
             self._reconcile_pending_orders(max_total_wait_s=0.5)
         except Exception:
@@ -2406,6 +2731,75 @@ class CryptoAPITrading:
                 if full not in symbols:
                     symbols.append(full)
             current_buy_prices, current_sell_prices, valid_symbols = self.get_price(symbols)
+
+        settings_path = resolve_settings_path(BASE_DIR) or _GUI_SETTINGS_PATH or os.path.join(BASE_DIR, "gui_settings.json")
+        settings = sanitize_settings(read_settings_file(settings_path, module_name="pt_trader") or {})
+        profile_key = normalize_settings_profile(settings.get("settings_profile", "balanced"), default="balanced")
+        start_level = max(1, min(int(TRADE_START_LEVEL or 3), 7))
+        runtime_snapshot = self._safe_read_json_file(RUNTIME_STATE_PATH)
+        runtime_alerts = runtime_snapshot.get("alerts", {}) if isinstance(runtime_snapshot.get("alerts", {}), dict) else {}
+        dynamic_status = self._safe_read_json_file(CRYPTO_DYNAMIC_STATUS_PATH)
+        dynamic_updated_ts = int(float(dynamic_status.get("ts", dynamic_status.get("updated_at", 0) or 0) or 0))
+        dynamic_rank_rows = dynamic_status.get("ranked", []) if isinstance(dynamic_status.get("ranked", []), list) else []
+        dynamic_rank_map: Dict[str, float] = {}
+        for row in list(dynamic_rank_rows):
+            if not isinstance(row, dict):
+                continue
+            symbol = str(row.get("symbol", "") or "").strip().upper()
+            if not symbol:
+                continue
+            try:
+                dynamic_rank_map[symbol] = float(row.get("score", 0.0) or 0.0)
+            except Exception:
+                dynamic_rank_map[symbol] = 0.0
+        reject_rows = dynamic_status.get("rejected", []) if isinstance(dynamic_status.get("rejected", []), list) else []
+        ranked_count = len([r for r in dynamic_rank_rows if isinstance(r, dict)])
+        rejected_count = len([r for r in reject_rows if isinstance(r, dict)])
+        reject_rate_pct = 0.0
+        if (ranked_count + rejected_count) > 0:
+            reject_rate_pct = (100.0 * float(rejected_count)) / float(ranked_count + rejected_count)
+        current_coins = dynamic_status.get("current_coins", []) if isinstance(dynamic_status.get("current_coins", []), list) else []
+        dynamic_current_set = {str(x or "").strip().upper() for x in current_coins if str(x or "").strip()}
+        try:
+            stale_exit_enabled = bool(settings.get("crypto_stale_exit_enabled", True))
+        except Exception:
+            stale_exit_enabled = True
+        try:
+            stale_exit_grace_cycles = max(1, int(float(settings.get("crypto_stale_alignment_grace_cycles", 2) or 2)))
+        except Exception:
+            stale_exit_grace_cycles = 2
+        try:
+            stale_exit_max_per_cycle = max(1, int(float(settings.get("crypto_stale_max_exits_per_cycle", 2) or 2)))
+        except Exception:
+            stale_exit_max_per_cycle = 2
+        try:
+            stale_exit_min_notional_usd = max(1.0, float(settings.get("crypto_stale_min_notional_usd", 5.0) or 5.0))
+        except Exception:
+            stale_exit_min_notional_usd = 5.0
+        try:
+            default_hold_s = 7200 if str(profile_key) == "max_growth" else 3600
+            stale_exit_min_hold_s = max(0, int(float(settings.get("crypto_stale_min_hold_seconds", default_hold_s) or default_hold_s)))
+        except Exception:
+            stale_exit_min_hold_s = 7200 if str(profile_key) == "max_growth" else 3600
+        try:
+            stale_exit_loss_cut_pct = float(settings.get("crypto_stale_loss_cut_pct", -2.0) or -2.0)
+        except Exception:
+            stale_exit_loss_cut_pct = -2.0
+        try:
+            stale_exit_force_short_count = max(
+                0,
+                int(
+                    float(
+                        settings.get(
+                            "crypto_stale_force_short_count",
+                            max(4, int(start_level) + 1),
+                        )
+                        or max(4, int(start_level) + 1)
+                    )
+                ),
+            )
+        except Exception:
+            stale_exit_force_short_count = max(4, int(start_level) + 1)
 
         # Calculate total account value (robust: never drop a held coin to $0 on transient API misses)
         snapshot_ok = True
@@ -2538,7 +2932,6 @@ class CryptoAPITrading:
 
             # Neural DCA applies to the levels BELOW the trade-start level.
             # Example: trade_start_level=3 => stages 0..3 map to N4..N7 (4 total).
-            start_level = max(1, min(int(TRADE_START_LEVEL or 3), 7))
             neural_dca_max = max(0, 7 - start_level)
 
             if next_stage < neural_dca_max:
@@ -2646,6 +3039,23 @@ class CryptoAPITrading:
                 "trail_peak": float(trail_peak_disp) if trail_peak_disp else 0.0,
                 "dist_to_trail_pct": float(dist_to_trail_pct) if dist_to_trail_pct else 0.0,
             }
+            align_snapshot = self._crypto_alignment_snapshot(
+                symbol,
+                start_level=start_level,
+                dynamic_current_set=dynamic_current_set,
+                profile_key=profile_key,
+                dynamic_score=float(dynamic_rank_map.get(str(symbol).upper().strip(), 0.0) or 0.0),
+            )
+            align_reasons = list(align_snapshot.get("reasons", []) or [])
+            if bool(align_snapshot.get("aligned", True)):
+                self._stale_alignment_streaks.pop(symbol, None)
+            else:
+                self._stale_alignment_streaks[symbol] = int(self._stale_alignment_streaks.get(symbol, 0) or 0) + 1
+            stale_streak = int(self._stale_alignment_streaks.get(symbol, 0) or 0)
+            aligned_with_strategy = bool(align_snapshot.get("aligned", True))
+            positions[symbol]["aligned_with_strategy"] = bool(aligned_with_strategy)
+            positions[symbol]["alignment_reasons"] = [str(r) for r in align_reasons[:3]]
+            positions[symbol]["alignment_streak"] = int(stale_streak)
 
 
             print(
@@ -2667,6 +3077,122 @@ class CryptoAPITrading:
                 )
             else:
                 print("  PM/Trail: N/A (avg_cost_basis is 0)")
+
+
+            should_force_stale_exit = (
+                bool(stale_exit_enabled)
+                and (not bool(align_snapshot.get("aligned", True)))
+                and stale_streak >= int(stale_exit_grace_cycles)
+                and stale_exit_count < int(stale_exit_max_per_cycle)
+            )
+            if should_force_stale_exit:
+                try:
+                    open_pos_row = (
+                        (self._pnl_ledger.get("open_positions", {}) if isinstance(self._pnl_ledger.get("open_positions", {}), dict) else {})
+                        .get(str(symbol).upper(), {})
+                    )
+                except Exception:
+                    open_pos_row = {}
+                if not isinstance(open_pos_row, dict):
+                    open_pos_row = {}
+                last_entry_ts_map = getattr(self, "_last_entry_ts", {})
+                if not isinstance(last_entry_ts_map, dict):
+                    last_entry_ts_map = {}
+                try:
+                    opened_ts = float(
+                        open_pos_row.get("opened_ts", last_entry_ts_map.get(str(symbol).upper(), 0.0))
+                        or 0.0
+                    )
+                except Exception:
+                    opened_ts = 0.0
+                position_age_s = max(0, int(time.time() - opened_ts)) if opened_ts > 0.0 else -1
+                sell_pressure = int(align_snapshot.get("sell_count", 0) or 0)
+                mild_loss = (gain_loss_percentage_sell < 0.0) and (gain_loss_percentage_sell > float(stale_exit_loss_cut_pct))
+                hold_guard_active = (
+                    position_age_s >= 0
+                    and position_age_s < int(stale_exit_min_hold_s)
+                    and mild_loss
+                    and sell_pressure < int(stale_exit_force_short_count)
+                )
+                if hold_guard_active:
+                    stale_exit_events.append(
+                        {
+                            "symbol": str(symbol),
+                            "ok": False,
+                            "reason": "stale_exit_hold_loss_guard",
+                            "detail": (
+                                f"Alignment stale but holding {symbol} to avoid a churn exit at mild loss "
+                                f"({gain_loss_percentage_sell:+.2f}% > {float(stale_exit_loss_cut_pct):+.2f}%) "
+                                f"during the first {int(stale_exit_min_hold_s)}s."
+                            ),
+                            "streak": int(stale_streak),
+                            "age_s": int(position_age_s),
+                            "sell_pressure": int(sell_pressure),
+                            "reasons": [str(r) for r in align_reasons[:3]],
+                        }
+                    )
+                    continue
+                if current_sell_price <= 0.0 or value < float(stale_exit_min_notional_usd):
+                    stale_exit_events.append(
+                        {
+                            "symbol": str(symbol),
+                            "ok": False,
+                            "reason": "stale_exit_price_or_notional_guard",
+                            "detail": f"Alignment stale but price/notional guard blocked exit ({value:.2f} USD).",
+                            "streak": int(stale_streak),
+                            "reasons": [str(r) for r in align_reasons[:3]],
+                        }
+                    )
+                else:
+                    reason_text = "; ".join([str(r) for r in align_reasons[:2]]) or "position no longer matches strategy"
+                    print(
+                        f"  Policy stale exit for {symbol}: {reason_text} "
+                        f"(streak {stale_streak}/{int(stale_exit_grace_cycles)})."
+                    )
+                    response = self.place_sell_order(
+                        str(uuid.uuid4()),
+                        "sell",
+                        "market",
+                        full_symbol,
+                        quantity,
+                        expected_price=current_sell_price,
+                        avg_cost_basis=avg_cost_basis,
+                        pnl_pct=gain_loss_percentage_sell,
+                        tag="POLICY_STALE_EXIT",
+                    )
+                    if response and isinstance(response, dict) and "errors" not in response:
+                        stale_exit_count += 1
+                        trades_made = True
+                        skip_new_entries_this_cycle = True
+                        self.trailing_pm.pop(symbol, None)
+                        self.dca_levels_triggered.pop(symbol, None)
+                        self._reset_dca_window_for_trade(symbol, sold=True)
+                        self._stale_alignment_streaks.pop(symbol, None)
+                        positions.pop(symbol, None)
+                        exit_msg = f"Exited {symbol}: no longer aligned with current strategy."
+                        self._set_status_note(exit_msg)
+                        stale_exit_events.append(
+                            {
+                                "symbol": str(symbol),
+                                "ok": True,
+                                "reason": "policy_stale_exit",
+                                "detail": reason_text,
+                                "streak": int(stale_streak),
+                                "reasons": [str(r) for r in align_reasons[:3]],
+                            }
+                        )
+                        time.sleep(2)
+                        continue
+                    stale_exit_events.append(
+                        {
+                            "symbol": str(symbol),
+                            "ok": False,
+                            "reason": "broker_sell_failed",
+                            "detail": reason_text,
+                            "streak": int(stale_streak),
+                            "reasons": [str(r) for r in align_reasons[:3]],
+                        }
+                    )
 
 
 
@@ -2791,6 +3317,13 @@ class CryptoAPITrading:
                 neural_hit = (gain_loss_percentage_buy < 0) and (neural_level_now >= neural_level_needed)
 
             if hard_hit or neural_hit:
+                if not bool(aligned_with_strategy):
+                    dca_skip_msg = (
+                        f"  Skipping DCA for {symbol}. "
+                        f"Position is no longer aligned with strategy ({'; '.join(align_reasons[:2]) or 'alignment gate'})."
+                    )
+                    self._log_rate_limited(f"dca_alignment_block_{symbol}", dca_skip_msg, every_s=30.0)
+                    continue
                 if neural_hit and hard_hit:
                     reason = f"NEURAL L{neural_level_now}>=L{neural_level_needed} OR HARD {hard_level:.2f}%"
                 elif neural_hit:
@@ -2849,6 +3382,20 @@ class CryptoAPITrading:
 
             else:
                 pass
+
+        try:
+            active_hold_symbols = {
+                str(row.get("asset_code", "") or "").strip().upper()
+                for row in list(holdings.get("results", []) or [])
+                if isinstance(row, dict)
+                and float(row.get("total_quantity", 0.0) or 0.0) > 0.0
+                and str(row.get("asset_code", "") or "").strip().upper() not in {"", "USDC"}
+            }
+            for coin in list(self._stale_alignment_streaks.keys()):
+                if str(coin or "").strip().upper() not in active_hold_symbols:
+                    self._stale_alignment_streaks.pop(coin, None)
+        except Exception:
+            pass
 
 
         # --- ensure GUI gets bid/ask lines even for coins not currently held ---
@@ -2918,118 +3465,425 @@ class CryptoAPITrading:
         except Exception:
             pass
 
+        market_health = {
+            "data_ok": bool(valid_symbols) and (not bool(used_cached_holdings)),
+            "broker_ok": bool(isinstance(account, dict) and trading_pairs),
+            "orders_ok": True,
+            "drift_warning": bool(used_cached_holdings),
+        }
+        policy = build_market_automation_policy(
+            market="crypto",
+            settings=settings,
+            profile_key=profile_key,
+            broker_mode=("paper" if bool(settings.get("paper_only_unless_checklist_green", False)) else "live"),
+            account_value_usd=float(total_account_value),
+            buying_power_usd=float(buying_power),
+            open_positions=int(len([row for row in holdings.get("results", []) if isinstance(row, dict)])),
+            runtime_alerts=runtime_alerts,
+            market_health=market_health,
+            compliance_state={},
+            reject_rate_pct=float(reject_rate_pct),
+            reject_rate_limit_pct=float(settings.get("runtime_alert_scan_reject_crit_pct", 85.0) or 85.0),
+            fallback_active=bool(used_cached_holdings),
+            fallback_age_s=max(0, int(time.time() - float(getattr(self, "_last_good_holdings_ts", 0.0) or 0.0)))
+            if bool(used_cached_holdings)
+            else 0,
+            fallback_hard_block_age_s=int(float(settings.get("market_fallback_snapshot_max_age_s", 1800.0) or 1800.0)),
+            loss_streak=0,
+            max_loss_streak=3,
+        )
+        policy_size_scale = max(0.20, float(policy.get("size_multiplier", 1.0) or 1.0))
+        effective_limits = policy.get("effective_limits", {}) if isinstance(policy.get("effective_limits", {}), dict) else {}
+        effective_crypto_max_spread_bps = max(
+            1.0,
+            float(
+                effective_limits.get(
+                    "max_spread_bps",
+                    settings.get("crypto_max_spread_bps", 150.0),
+                )
+                or 150.0
+            ),
+        )
+        try:
+            self.entry_cooldown_seconds = max(
+                60.0,
+                float(
+                    effective_limits.get(
+                        "rotation_cooldown_s",
+                        settings.get("crypto_dynamic_rotation_cooldown_s", self.entry_cooldown_seconds),
+                    )
+                    or self.entry_cooldown_seconds
+                ),
+            )
+        except Exception:
+            pass
+        if not bool(policy.get("allow_new_entries", True)):
+            policy_reason = str(
+                ((policy.get("runtime_trust", {}) if isinstance(policy.get("runtime_trust", {}), dict) else {}).get("reasons", [""])
+                or [""])[0]
+                or "Runtime trust is too low for new crypto entries"
+            ).strip()
+            if policy_reason:
+                self._set_status_note(policy_reason)
+                entry_fail_reasons.append(policy_reason)
+        if stale_exit_count > 0:
+            refresh_msg = f"Exited {stale_exit_count} stale position(s); waiting one cycle before new entries."
+            entry_fail_reasons.append(refresh_msg)
+            skip_new_entries_this_cycle = True
+            cur_note = str(getattr(self, "_status_note", "") or "").strip()
+            if cur_note:
+                if refresh_msg.lower() not in cur_note.lower():
+                    self._set_status_note(f"{cur_note} | {refresh_msg}")
+            else:
+                self._set_status_note(refresh_msg)
+
         if not trading_pairs:
-            return
+            if not entry_fail_reasons:
+                entry_fail_reasons.append("Trading pairs unavailable from broker API")
+        else:
+            alloc_pct = float(START_ALLOC_PCT or 0.5)
+            allocation_base_usd = total_account_value * (alloc_pct / 100.0)
+            if allocation_base_usd < 0.5:
+                allocation_base_usd = 0.5
+            allocation_policy_usd = max(0.5, float(allocation_base_usd) * float(policy_size_scale))
 
+            holding_full_symbols = [f"{h['asset_code']}-USD" for h in holdings.get("results", [])]
 
+            def _open_positions_count() -> int:
+                count = 0
+                for full in list(holding_full_symbols or []):
+                    base = str(full).split("-", 1)[0].strip().upper()
+                    if not base or base == "USDC":
+                        continue
+                    count += 1
+                return count
 
-        alloc_pct = float(START_ALLOC_PCT or 0.5)
-        allocation_in_usd = total_account_value * (alloc_pct / 100.0)
-        if allocation_in_usd < 0.5:
-            allocation_in_usd = 0.5
-
-
-        holding_full_symbols = [f"{h['asset_code']}-USD" for h in holdings.get("results", [])]
-
-        def _open_positions_count() -> int:
-            count = 0
-            for full in list(holding_full_symbols or []):
-                base = str(full).split("-", 1)[0].strip().upper()
-                if not base or base == "USDC":
+            candidate_rows: List[Dict[str, Any]] = []
+            for sym in list(crypto_symbols or []):
+                base_symbol = str(sym or "").strip().upper()
+                if not base_symbol:
                     continue
-                count += 1
-            return count
-
-        start_index = 0
-        while start_index < len(crypto_symbols):
-            if int(MAX_OPEN_POSITIONS or 0) > 0:
-                open_count = _open_positions_count()
-                if open_count >= int(MAX_OPEN_POSITIONS):
-                    msg = f"Max open positions reached ({open_count}/{int(MAX_OPEN_POSITIONS)})."
-                    self._set_status_note(msg)
-                    self._log_rate_limited("max_open_positions_reached", msg)
-                    break
-            base_symbol = crypto_symbols[start_index].upper().strip()
-            full_symbol = f"{base_symbol}-USD"
-
-            # Skip if already held
-            if full_symbol in holding_full_symbols:
-                start_index += 1
-                continue
-
-            last_exit_ts = float(self._last_exit_ts.get(base_symbol, 0.0) or 0.0)
-            if last_exit_ts > 0.0 and (time.time() - last_exit_ts) < float(self.entry_cooldown_seconds):
-                start_index += 1
-                continue
-
-            px_buy = float(current_buy_prices.get(full_symbol, 0.0) or 0.0)
-            px_sell = float(current_sell_prices.get(full_symbol, 0.0) or 0.0)
-            if full_symbol not in valid_symbols or px_buy <= 0.0 or px_sell <= 0.0:
-                msg = f"Skipping {base_symbol}: missing bid/ask price for entry."
-                self._set_status_note(msg)
-                self._log_rate_limited(f"missing_price_{base_symbol}", msg)
-                start_index += 1
-                continue
-
-            folder = base_paths.get(base_symbol, os.path.join(main_dir, base_symbol))
-            long_path = os.path.join(folder, "long_dca_signal.txt")
-            short_path = os.path.join(folder, "short_dca_signal.txt")
-            if (not os.path.isfile(long_path)) or (not os.path.isfile(short_path)):
-                msg = f"Skipping {base_symbol}: missing signal file(s)."
-                self._set_status_note(msg)
-                self._log_rate_limited(f"missing_signal_{base_symbol}", msg)
-                start_index += 1
-                continue
-
-            # Neural signals are used as a "permission to start" gate.
-            buy_count = self._read_long_dca_signal(base_symbol)
-            sell_count = self._read_short_dca_signal(base_symbol)
-
-            start_level = max(1, min(int(TRADE_START_LEVEL or 3), 7))
-
-            # Default behavior: long must be >= start_level and short must be 0
-            if not (buy_count >= start_level and sell_count == 0):
-                start_index += 1
-                continue
-
-            if not self._can_place_buy(base_symbol, allocation_in_usd, 0.0, total_account_value, holdings_sell_value):
-                start_index += 1
-                continue
-
-
-
-
-
-            response = self.place_buy_order(
-                str(uuid.uuid4()),
-                "buy",
-                "market",
-                full_symbol,
-                allocation_in_usd,
+                full_symbol = f"{base_symbol}-USD"
+                buy_count = self._read_long_dca_signal(base_symbol)
+                sell_count = self._read_short_dca_signal(base_symbol)
+                dyn_score = float(dynamic_rank_map.get(base_symbol, 0.0) or 0.0)
+                candidate_rows.append(
+                    {
+                        "symbol": base_symbol,
+                        "full_symbol": full_symbol,
+                        "buy_count": int(buy_count),
+                        "sell_count": int(sell_count),
+                        "dynamic_score": float(dyn_score),
+                    }
+                )
+            candidate_rows = sorted(
+                candidate_rows,
+                key=lambda row: (
+                    float(row.get("dynamic_score", 0.0) or 0.0),
+                    int(row.get("buy_count", 0) or 0),
+                    -int(row.get("sell_count", 0) or 0),
+                ),
+                reverse=True,
             )
 
-            if response and "errors" not in response:
-                trades_made = True
-                # Do NOT pre-trigger any DCA levels. Hardcoded DCA will mark levels only when it hits your loss thresholds.
-                self.dca_levels_triggered[base_symbol] = []
-
-                # Fresh trade -> clear any rolling 24h DCA window for this coin
-                self._reset_dca_window_for_trade(base_symbol, sold=False)
-
-                # Reset trailing PM state for this coin (fresh trade, fresh trailing logic)
-                self.trailing_pm.pop(base_symbol, None)
-
-
-                print(
-                    f"Starting new trade for {full_symbol} (AI start signal long={buy_count}, short={sell_count}). "
-                    f"Allocating ${allocation_in_usd:.2f}."
+            min_runtime_trust_score, min_confidence_score = self._profile_quality_thresholds(profile_key)
+            selected_symbol = ""
+            if (not bool(policy.get("allow_new_entries", True))) or bool(skip_new_entries_this_cycle):
+                candidate_rows = []
+            for cand in candidate_rows:
+                if int(MAX_OPEN_POSITIONS or 0) > 0:
+                    open_count = _open_positions_count()
+                    if open_count >= int(MAX_OPEN_POSITIONS):
+                        msg = f"Max open positions reached ({open_count}/{int(MAX_OPEN_POSITIONS)})."
+                        self._set_status_note(msg)
+                        self._log_rate_limited("max_open_positions_reached", msg)
+                        entry_fail_reasons.append(msg)
+                        break
+                base_symbol = str(cand.get("symbol", "") or "").strip().upper()
+                full_symbol = str(cand.get("full_symbol", "") or "").strip().upper()
+                if (not base_symbol) or (not full_symbol):
+                    continue
+                if full_symbol in holding_full_symbols:
+                    continue
+                if dynamic_current_set and base_symbol not in dynamic_current_set:
+                    entry_fail_reasons.append(f"Rotation set blocked {base_symbol} (not in active coin rotation)")
+                    continue
+                last_exit_ts = float(self._last_exit_ts.get(base_symbol, 0.0) or 0.0)
+                if last_exit_ts > 0.0 and (time.time() - last_exit_ts) < float(self.entry_cooldown_seconds):
+                    cd_left = int(max(0.0, float(self.entry_cooldown_seconds) - (time.time() - last_exit_ts)))
+                    entry_fail_reasons.append(f"Rotation cooldown active for {base_symbol} ({cd_left}s)")
+                    continue
+                px_buy = float(current_buy_prices.get(full_symbol, 0.0) or 0.0)
+                px_sell = float(current_sell_prices.get(full_symbol, 0.0) or 0.0)
+                if full_symbol not in valid_symbols or px_buy <= 0.0 or px_sell <= 0.0:
+                    msg = f"Skipping {base_symbol}: missing bid/ask price for entry."
+                    self._set_status_note(msg)
+                    self._log_rate_limited(f"missing_price_{base_symbol}", msg)
+                    entry_fail_reasons.append(msg)
+                    continue
+                folder = base_paths.get(base_symbol, os.path.join(main_dir, base_symbol))
+                long_path = os.path.join(folder, "long_dca_signal.txt")
+                short_path = os.path.join(folder, "short_dca_signal.txt")
+                if (not os.path.isfile(long_path)) or (not os.path.isfile(short_path)):
+                    msg = f"Skipping {base_symbol}: missing signal file(s)."
+                    self._set_status_note(msg)
+                    self._log_rate_limited(f"missing_signal_{base_symbol}", msg)
+                    entry_fail_reasons.append(msg)
+                    continue
+                buy_count = int(cand.get("buy_count", 0) or 0)
+                sell_count = int(cand.get("sell_count", 0) or 0)
+                dynamic_score = float(cand.get("dynamic_score", 0.0) or 0.0)
+                gate_eval = self._evaluate_crypto_signal_gate(
+                    profile_key=profile_key,
+                    start_level=int(start_level),
+                    buy_count=int(buy_count),
+                    sell_count=int(sell_count),
+                    dynamic_score=float(dynamic_score),
+                    policy_mode=str(policy.get("mode", "") or ""),
                 )
-                time.sleep(5)
-                holdings = self.get_holdings()
-                holding_full_symbols = [f"{h['asset_code']}-USD" for h in holdings.get("results", [])]
+                signal_gate_debug = {
+                    "symbol": str(base_symbol),
+                    "gate_mode": str(gate_eval.get("gate_mode", "blocked") or "blocked"),
+                    "requirement": str(gate_eval.get("requirement_text", "") or ""),
+                    "min_long_count": int(gate_eval.get("min_long_count", start_level) or start_level),
+                    "max_short_count": int(gate_eval.get("max_short_count", 0) or 0),
+                    "allow_dynamic_fallback": bool(gate_eval.get("allow_dynamic_fallback", False)),
+                    "min_dynamic_score": float(gate_eval.get("min_dynamic_score", 0.0) or 0.0),
+                    "dynamic_score": round(float(gate_eval.get("dynamic_score", 0.0) or 0.0), 4),
+                }
+                if not bool(gate_eval.get("passed", False)):
+                    fail_reason = str(gate_eval.get("failure_reason", "") or "").strip()
+                    req_text = str(gate_eval.get("requirement_text", "") or "").strip()
+                    if fail_reason and req_text:
+                        entry_fail_reasons.append(
+                            f"Signal gate blocked {base_symbol} ({fail_reason}; {req_text})"
+                        )
+                    elif fail_reason:
+                        entry_fail_reasons.append(f"Signal gate blocked {base_symbol} ({fail_reason})")
+                    else:
+                        entry_fail_reasons.append(f"Signal gate blocked {base_symbol} ({req_text or 'policy threshold'})")
+                    continue
+                entry_align_eval = self._evaluate_crypto_entry_alignment_gate(
+                    profile_key=profile_key,
+                    start_level=int(start_level),
+                    buy_count=int(buy_count),
+                    sell_count=int(sell_count),
+                    dynamic_score=float(dynamic_score),
+                    policy_mode=str(policy.get("mode", "") or ""),
+                )
+                entry_alignment_debug = {
+                    "symbol": str(base_symbol),
+                    "alignment_mode": str(entry_align_eval.get("alignment_mode", "not_evaluated") or "not_evaluated"),
+                    "requirement": str(entry_align_eval.get("requirement_text", "") or ""),
+                    "min_long_count": int(entry_align_eval.get("min_long_count", start_level) or start_level),
+                    "min_dynamic_score": float(entry_align_eval.get("min_dynamic_score", 0.0) or 0.0),
+                    "long_headroom": int(entry_align_eval.get("long_headroom", 0) or 0),
+                    "dynamic_margin": float(entry_align_eval.get("dynamic_margin", 0.0) or 0.0),
+                    "min_dynamic_long_count": int(entry_align_eval.get("min_dynamic_long_count", 0) or 0),
+                    "dynamic_score": round(float(entry_align_eval.get("dynamic_score", 0.0) or 0.0), 4),
+                    "passed": bool(entry_align_eval.get("passed", False)),
+                }
+                if not bool(entry_align_eval.get("passed", False)):
+                    align_reason = str(entry_align_eval.get("failure_reason", "") or "").strip()
+                    req_text = str(entry_align_eval.get("requirement_text", "") or "").strip()
+                    if align_reason and req_text:
+                        entry_fail_reasons.append(
+                            f"Entry alignment gate blocked {base_symbol} ({align_reason}; {req_text})"
+                        )
+                    elif align_reason:
+                        entry_fail_reasons.append(f"Entry alignment gate blocked {base_symbol} ({align_reason})")
+                    else:
+                        entry_fail_reasons.append(
+                            f"Entry alignment gate blocked {base_symbol} ({req_text or 'alignment threshold'})"
+                        )
+                    continue
+                stale_entry_guard_reason = ""
+                if str(entry_align_eval.get("alignment_mode", "") or "").strip().lower() == "dynamic_fallback_buffer":
+                    try:
+                        dynamic_margin_live = float(dynamic_score) - float(entry_align_eval.get("min_dynamic_score", 0.0) or 0.0)
+                    except Exception:
+                        dynamic_margin_live = 0.0
+                    try:
+                        dynamic_buffer_floor = float(
+                            settings.get(
+                                "crypto_entry_dynamic_buffer_min",
+                                0.18 if str(profile_key) == "max_growth" else 0.12,
+                            )
+                            or (0.18 if str(profile_key) == "max_growth" else 0.12)
+                        )
+                    except Exception:
+                        dynamic_buffer_floor = 0.18 if str(profile_key) == "max_growth" else 0.12
+                    try:
+                        dynamic_buy_floor = max(
+                            1,
+                            int(
+                                float(
+                                    settings.get(
+                                        "crypto_entry_dynamic_min_long_count",
+                                        max(1, int(start_level) - 1),
+                                    )
+                                    or max(1, int(start_level) - 1)
+                                )
+                            ),
+                        )
+                    except Exception:
+                        dynamic_buy_floor = max(1, int(start_level) - 1)
+                    if int(sell_count) > 0 and int(buy_count) < int(dynamic_buy_floor):
+                        stale_entry_guard_reason = (
+                            f"Entry stale-risk guard blocked {base_symbol} "
+                            f"(short pressure S{int(sell_count)} with long N{int(buy_count)} < N{int(dynamic_buy_floor)})"
+                        )
+                    elif int(buy_count) < int(dynamic_buy_floor) and float(dynamic_margin_live) < float(dynamic_buffer_floor):
+                        stale_entry_guard_reason = (
+                            f"Entry stale-risk guard blocked {base_symbol} "
+                            f"(dynamic margin {float(dynamic_margin_live):.3f} < {float(dynamic_buffer_floor):.3f} "
+                            f"with long N{int(buy_count)} below N{int(dynamic_buy_floor)})"
+                        )
+                    entry_alignment_debug["stale_entry_dynamic_margin"] = float(round(float(dynamic_margin_live), 4))
+                    entry_alignment_debug["stale_entry_dynamic_buffer_floor"] = float(round(float(dynamic_buffer_floor), 4))
+                    entry_alignment_debug["stale_entry_dynamic_buy_floor"] = int(dynamic_buy_floor)
+                if stale_entry_guard_reason:
+                    entry_alignment_debug["stale_entry_guard"] = str(stale_entry_guard_reason)
+                    entry_fail_reasons.append(str(stale_entry_guard_reason))
+                    continue
+                signal_score, required_score = self._signal_score_for_candidate(
+                    float(dynamic_score),
+                    buy_count,
+                    start_level,
+                )
+                mid_px = (px_buy + px_sell) / 2.0 if (px_buy > 0.0 and px_sell > 0.0) else 0.0
+                spread_bps = 0.0
+                if mid_px > 0.0:
+                    spread_bps = abs((px_buy - px_sell) / mid_px) * 10000.0
+                projected_exposure_pct = (((holdings_sell_value + allocation_policy_usd) / total_account_value) * 100.0) if total_account_value > 0.0 else 0.0
+                runtime_trust_score = float(
+                    (
+                        (policy.get("runtime_trust", {}) if isinstance(policy.get("runtime_trust", {}), dict) else {}).get(
+                            "score",
+                            0.0,
+                        )
+                    )
+                    or 0.0
+                )
+                runtime_reasons = (
+                    (policy.get("runtime_trust", {}) if isinstance(policy.get("runtime_trust", {}), dict) else {}).get(
+                        "reasons",
+                        [],
+                    )
+                )
+                runtime_reasons = runtime_reasons if isinstance(runtime_reasons, list) else []
+                compliance_reason = str(
+                    (runtime_reasons[0] if runtime_reasons else "")
+                    or "Crypto runtime trust gate is active"
+                ).strip()
+                fallback_age_s = (
+                    max(0, int(time.time() - float(getattr(self, "_last_good_holdings_ts", 0.0) or 0.0)))
+                    if bool(used_cached_holdings)
+                    else 0
+                )
+                quality_eval = evaluate_trade_quality(
+                    market="crypto",
+                    signal_score=float(signal_score),
+                    required_score=float(required_score),
+                    data_quality_ok=bool(market_health.get("data_ok", True)),
+                    broker_ok=bool(market_health.get("broker_ok", True)),
+                    runtime_trust_score=float(runtime_trust_score),
+                    runtime_alert_severity=str(runtime_alerts.get("severity", "ok") or "ok"),
+                    compliance_allowed=bool(policy.get("allow_new_entries", True)),
+                    compliance_reason=str(compliance_reason),
+                    fallback_active=bool(used_cached_holdings),
+                    fallback_age_s=int(fallback_age_s),
+                    fallback_hard_block_age_s=int(float(settings.get("market_fallback_snapshot_max_age_s", 1800.0) or 1800.0)),
+                    reject_rate_pct=float(reject_rate_pct),
+                    reject_rate_limit_pct=float(settings.get("runtime_alert_scan_reject_crit_pct", 85.0) or 85.0),
+                    spread_bps=float(spread_bps),
+                    max_slippage_bps=float(effective_crypto_max_spread_bps),
+                    loss_streak=0,
+                    max_loss_streak=3,
+                    exposure_usage_pct=float(projected_exposure_pct),
+                    min_runtime_trust_score=float(min_runtime_trust_score),
+                    min_confidence_score=float(min_confidence_score),
+                )
+                trade_quality_eval = dict(quality_eval)
+                if str(quality_eval.get("decision", "block") or "block").strip().lower() != "allow":
+                    q_reasons = quality_eval.get("block_reasons", []) if isinstance(quality_eval.get("block_reasons", []), list) else []
+                    fail_reason = str((q_reasons[0] if q_reasons else "Trade-quality gate blocked crypto entry") or "").strip()
+                    entry_fail_reasons.append(fail_reason)
+                    continue
 
+                quality_size_mult = max(0.20, min(1.25, float(quality_eval.get("size_multiplier", 1.0) or 1.0)))
+                proposed_notional = max(0.5, float(allocation_policy_usd) * float(quality_size_mult))
+                if not self._can_place_buy(base_symbol, proposed_notional, 0.0, total_account_value, holdings_sell_value):
+                    entry_fail_reasons.append(f"Risk cap blocked {base_symbol} entry")
+                    continue
 
-            start_index += 1
+                candidate_age_s = 0
+                if int(dynamic_updated_ts) > 0:
+                    candidate_age_s = max(0, int(time.time()) - int(dynamic_updated_ts))
+                allocator_eval = evaluate_cross_market_allocation(
+                    hub_dir=(os.path.dirname(CRYPTO_DYNAMIC_STATUS_PATH) or HUB_DATA_DIR),
+                    settings=settings,
+                    market="crypto",
+                    candidate_id=base_symbol,
+                    candidate_side="long",
+                    signal_score=float(signal_score),
+                    required_score=float(required_score),
+                    trade_quality=quality_eval if isinstance(quality_eval, dict) else {},
+                    automation_policy=policy if isinstance(policy, dict) else {},
+                    projected_trade_value_usd=float(proposed_notional),
+                    market_exposure_usd=float(holdings_sell_value),
+                    account_value_usd=float(total_account_value),
+                    buying_power_usd=float(buying_power),
+                    spread_bps=float(spread_bps),
+                    max_slippage_bps=float(effective_crypto_max_spread_bps),
+                    candidate_age_s=int(candidate_age_s),
+                    loss_streak=0,
+                    max_loss_streak=3,
+                )
+                allocator_decision = str(allocator_eval.get("decision", "allow") or "allow").strip().lower()
+                if allocator_decision != "allow":
+                    opportunity_eval = dict(allocator_eval)
+                    alloc_reason = str(
+                        allocator_eval.get("summary", "")
+                        or (
+                            (allocator_eval.get("reasons", []) if isinstance(allocator_eval.get("reasons", []), list) else [""])
+                            or [""]
+                        )[0]
+                        or "portfolio allocator deprioritized crypto entry"
+                    ).strip()
+                    entry_fail_reasons.append(f"Portfolio allocator: {alloc_reason}")
+                    continue
+                opportunity_eval = dict(allocator_eval)
+
+                response = self.place_buy_order(
+                    str(uuid.uuid4()),
+                    "buy",
+                    "market",
+                    full_symbol,
+                    proposed_notional,
+                )
+                if response and "errors" not in response:
+                    selected_symbol = base_symbol
+                    entry_fail_reasons = []
+                    entry_size_scale = quality_size_mult
+                    trades_made = True
+                    self._set_status_note(f"Entry placed for {base_symbol}")
+                    self.dca_levels_triggered[base_symbol] = []
+                    self._reset_dca_window_for_trade(base_symbol, sold=False)
+                    self.trailing_pm.pop(base_symbol, None)
+                    print(
+                        f"Starting new trade for {full_symbol} "
+                        f"(score={signal_score:.4f}, req={required_score:.4f}, quality={float(quality_eval.get('confidence_score', 0.0) or 0.0):.1f}). "
+                        f"Allocating ${proposed_notional:.2f}."
+                    )
+                    time.sleep(5)
+                    holdings = self.get_holdings()
+                    holding_full_symbols = [f"{h['asset_code']}-USD" for h in holdings.get("results", [])]
+                    break
+                entry_fail_reasons.append(f"Order rejected for {base_symbol}")
+
+            if (not selected_symbol) and (not entry_fail_reasons):
+                entry_fail_reasons.append("No crypto candidates passed policy and quality gates")
 
         # If any trades were made, recalculate the cost basis
         if trades_made:
@@ -3043,11 +3897,117 @@ class CryptoAPITrading:
                 print("Failed to recalculcate cost basis.")
             self.initialize_dca_levels()
 
+        entry_eval_top_reason, entry_eval_reason_counts = self._entry_fail_summary(entry_fail_reasons)
+        if (not str(getattr(self, "_status_note", "") or "").strip()) and entry_eval_top_reason:
+            self._set_status_note(entry_eval_top_reason)
+        policy_summary = str(policy.get("summary", "") or "").strip()
+        if policy_summary:
+            cur_note = str(getattr(self, "_status_note", "") or "").strip()
+            if cur_note and policy_summary.lower() not in cur_note.lower():
+                self._set_status_note(f"{cur_note} | {policy_summary}")
+            elif not cur_note:
+                self._set_status_note(policy_summary)
+        allocator_summary = str(opportunity_eval.get("summary", "") or "").strip() if isinstance(opportunity_eval, dict) else ""
+        if allocator_summary:
+            cur_note = str(getattr(self, "_status_note", "") or "").strip()
+            if cur_note and allocator_summary.lower() not in cur_note.lower():
+                self._set_status_note(f"{cur_note} | {allocator_summary}")
+            elif not cur_note:
+                self._set_status_note(allocator_summary)
+        runtime_trust = policy.get("runtime_trust", {}) if isinstance(policy.get("runtime_trust", {}), dict) else {}
+        quality_layers = trade_quality_eval.get("layers", {}) if isinstance(trade_quality_eval.get("layers", {}), dict) else {}
+        trade_quality_evaluated = bool(isinstance(trade_quality_eval, dict) and trade_quality_eval)
+        allocator_evaluated = bool(isinstance(opportunity_eval, dict) and opportunity_eval)
+        allocator_reasons = opportunity_eval.get("reasons", []) if isinstance(opportunity_eval.get("reasons", []), list) else []
+        allocator_top_reason = str((allocator_reasons[0] if allocator_reasons else "") or "").strip()
+        trade_confidence_score = float(trade_quality_eval.get("confidence_score", 0.0) or 0.0) if trade_quality_evaluated else 0.0
+        quality_size_scale = float(trade_quality_eval.get("size_multiplier", 1.0) or 1.0) if trade_quality_evaluated else 1.0
+        entry_gate_flags = {
+            "data_quality_ok": bool(market_health.get("data_ok", True)),
+            "broker_ok": bool(market_health.get("broker_ok", True)),
+            "orders_ok": bool(market_health.get("orders_ok", True)),
+            "drift_warning": bool(market_health.get("drift_warning", False)),
+            "cached_fallback_active": bool(used_cached_holdings),
+            "cached_fallback_age_s": max(0, int(time.time() - float(getattr(self, "_last_good_holdings_ts", 0.0) or 0.0)))
+            if bool(used_cached_holdings)
+            else 0,
+            "reject_rate_pct": round(float(reject_rate_pct), 4),
+            "reject_rate_max_pct": round(float(settings.get("runtime_alert_scan_reject_crit_pct", 85.0) or 85.0), 4),
+            "max_spread_bps": round(float(effective_crypto_max_spread_bps), 4),
+            "runtime_trust_score": round(float(runtime_trust.get("score", 0.0) or 0.0), 4),
+            "runtime_trust_mode": str(runtime_trust.get("mode", "") or ""),
+            "policy_mode": str(policy.get("mode", "") or ""),
+            "policy_profile": str(policy.get("profile", "") or ""),
+            "policy_size_scale": round(float(policy_size_scale), 4),
+            "trade_quality_evaluated": bool(trade_quality_evaluated),
+            "trade_quality_decision": str(trade_quality_eval.get("decision", "not_evaluated") if trade_quality_evaluated else "not_evaluated"),
+            "trade_confidence_score": round(float(trade_confidence_score), 4),
+            "trade_quality_size_scale": round(float(quality_size_scale), 4),
+            "portfolio_allocator_evaluated": bool(allocator_evaluated),
+            "portfolio_allocator_decision": str(opportunity_eval.get("decision", "not_evaluated") if allocator_evaluated else "not_evaluated"),
+            "portfolio_allocator_best_market": str(opportunity_eval.get("best_market", "") or ""),
+            "portfolio_allocator_score": round(float(opportunity_eval.get("current_market_score", 0.0) or 0.0), 4),
+            "portfolio_allocator_top_reason": allocator_top_reason,
+            "portfolio_allocator_capital_constrained": bool(opportunity_eval.get("capital_constrained", False)) if allocator_evaluated else False,
+            "signal_quality_pass": bool(quality_layers.get("signal_quality", False)),
+            "execution_quality_pass": bool(quality_layers.get("execution_quality", False)),
+            "compliance_permission_pass": bool(quality_layers.get("compliance_permission", False)),
+            "runtime_trust_pass": bool(quality_layers.get("runtime_trust", False)),
+            "rotation_cooldown_s": int(max(0.0, float(self.entry_cooldown_seconds or 0.0))),
+            "stale_exit_enabled": bool(stale_exit_enabled),
+            "stale_exit_grace_cycles": int(stale_exit_grace_cycles),
+            "stale_exit_count": int(stale_exit_count),
+            "stale_exit_max_per_cycle": int(stale_exit_max_per_cycle),
+            "stale_exit_min_notional_usd": round(float(stale_exit_min_notional_usd), 4),
+            "stale_exit_min_hold_s": int(stale_exit_min_hold_s),
+            "stale_exit_loss_cut_pct": round(float(stale_exit_loss_cut_pct), 4),
+            "stale_exit_force_short_count": int(stale_exit_force_short_count),
+            "skip_new_entries_this_cycle": bool(skip_new_entries_this_cycle),
+            "signal_gate_symbol": str(signal_gate_debug.get("symbol", "") or ""),
+            "signal_gate_mode": str(signal_gate_debug.get("gate_mode", "") or ""),
+            "signal_gate_requirement": str(signal_gate_debug.get("requirement", "") or ""),
+            "signal_gate_min_long_count": int(signal_gate_debug.get("min_long_count", start_level) or start_level),
+            "signal_gate_max_short_count": int(signal_gate_debug.get("max_short_count", 0) or 0),
+            "signal_gate_dynamic_fallback": bool(signal_gate_debug.get("allow_dynamic_fallback", False)),
+            "signal_gate_min_dynamic_score": round(float(signal_gate_debug.get("min_dynamic_score", 0.0) or 0.0), 4),
+            "signal_gate_dynamic_score": round(float(signal_gate_debug.get("dynamic_score", 0.0) or 0.0), 4),
+            "entry_alignment_symbol": str(entry_alignment_debug.get("symbol", "") or ""),
+            "entry_alignment_mode": str(entry_alignment_debug.get("alignment_mode", "") or ""),
+            "entry_alignment_requirement": str(entry_alignment_debug.get("requirement", "") or ""),
+            "entry_alignment_min_long_count": int(entry_alignment_debug.get("min_long_count", start_level) or start_level),
+            "entry_alignment_min_dynamic_score": round(float(entry_alignment_debug.get("min_dynamic_score", 0.0) or 0.0), 4),
+            "entry_alignment_long_headroom": int(entry_alignment_debug.get("long_headroom", 0) or 0),
+            "entry_alignment_dynamic_margin": round(float(entry_alignment_debug.get("dynamic_margin", 0.0) or 0.0), 4),
+            "entry_alignment_min_dynamic_long_count": int(entry_alignment_debug.get("min_dynamic_long_count", 0) or 0),
+            "entry_alignment_dynamic_score": round(float(entry_alignment_debug.get("dynamic_score", 0.0) or 0.0), 4),
+            "entry_alignment_pass": bool(entry_alignment_debug.get("passed", False)),
+            "entry_alignment_stale_entry_guard": str(entry_alignment_debug.get("stale_entry_guard", "") or ""),
+            "entry_alignment_stale_dynamic_margin": round(float(entry_alignment_debug.get("stale_entry_dynamic_margin", 0.0) or 0.0), 4),
+            "entry_alignment_stale_dynamic_buffer_floor": round(float(entry_alignment_debug.get("stale_entry_dynamic_buffer_floor", 0.0) or 0.0), 4),
+            "entry_alignment_stale_dynamic_buy_floor": int(entry_alignment_debug.get("stale_entry_dynamic_buy_floor", 0) or 0),
+        }
+
         # --- GUI HUB STATUS WRITE ---
         try:
+            base_alloc_pct = float(START_ALLOC_PCT or 0.5)
+            trade_notional_base = max(0.5, float(total_account_value) * (base_alloc_pct / 100.0))
+            trade_notional_policy = max(0.5, float(trade_notional_base) * float(policy_size_scale))
+            open_positions_count = 0
+            for row in list(positions.values() if isinstance(positions, dict) else []):
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    qty = float(row.get("quantity", 0.0) or 0.0)
+                except Exception:
+                    qty = 0.0
+                if qty > 0.0:
+                    open_positions_count += 1
             status = {
                 "timestamp": time.time(),
                 "status_note": getattr(self, "_status_note", ""),
+                "state": "READY",
+                "trader_state": "AUTO",
+                "msg": str(getattr(self, "_status_note", "") or ""),
                 "account": {
                     "total_account_value": total_account_value,
                     "buying_power": buying_power,
@@ -3060,6 +4020,20 @@ class CryptoAPITrading:
                     "trailing_gap_pct": float(getattr(self, "trailing_gap_pct", 0.0)),
                 },
                 "positions": positions,
+                "open_positions": int(open_positions_count),
+                "trade_notional_base_usd": round(float(trade_notional_base), 4),
+                "trade_notional_policy_usd": round(float(trade_notional_policy), 4),
+                "entry_size_scale": round(float(entry_size_scale), 4),
+                "entry_eval_total": int(len(entry_fail_reasons)),
+                "entry_eval_failed": int(len(entry_fail_reasons) > 0),
+                "entry_eval_top_reason": str(entry_eval_top_reason),
+                "entry_eval_reason_counts": dict(entry_eval_reason_counts),
+                "automation_policy": policy if isinstance(policy, dict) else {},
+                "trade_quality": trade_quality_eval if isinstance(trade_quality_eval, dict) else {},
+                "opportunity_allocator": opportunity_eval if isinstance(opportunity_eval, dict) else {},
+                "entry_gate_flags": dict(entry_gate_flags),
+                "stale_exit_count": int(stale_exit_count),
+                "stale_exit_events": list(stale_exit_events[:12]),
             }
             now_ts = float(status["timestamp"])
             if (now_ts - float(getattr(self, "_last_account_value_history_write_ts", 0.0) or 0.0)) >= 15.0:

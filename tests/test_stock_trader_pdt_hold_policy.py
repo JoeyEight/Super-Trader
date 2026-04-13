@@ -114,7 +114,10 @@ class TestStockTraderPDTHoldPolicy(unittest.TestCase):
                 out = stock_trader.run_step(settings, td)
             self.assertEqual(_FakeAlpacaClient.close_calls, 0)
             self.assertEqual(str(out.get("state", "")), "READY")
-            self.assertIn("pdt hold gate", " ".join([str(x) for x in list(out.get("actions", []) or [])]).lower())
+            self.assertIn(
+                "exit delayed to next session due to stock day-trade protection",
+                " ".join([str(x) for x in list(out.get("actions", []) or [])]).lower(),
+            )
             state = self._read_json(os.path.join(stocks_dir, "stock_trader_state.json"))
             self.assertIn("AAPL", (state.get("trail", {}) or {}))
 
@@ -225,9 +228,12 @@ class TestStockTraderPDTHoldPolicy(unittest.TestCase):
             self.assertEqual(str(out.get("state", "")), "READY")
             self.assertEqual(int(out.get("day_trades_rolling_5d", 0) or 0), 3)
             self.assertIn(
-                "pdt guard",
+                "exit delayed to next session due to stock day-trade protection",
                 " ".join([str(x) for x in list(out.get("actions", []) or [])]).lower(),
             )
+            gate_flags = out.get("entry_gate_flags", {}) if isinstance(out.get("entry_gate_flags", {}), dict) else {}
+            self.assertTrue(bool(gate_flags.get("compliance_mode", "")))
+            self.assertIn("compliance mode", str(gate_flags.get("compliance_status", "")).lower())
 
 
 if __name__ == "__main__":

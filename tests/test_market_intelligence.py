@@ -144,6 +144,19 @@ class TestMarketIntelligence(unittest.TestCase):
             "ts": 1_700_000_000,
             "checks": {"ok": True, "warnings": [], "errors": []},
             "alerts": {"severity": "warning", "reasons": ["scan_reject_pressure"], "hints": ["Tune thresholds."]},
+            "automation_policy": {
+                "stocks": {
+                    "summary": "Balanced preset; scan every 15s",
+                    "allow_new_entries": True,
+                    "runtime_trust_score": 78.0,
+                },
+                "forex": {
+                    "summary": "Aggressive preset; runtime trust reduced size",
+                    "allow_new_entries": False,
+                    "runtime_trust_score": 30.0,
+                    "compliance_status": "",
+                },
+            },
             "scan_cadence": {"active": []},
             "market_trends": {
                 "stocks": {
@@ -169,6 +182,8 @@ class TestMarketIntelligence(unittest.TestCase):
         self.assertTrue(isinstance(out.get("items", []), list))
         self.assertTrue(isinstance(out.get("by_market", {}), dict))
         titles = [str((row or {}).get("title", "") or "") for row in list(out.get("items", []) or [])]
+        self.assertIn("Stocks automation policy", titles)
+        self.assertIn("Forex automation policy", titles)
         self.assertNotIn("scanner_cadence_drift", titles)
         self.assertNotIn("runner_startup_check", titles)
 
@@ -292,6 +307,52 @@ class TestMarketIntelligence(unittest.TestCase):
         out = build_notification_center_payload(runtime_state, incidents_rows=incidents)
         titles = [str((row or {}).get("title", "") or "") for row in list(out.get("items", []) or [])]
         self.assertIn("runner_watchdog_restart", titles)
+
+    def test_notification_center_filters_resolved_trader_crash_loop(self) -> None:
+        runtime_state = {
+            "ts": 1_700_000_000,
+            "checks": {"ok": True, "warnings": [], "errors": []},
+            "alerts": {"severity": "ok", "reasons": [], "hints": []},
+            "scan_cadence": {"active": []},
+            "scan_drift": {"active": []},
+            "runner": {"state": "RUNNING", "children": {"trader": 45678}},
+            "market_trends": {"stocks": {}, "forex": {}},
+        }
+        incidents = [
+            {
+                "ts": 1_699_999_995,
+                "severity": "error",
+                "event": "runner_child_crash_loop",
+                "msg": "trader crash loop; lockout 180s",
+                "details": {"child": "trader"},
+            }
+        ]
+        out = build_notification_center_payload(runtime_state, incidents_rows=incidents)
+        titles = [str((row or {}).get("title", "") or "") for row in list(out.get("items", []) or [])]
+        self.assertNotIn("runner_child_crash_loop", titles)
+
+    def test_notification_center_keeps_active_trader_crash_loop_when_child_down(self) -> None:
+        runtime_state = {
+            "ts": 1_700_000_000,
+            "checks": {"ok": True, "warnings": [], "errors": []},
+            "alerts": {"severity": "ok", "reasons": [], "hints": []},
+            "scan_cadence": {"active": []},
+            "scan_drift": {"active": []},
+            "runner": {"state": "RUNNING", "children": {"trader": 0}},
+            "market_trends": {"stocks": {}, "forex": {}},
+        }
+        incidents = [
+            {
+                "ts": 1_699_999_995,
+                "severity": "error",
+                "event": "runner_child_crash_loop",
+                "msg": "trader crash loop; lockout 180s",
+                "details": {"child": "trader"},
+            }
+        ]
+        out = build_notification_center_payload(runtime_state, incidents_rows=incidents)
+        titles = [str((row or {}).get("title", "") or "") for row in list(out.get("items", []) or [])]
+        self.assertIn("runner_child_crash_loop", titles)
 
     def test_notification_center_from_hub_recomputes_runtime_alerts(self) -> None:
         with tempfile.TemporaryDirectory() as td:

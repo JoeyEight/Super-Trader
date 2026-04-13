@@ -19,14 +19,37 @@ def _safe_read_json(path: str) -> Dict[str, Any]:
         return {}
 
 
+def _tail_text_lines(path: str, max_lines: int = 2000, max_bytes: int = 2 * 1024 * 1024) -> List[str]:
+    lim = max(1, int(max_lines or 1))
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = int(f.tell() or 0)
+            if size <= 0:
+                return []
+            window = min(size, max(8192, int(max_bytes or 0), lim * 512))
+            f.seek(-window, os.SEEK_END)
+            blob = f.read(window)
+    except Exception:
+        return []
+    try:
+        lines = str(blob.decode("utf-8", errors="ignore")).splitlines()
+    except Exception:
+        return []
+    if window < size and lines:
+        # The first line may be partial when reading from a tail window.
+        lines = lines[1:]
+    out: List[str] = []
+    for ln in lines:
+        txt = str(ln or "").strip()
+        if txt:
+            out.append(txt)
+    return out[-lim:]
+
+
 def _safe_read_jsonl(path: str, max_lines: int = 2000) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            lines = [ln.strip() for ln in f if ln.strip()]
-    except Exception:
-        return out
-    for ln in lines[-max(1, int(max_lines)):]:
+    for ln in _tail_text_lines(path, max_lines=max_lines):
         try:
             row = json.loads(ln)
         except Exception:
@@ -104,6 +127,22 @@ def _data_source_reliability(scan_diag: Dict[str, Any], quality_report: Dict[str
     reject_summary = diag.get("reject_summary", {}) if isinstance(diag.get("reject_summary", {}), dict) else {}
     fallback_cached = bool(thinker.get("fallback_cached", False))
     fallback_age_s = int(float(thinker.get("fallback_age_s", 0) or 0)) if fallback_cached else 0
+    market_open = bool(diag.get("market_open", True))
+    market_closed_mode = (not market_open) and (str(reject_summary.get("dominant_reason", "") or "").strip().lower() == "market_closed")
+
+    if market_closed_mode:
+        return {
+            "score": 100.0,
+            "level": "high",
+            "reject_rate_pct": 0.0,
+            "fallback_cached": bool(fallback_cached),
+            "fallback_age_s": int(fallback_age_s),
+            "feed_health": {
+                "errors": int(feed_health.get("errors", 0) or 0),
+                "stale": int(feed_health.get("stale", 0) or 0),
+                "total": int(feed_health.get("total", 0) or 0),
+            },
+        }
 
     reject_rate = float(report.get("reject_rate_pct", reject_summary.get("reject_rate_pct", 0.0)) or 0.0)
     quality_penalty = max(0.0, min(60.0, reject_rate * 0.45))
@@ -274,6 +313,27 @@ def _quality_aggregate(scan_diag: Dict[str, Any], quality_report: Dict[str, Any]
     leaders_total = int(report.get("leaders_total", diag.get("leaders_total", 0)) or 0)
     scores_total = int(report.get("scores_total", diag.get("scores_total", 0)) or 0)
     dominant_ratio_pct = float(reject_summary.get("dominant_ratio_pct", 0.0) or 0.0)
+    market_open = bool(diag.get("market_open", True))
+    market_closed_mode = (not market_open) and (str(reject_summary.get("dominant_reason", "") or "").strip().lower() == "market_closed")
+    if market_closed_mode:
+        reject_rate_raw = float(reject_summary.get("reject_rate_pct", 0.0) or 0.0)
+        reject_rate = 0.0
+        dominant_reason = "market_closed"
+        dominant_ratio_pct = 0.0
+        candidate_churn = float(diag.get("candidate_churn_pct", 0.0) or 0.0)
+        leader_churn = float(diag.get("leader_churn_pct", 0.0) or 0.0)
+        gate_pass_pct = 100.0 if (leaders_total <= 0 and scores_total <= 0 and reject_rate_raw <= 0.0) else 0.0
+        return {
+            "reject_rate_pct": round(max(0.0, min(100.0, reject_rate)), 3),
+            "reject_rate_raw_pct": round(max(0.0, min(100.0, reject_rate_raw)), 3),
+            "candidate_churn_pct": round(max(0.0, min(100.0, candidate_churn)), 3),
+            "leader_churn_pct": round(max(0.0, min(100.0, leader_churn)), 3),
+            "gate_pass_pct": round(max(0.0, min(100.0, gate_pass_pct)), 3),
+            "dominant_reason": dominant_reason,
+            "reject_dominant_ratio_pct": round(max(0.0, min(100.0, dominant_ratio_pct)), 3),
+            "leaders_total": max(0, leaders_total),
+            "scores_total": max(0, scores_total),
+        }
     reject_rate = effective_reject_pressure(
         reject_rate_raw,
         dominant_reason=dominant_reason,

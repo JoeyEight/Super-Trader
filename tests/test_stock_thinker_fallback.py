@@ -4,15 +4,15 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from engines import stock_thinker
 
 
 def _mk_bar(idx: int, close_px: float) -> dict:
-    hh = idx % 24
-    day = 1 + (idx % 28)
-    ts = f"2026-03-{day:02d}T{hh:02d}:00:00Z"
+    base = datetime.now(timezone.utc) - timedelta(hours=30)
+    ts = (base + timedelta(hours=int(idx))).strftime("%Y-%m-%dT%H:00:00Z")
     c = float(close_px)
     o = c * 1.002
     h = max(o, c) * 1.001

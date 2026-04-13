@@ -6,6 +6,7 @@ import json
 import os
 import random
 import time
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -37,6 +38,9 @@ ROLLOUT_ORDER = {
 FOREX_FACTORY_EXPORT_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.csv"
 FOREX_FACTORY_USER_AGENT = "Mozilla/5.0 (SuperTrader/1.0)"
 _FF_IMPACT_RANK = {"low": 1, "medium": 2, "high": 3}
+_FOREX_OUTLIER_MAX_ABS_CHANGE_6H_PCT = 8.0
+_FOREX_OUTLIER_MAX_ABS_CHANGE_24H_PCT = 12.0
+_FOREX_OUTLIER_MAX_STEP_MOVE_PCT = 3.0
 
 
 def _float(v: Any, default: float = 0.0) -> float:
@@ -116,6 +120,10 @@ def _quality_report_path(hub_dir: str) -> str:
 
 def _calendar_cache_path(hub_dir: str) -> str:
     return os.path.join(hub_dir, "forex", "forexfactory_calendar_cache.json")
+
+
+def _calendar_refresh_marker_path(hub_dir: str) -> str:
+    return os.path.join(hub_dir, "forex", "forexfactory_calendar_refresh.lock")
 
 
 def _confidence_calibration_path(hub_dir: str) -> str:
@@ -207,7 +215,114 @@ def _fetch_forexfactory_events(now_ts: int, timeout_s: float = 8.0) -> List[Dict
     return events
 
 
-def _load_forexfactory_context(hub_dir: str, settings: Dict[str, Any], now_ts: int) -> Dict[str, Any]:
+def _try_acquire_calendar_refresh_marker(marker_path: str, now_ts: int, stale_after_s: float) -> bool:
+    stale_window_s = max(30.0, float(stale_after_s or 0.0))
+    if os.path.isfile(marker_path):
+        marker = _load_json_map(marker_path)
+        started_ts = _float(marker.get("started_ts", 0.0), 0.0)
+        if started_ts <= 0.0:
+            try:
+                started_ts = float(os.path.getmtime(marker_path))
+            except Exception:
+                started_ts = float(now_ts)
+        if (float(now_ts) - started_ts) <= stale_window_s:
+            return False
+        try:
+            os.remove(marker_path)
+        except Exception:
+            return False
+    try:
+        os.makedirs(os.path.dirname(marker_path), exist_ok=True)
+        fd = os.open(marker_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return False
+    except Exception:
+        return False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"started_ts": int(now_ts), "pid": int(os.getpid())}, f, indent=2)
+    except Exception:
+        return False
+    return True
+
+
+def _release_calendar_refresh_marker(marker_path: str) -> None:
+    try:
+        if os.path.isfile(marker_path):
+            os.remove(marker_path)
+    except Exception:
+        pass
+
+
+def _refresh_forexfactory_cache(hub_dir: str, settings: Dict[str, Any], now_ts: int) -> Dict[str, Any]:
+    path = _calendar_cache_path(hub_dir)
+    cache = _load_json_map(path)
+    cached_events = list(cache.get("events", []) or []) if isinstance(cache.get("events", []), list) else []
+    try:
+        fetched_ts = float(cache.get("fetched_ts", 0.0) or 0.0)
+    except Exception:
+        fetched_ts = 0.0
+    timeout_s = 8.0
+    try:
+        timeout_s = max(1.0, min(20.0, float(settings.get("news_event_timeout_s", 8.0) or 8.0)))
+    except Exception:
+        timeout_s = 8.0
+    try:
+        events = _fetch_forexfactory_events(now_ts=now_ts, timeout_s=timeout_s)
+        payload = dict(cache)
+        payload.update(
+            {
+                "fetched_ts": int(now_ts),
+                "events": events,
+                "source": "forexfactory",
+                "last_error_ts": 0,
+                "last_error": "",
+                "last_refresh_attempt_ts": int(now_ts),
+                "last_refresh_ok_ts": int(now_ts),
+                "last_refresh_state": "ok",
+            }
+        )
+        _save_json_map(path, payload)
+        return {"ok": True, "events_total": int(len(events))}
+    except Exception as exc:
+        err = f"{type(exc).__name__}: {exc}"
+        payload = dict(cache)
+        payload.update(
+            {
+                "fetched_ts": int(fetched_ts),
+                "events": cached_events,
+                "source": "forexfactory",
+                "last_error_ts": int(now_ts),
+                "last_error": err,
+                "last_refresh_attempt_ts": int(now_ts),
+                "last_refresh_state": "error",
+            }
+        )
+        _save_json_map(path, payload)
+        return {"ok": False, "events_total": int(len(cached_events)), "error": err}
+
+
+def _spawn_forexfactory_refresh(hub_dir: str, settings: Dict[str, Any], marker_path: str) -> bool:
+    def _runner() -> None:
+        try:
+            _refresh_forexfactory_cache(hub_dir, dict(settings or {}), int(time.time()))
+        finally:
+            _release_calendar_refresh_marker(marker_path)
+
+    try:
+        thread = threading.Thread(
+            target=_runner,
+            name="forex_factory_refresh",
+            daemon=True,
+        )
+        thread.start()
+        return True
+    except Exception:
+        _release_calendar_refresh_marker(marker_path)
+        return False
+
+
+def _load_forexfactory_context_cached(hub_dir: str, settings: Dict[str, Any], now_ts: int) -> Dict[str, Any]:
     enabled = bool(settings.get("forex_event_risk_enabled", True))
     if not enabled:
         return {"enabled": False, "state": "disabled", "events": [], "error": ""}
@@ -227,45 +342,93 @@ def _load_forexfactory_context(hub_dir: str, settings: Dict[str, Any], now_ts: i
         last_error_ts = 0.0
     last_error = str(cache.get("last_error", "") or "")
     cache_age = (float(now_ts) - fetched_ts) if fetched_ts > 0 else 1e12
+    cache_age_s = int(max(0.0, cache_age)) if fetched_ts > 0 else -1
 
     if cached_events and cache_age <= refresh_s:
-        return {"enabled": True, "state": "cached", "events": cached_events, "error": ""}
+        return {
+            "enabled": True,
+            "state": "cached",
+            "events": cached_events,
+            "error": "",
+            "cache_age_s": int(max(0.0, cache_age)),
+            "refresh_s": float(refresh_s),
+            "stale_max_s": float(stale_max_s),
+            "refresh_eligible": False,
+        }
+    if cached_events and cache_age <= stale_max_s:
+        return {
+            "enabled": True,
+            "state": "cached_stale",
+            "events": cached_events,
+            "error": str(last_error),
+            "cache_age_s": int(max(0.0, cache_age)),
+            "refresh_s": float(refresh_s),
+            "stale_max_s": float(stale_max_s),
+            "refresh_eligible": True,
+        }
     if (not cached_events) and last_error_ts > 0 and (float(now_ts) - last_error_ts) <= refresh_s:
-        return {"enabled": True, "state": "cooldown", "events": [], "error": last_error}
+        return {
+            "enabled": True,
+            "state": "cooldown",
+            "events": [],
+            "error": str(last_error),
+            "cache_age_s": int(cache_age_s),
+            "refresh_s": float(refresh_s),
+            "stale_max_s": float(stale_max_s),
+            "refresh_eligible": False,
+        }
+    return {
+        "enabled": True,
+        "state": "unavailable",
+        "events": [],
+        "error": str(last_error),
+        "cache_age_s": int(cache_age_s),
+        "refresh_s": float(refresh_s),
+        "stale_max_s": float(stale_max_s),
+        "refresh_eligible": True,
+    }
 
-    try:
-        events = _fetch_forexfactory_events(now_ts=now_ts, timeout_s=8.0)
-        _save_json_map(
-            path,
-            {
-                "fetched_ts": int(now_ts),
-                "events": events,
-                "source": "forexfactory",
-                "last_error_ts": 0,
-                "last_error": "",
-            },
-        )
-        return {"enabled": True, "state": "live", "events": events, "error": ""}
-    except Exception as exc:
-        err = f"{type(exc).__name__}: {exc}"
-        _save_json_map(
-            path,
-            {
-                "fetched_ts": int(fetched_ts),
-                "events": cached_events,
-                "source": "forexfactory",
-                "last_error_ts": int(now_ts),
-                "last_error": err,
-            },
-        )
-        if cached_events and cache_age <= stale_max_s:
-            return {
-                "enabled": True,
-                "state": "cached_stale",
-                "events": cached_events,
-                "error": err,
-            }
-        return {"enabled": True, "state": "unavailable", "events": [], "error": err}
+
+def _maybe_schedule_forexfactory_refresh(hub_dir: str, settings: Dict[str, Any], calendar_ctx: Dict[str, Any], now_ts: int) -> Dict[str, Any]:
+    if not bool((calendar_ctx or {}).get("enabled", False)):
+        return {"scheduled": False, "reason": "disabled"}
+    if not bool((calendar_ctx or {}).get("refresh_eligible", False)):
+        return {"scheduled": False, "reason": "not_needed"}
+
+    refresh_s = max(60.0, float(settings.get("forex_event_cache_refresh_s", 1800.0) or 1800.0))
+    stale_max_s = max(refresh_s, float(settings.get("forex_event_cache_stale_max_s", 86400.0) or 86400.0))
+    request_cooldown_s = max(30.0, min(300.0, refresh_s * 0.20))
+    path = _calendar_cache_path(hub_dir)
+    cache = _load_json_map(path)
+    last_request_ts = _float(cache.get("last_refresh_request_ts", 0.0), 0.0)
+    if last_request_ts > 0.0 and (float(now_ts) - last_request_ts) < request_cooldown_s:
+        return {"scheduled": False, "reason": "throttled"}
+
+    marker_path = _calendar_refresh_marker_path(hub_dir)
+    marker_ttl_s = max(120.0, min(1800.0, stale_max_s))
+    if not _try_acquire_calendar_refresh_marker(marker_path, now_ts, stale_after_s=marker_ttl_s):
+        return {"scheduled": False, "reason": "in_flight"}
+
+    payload = dict(cache)
+    payload.update(
+        {
+            "last_refresh_request_ts": int(now_ts),
+            "last_refresh_state": "scheduled",
+        }
+    )
+    _save_json_map(path, payload)
+    if not _spawn_forexfactory_refresh(hub_dir, settings, marker_path):
+        return {"scheduled": False, "reason": "spawn_failed"}
+    return {"scheduled": True, "reason": "scheduled"}
+
+
+def _load_forexfactory_context(hub_dir: str, settings: Dict[str, Any], now_ts: int) -> Dict[str, Any]:
+    ctx = _load_forexfactory_context_cached(hub_dir, settings, now_ts)
+    refresh_meta = _maybe_schedule_forexfactory_refresh(hub_dir, settings, ctx, now_ts)
+    out = dict(ctx or {})
+    out["refresh_scheduled"] = bool(refresh_meta.get("scheduled", False))
+    out["refresh_state"] = str(refresh_meta.get("reason", "not_needed") or "not_needed")
+    return out
 
 
 def _pair_ccys(pair: str) -> tuple[str, str]:
@@ -622,9 +785,32 @@ def _market_pooled_calibration_samples(hub_dir: str, settings: Dict[str, Any]) -
         return 0
 
 
+def _rotate_jsonl(path: str, max_bytes: int = 64 * 1024 * 1024, keep: int = 8) -> None:
+    try:
+        if not os.path.isfile(path):
+            return
+        if os.path.getsize(path) <= int(max_bytes):
+            return
+        ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        rotated = f"{path}.{ts}"
+        os.replace(path, rotated)
+        prefix = os.path.basename(path) + "."
+        base_dir = os.path.dirname(path)
+        olds = sorted([os.path.join(base_dir, n) for n in os.listdir(base_dir) if n.startswith(prefix)])
+        if len(olds) > int(keep):
+            for old in olds[:-keep]:
+                try:
+                    os.remove(old)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 def _append_jsonl(path: str, row: Dict[str, Any]) -> None:
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        _rotate_jsonl(path)
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(row, separators=(",", ":")) + "\n")
     except Exception:
@@ -841,6 +1027,7 @@ def _score_candles(pair: str, candles: List[Dict[str, Any]], spread_bps: float =
         return {
             "pair": pair,
             "score": -9999.0,
+            "outlier": False,
             "side": "watch",
             "last": closes[-1] if closes else 0.0,
             "change_6h_pct": 0.0,
@@ -864,7 +1051,35 @@ def _score_candles(pair: str, candles: List[Dict[str, Any]], spread_bps: float =
         cur_px = closes[idx]
         if prev_px > 0:
             step_moves.append(abs(((cur_px - prev_px) / prev_px) * 100.0))
+    max_step_move = max(step_moves[-24:]) if step_moves else 0.0
     volatility = (sum(step_moves[-12:]) / max(1, len(step_moves[-12:]))) if step_moves else 0.0
+
+    # Protect against malformed candles / feed spikes that produce unrealistic scores.
+    if (
+        abs(float(change_6)) > float(_FOREX_OUTLIER_MAX_ABS_CHANGE_6H_PCT)
+        or abs(float(change_24)) > float(_FOREX_OUTLIER_MAX_ABS_CHANGE_24H_PCT)
+        or float(max_step_move) > float(_FOREX_OUTLIER_MAX_STEP_MOVE_PCT)
+    ):
+        reason_logic = "Outlier price jump detected; waiting for cleaner candles"
+        reason_data = (
+            f"6h {change_6:+.3f}% | 24h {change_24:+.3f}% | "
+            f"max step {max_step_move:.3f}% | spr {float(spread_bps):.2f}bps"
+        )
+        return {
+            "pair": pair,
+            "score": -9999.0,
+            "outlier": True,
+            "side": "watch",
+            "last": round(last_px, 6),
+            "change_6h_pct": round(change_6, 6),
+            "change_24h_pct": round(change_24, 6),
+            "volatility_pct": round(volatility, 6),
+            "spread_bps": round(float(spread_bps), 4),
+            "confidence": "LOW",
+            "reason_logic": reason_logic,
+            "reason_data": reason_data,
+            "reason": reason_logic,
+        }
     spread_penalty = max(0.0, float(spread_bps) / 10.0)
     score = (change_6 * 0.60) + (change_24 * 0.25) + (volatility * 0.20) - spread_penalty
     side = "long" if score > 0 else "short"
@@ -880,6 +1095,7 @@ def _score_candles(pair: str, candles: List[Dict[str, Any]], spread_bps: float =
     return {
         "pair": pair,
         "score": round(score, 6),
+        "outlier": False,
         "side": side,
         "last": round(last_px, 6),
         "change_6h_pct": round(change_6, 6),
@@ -1017,6 +1233,89 @@ _REJECT_REASON_PRIORITY = {
 }
 
 
+def _select_forex_mtf_confirmation_rows(
+    scored: List[Dict[str, Any]],
+    settings: Dict[str, Any],
+) -> tuple[List[Dict[str, Any]], int, float]:
+    rows = [row for row in list(scored or []) if isinstance(row, dict)]
+    try:
+        limit = max(0, int(float(settings.get("forex_mtf_confirm_max_pairs", 10) or 10)))
+    except Exception:
+        limit = 10
+    if (limit <= 0) or (not rows):
+        return [], int(limit), 0.0
+    ranked = sorted(rows, key=lambda row: abs(_float(row.get("score", 0.0), 0.0)), reverse=True)
+    try:
+        base_threshold = max(0.02, float(settings.get("forex_score_threshold", 0.2) or 0.2))
+    except Exception:
+        base_threshold = 0.2
+    near_ready_threshold = max(base_threshold * 1.50, 0.35)
+    selected: List[Dict[str, Any]] = list(ranked[:limit])
+    return selected, int(limit), float(near_ready_threshold)
+
+
+def _apply_forex_mtf_confirmation(
+    scored: List[Dict[str, Any]],
+    client: OandaBrokerClient,
+    settings: Dict[str, Any],
+) -> Dict[str, Any]:
+    rows = [row for row in list(scored or []) if isinstance(row, dict)]
+    for row in rows:
+        row["mtf_side"] = "unverified"
+        row["mtf_confirmed"] = None
+        row["mtf_source"] = "deferred"
+
+    selected, limit, near_ready_threshold = _select_forex_mtf_confirmation_rows(rows, settings)
+    if not selected:
+        return {
+            "limit": int(limit),
+            "selected_pairs": 0,
+            "h4_calls": 0,
+            "deferred_pairs": int(len(rows)),
+            "near_ready_threshold": float(round(near_ready_threshold, 6)),
+        }
+
+    h4_calls = 0
+    selected_pairs: set[str] = set()
+    for row in selected:
+        pair = str(row.get("pair", "") or "").strip().upper()
+        if (not pair) or (pair in selected_pairs):
+            continue
+        selected_pairs.add(pair)
+        spread_bps = _float(row.get("spread_bps", 0.0), 0.0)
+        mtf_side = "watch"
+        mtf_source = "h4_remote"
+        try:
+            c4 = client.get_candles(pair, granularity="H4", count=40)
+            h4_calls += 1
+            m4 = _score_candles(pair, c4, spread_bps=spread_bps)
+            if bool(m4.get("outlier", False)) or float(m4.get("score", -9999.0) or -9999.0) <= -9999.0:
+                mtf_side = "watch"
+            else:
+                mtf_side = "long" if float(m4.get("score", 0.0) or 0.0) > 0 else "short"
+        except Exception:
+            mtf_side = "watch"
+            mtf_source = "h4_error"
+        row["mtf_side"] = mtf_side
+        row["mtf_source"] = mtf_source
+        row["mtf_confirmed"] = bool(str(row.get("side", "watch")).lower() == mtf_side)
+        if not bool(row["mtf_confirmed"]):
+            row["score"] = round(float(row.get("score", 0.0) or 0.0) * 0.75, 6)
+            _append_reason_parts(
+                row,
+                logic="Multi-timeframe trend mismatch; reducing conviction",
+                data=f"H1 side {str(row.get('side', 'watch')).upper()} vs H4 side {str(mtf_side).upper()}",
+            )
+
+    return {
+        "limit": int(limit),
+        "selected_pairs": int(len(selected_pairs)),
+        "h4_calls": int(h4_calls),
+        "deferred_pairs": int(max(0, len(rows) - len(selected_pairs))),
+        "near_ready_threshold": float(round(near_ready_threshold, 6)),
+    }
+
+
 def _summarize_rejections(rejected: List[Dict[str, Any]], universe_size: int) -> Dict[str, Any]:
     best_by_pair: Dict[str, Dict[str, Any]] = {}
     for row in list(rejected or []):
@@ -1053,6 +1352,15 @@ def _summarize_rejections(rejected: List[Dict[str, Any]], universe_size: int) ->
 
 
 def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
+    scan_start = time.perf_counter()
+
+    def _scan_elapsed_ms() -> int:
+        try:
+            elapsed = (time.perf_counter() - float(scan_start)) * 1000.0
+        except Exception:
+            elapsed = 0.0
+        return int(max(0.0, elapsed))
+
     prev_diag = _load_json_map(_scan_diag_path(hub_dir))
     prev_status = _load_json_map(_thinker_status_path(hub_dir))
     prev_candidates = _norm_id_list(prev_diag.get("candidate_pairs", []))
@@ -1105,6 +1413,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     ) -> None:
         payload: Dict[str, Any] = {
             "ts": int(ts_now),
+            "scan_elapsed_ms": int(_scan_elapsed_ms()),
             "state": str(state or ""),
             "market_open": True,  # FX runs 24/5; scanner has no equity-hours gate.
             "universe_total": int(universe_total),
@@ -1148,7 +1457,9 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     max_spread_bps = max(0.0, float(settings.get("forex_max_spread_bps", 8.0) or 8.0))
     min_volatility_pct = max(0.0, float(settings.get("forex_min_volatility_pct", 0.01) or 0.01))
     min_bars_required = max(8, int(float(settings.get("forex_min_bars_required", 24) or 24)))
+    pricing_fetch_started = time.perf_counter()
     price_rows = client.get_pricing_details(universe)
+    pricing_fetch_ms = int(max(0.0, (time.perf_counter() - float(pricing_fetch_started)) * 1000.0))
     cooldown_state = _load_json_map(_pair_cooldown_path(hub_dir))
     cooldown_map = cooldown_state.get("pairs", {}) if isinstance(cooldown_state.get("pairs", {}), dict) else {}
     cooldown_map = _prune_cooldown_map(cooldown_map, ts_now)
@@ -1171,7 +1482,18 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     min_valid_ratio = max(0.0, min(1.0, float(settings.get("forex_min_valid_bars_ratio", 0.70) or 0.70)))
     max_stale_hours = max(0.5, float(settings.get("forex_max_stale_hours", 8.0) or 8.0))
     session_weighted_candidates = 0
+    h1_scoring_loop_ms = 0
+    h4_confirmation_loop_ms = 0
+    chart_hydration_loop_ms = 0
+    mtf_confirmation = {
+        "limit": 0,
+        "selected_pairs": 0,
+        "h4_calls": 0,
+        "deferred_pairs": 0,
+        "near_ready_threshold": 0.0,
+    }
     try:
+        h1_loop_started = time.perf_counter()
         for pair in candidates:
             params = urllib.parse.urlencode({"price": "M", "granularity": "H1", "count": "48"})
             url = f"{rest_url}/v3/instruments/{pair}/candles?{params}"
@@ -1197,28 +1519,50 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             row["spread_bps"] = round(spread_bps, 4)
             row["bars_count"] = bars_count
             row["data_source"] = "oanda_h1"
+            if bool(row.get("outlier", False)):
+                rejected.append(
+                    {
+                        "pair": pair,
+                        "reason": "outlier_jump",
+                        "change_6h_pct": row.get("change_6h_pct"),
+                        "change_24h_pct": row.get("change_24h_pct"),
+                        "volatility_pct": row.get("volatility_pct"),
+                        "source": row.get("data_source"),
+                    }
+                )
+                _apply_pair_cooldown(cooldown_map, pair, "data_quality", settings, ts_now)
+                continue
             q = _bar_quality(candles)
             row["valid_ratio"] = round(float(q.get("valid_ratio", 0.0)), 4)
             row["stale_hours"] = round(float(q.get("stale_hours", 9999.0)), 3)
             row["data_quality_ok"] = bool((row["valid_ratio"] >= min_valid_ratio) and (row["stale_hours"] <= max_stale_hours))
-            # MTF confirmation from H4.
-            mtf_side = "watch"
-            try:
-                c4 = client.get_candles(pair, granularity="H4", count=40)
-                m4 = _score_candles(pair, c4, spread_bps=spread_bps)
-                ms = float(m4.get("score", 0.0) or 0.0)
-                mtf_side = ("long" if ms > 0 else "short")
-            except Exception:
-                mtf_side = "watch"
-            row["mtf_side"] = mtf_side
-            row["mtf_confirmed"] = bool(str(row.get("side", "watch")).lower() == mtf_side)
-            if not row["mtf_confirmed"]:
-                row["score"] = round(float(row.get("score", 0.0)) * 0.75, 6)
-                _append_reason_parts(
-                    row,
-                    logic="Multi-timeframe trend mismatch; reducing conviction",
-                    data=f"H1 side {str(row.get('side', 'watch')).upper()} vs H4 side {str(mtf_side).upper()}",
+            if _float(row.get("volatility_pct", 0.0), 0.0) < min_volatility_pct:
+                rejected.append({"pair": pair, "reason": "low_volatility", "volatility_pct": row.get("volatility_pct", 0.0)})
+                _apply_pair_cooldown(cooldown_map, pair, "low_volatility", settings, ts_now)
+                continue
+            if not row["data_quality_ok"]:
+                rejected.append(
+                    {
+                        "pair": pair,
+                        "reason": "data_quality",
+                        "valid_ratio": row.get("valid_ratio"),
+                        "stale_hours": row.get("stale_hours"),
+                        "bars_count": row.get("bars_count"),
+                        "source": row.get("data_source"),
+                    }
                 )
+                _apply_pair_cooldown(cooldown_map, pair, "data_quality", settings, ts_now)
+                continue
+            candles_by_pair[pair] = list(candles or [])
+            scored.append(row)
+        h1_scoring_loop_ms = int(max(0.0, (time.perf_counter() - float(h1_loop_started)) * 1000.0))
+
+        h4_loop_started = time.perf_counter()
+        mtf_confirmation = _apply_forex_mtf_confirmation(scored, client, settings)
+        h4_confirmation_loop_ms = int(max(0.0, (time.perf_counter() - float(h4_loop_started)) * 1000.0))
+
+        for row in scored:
+            pair = str(row.get("pair", "") or "").strip().upper()
             mult, session_mode = _session_weight_multiplier(settings, str(row.get("side", "watch")), session_ctx)
             row["session_name"] = str((session_ctx or {}).get("session", "N/A") or "N/A")
             row["session_bias"] = str((session_ctx or {}).get("bias", "FLAT") or "FLAT")
@@ -1254,28 +1598,10 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                     logic=str(event_risk.get("logic", "") or ""),
                     data=str(event_risk.get("data", "") or ""),
                 )
-            if _float(row.get("volatility_pct", 0.0), 0.0) < min_volatility_pct:
-                rejected.append({"pair": pair, "reason": "low_volatility", "volatility_pct": row.get("volatility_pct", 0.0)})
-                _apply_pair_cooldown(cooldown_map, pair, "low_volatility", settings, ts_now)
-                continue
-            if not row["data_quality_ok"]:
-                rejected.append(
-                    {
-                        "pair": pair,
-                        "reason": "data_quality",
-                        "valid_ratio": row.get("valid_ratio"),
-                        "stale_hours": row.get("stale_hours"),
-                        "bars_count": row.get("bars_count"),
-                        "source": row.get("data_source"),
-                    }
-                )
-                _apply_pair_cooldown(cooldown_map, pair, "data_quality", settings, ts_now)
-                continue
-            candles_by_pair[pair] = list(candles or [])
-            scored.append(row)
 
         # Keep chart hydration independent from eligibility gates: open positions should
         # always have chart bars available, even when currently filtered out of leaders.
+        chart_hydration_started = time.perf_counter()
         for pair in list(open_position_pairs or []):
             p = str(pair or "").strip().upper()
             if not p:
@@ -1291,6 +1617,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                     candles_by_pair[p] = list(candles)
             except Exception:
                 continue
+        chart_hydration_loop_ms = int(max(0.0, (time.perf_counter() - float(chart_hydration_started)) * 1000.0))
 
         scored.sort(key=lambda row: abs(float(row.get("score", 0.0))), reverse=True)
         outcome_map = _compute_outcome_map(hub_dir)
@@ -1371,6 +1698,9 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "enabled": bool(calendar_ctx.get("enabled", False)),
             "state": str(calendar_ctx.get("state", "disabled") or "disabled"),
             "error": str(calendar_ctx.get("error", "") or ""),
+            "cache_age_s": int(calendar_ctx.get("cache_age_s", -1) or -1),
+            "refresh_scheduled": bool(calendar_ctx.get("refresh_scheduled", False)),
+            "refresh_state": str(calendar_ctx.get("refresh_state", "not_needed") or "not_needed"),
             "events_total": int(len(calendar_events)),
             "upcoming_high": int(upcoming_high),
             "upcoming_medium": int(upcoming_medium),
@@ -1496,6 +1826,12 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         )
         reject_warn_pct = max(10.0, float(settings.get("forex_reject_drift_warn_pct", 65.0) or 65.0))
         drift_warning = bool((reject_rate_pct >= reject_warn_pct) and (dominant_ratio >= 0.60))
+        scan_phase_timing = {
+            "pricing_fetch": int(pricing_fetch_ms),
+            "h1_scoring_loop": int(h1_scoring_loop_ms),
+            "h4_confirmation_loop": int(h4_confirmation_loop_ms),
+            "chart_hydration_loop": int(chart_hydration_loop_ms),
+        }
         _write_diag(
             "READY",
             msg,
@@ -1526,6 +1862,8 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 "adaptive_threshold_replay_target_entries": int(replay_target_entries),
                 "adaptive_threshold_replay_reason": str(replay_reason),
                 "adaptive_threshold_replay_enabled": bool(replay_enabled),
+                "scan_phase_timing_ms": dict(scan_phase_timing),
+                "mtf_confirmation": dict(mtf_confirmation),
             },
         )
         _save_json_map(_pair_cooldown_path(hub_dir), {"ts": int(time.time()), "pairs": cooldown_map})
@@ -1548,6 +1886,11 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             hints.append(f"Macro-event risk filter active on {event_risk_active_count} pair(s).")
         if str(event_context.get("state", "") or "") in {"unavailable", "cooldown"}:
             hints.append("ForexFactory event feed unavailable; running scanner without event dampener.")
+        if int(mtf_confirmation.get("deferred_pairs", 0) or 0) > 0:
+            hints.append(
+                f"H4 confirmation budgeted: {int(mtf_confirmation.get('selected_pairs', 0) or 0)} checked, "
+                f"{int(mtf_confirmation.get('deferred_pairs', 0) or 0)} deferred."
+            )
         return {
             "state": "READY",
             "ai_state": "Scan ready",
@@ -1580,6 +1923,8 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "session_weighted_candidates": int(session_weighted_candidates),
             "universe_quality": quality_report,
             "event_context": dict(event_context),
+            "scan_phase_timing_ms": dict(scan_phase_timing),
+            "mtf_confirmation": dict(mtf_confirmation),
             "health": {"data_ok": True, "broker_ok": True, "orders_ok": True, "drift_warning": drift_warning},
         }
     except urllib.error.HTTPError as exc:

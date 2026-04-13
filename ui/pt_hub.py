@@ -833,6 +833,38 @@ def _fmt_pct(x: float) -> str:
         return "N/A"
 
 
+def _float_or_none(value: Any) -> Optional[float]:
+    try:
+        val = float(value)
+    except Exception:
+        return None
+    return val if math.isfinite(val) else None
+
+
+def _effective_trade_pnl_pct(row: Dict[str, Any]) -> Optional[float]:
+    side = str(row.get("side", "") or "").strip().upper()
+    raw_pct = _float_or_none(row.get("pnl_pct", None))
+    if side != "SELL":
+        return raw_pct
+
+    realized = _float_or_none(row.get("realized_profit_usd", None))
+    cost_used = _float_or_none(row.get("position_cost_used_usd", None))
+    avg_cost = _float_or_none(row.get("avg_cost_basis", None))
+    qty = _float_or_none(row.get("qty", None))
+    if qty is not None:
+        qty = abs(qty)
+
+    cost_for_pct = cost_used if (cost_used is not None and cost_used > 0.0) else None
+    if cost_for_pct is None and avg_cost is not None and qty is not None:
+        est_cost = float(avg_cost) * float(qty)
+        if est_cost > 0.0:
+            cost_for_pct = est_cost
+
+    if realized is not None and cost_for_pct is not None and cost_for_pct > 0.0:
+        return (float(realized) / float(cost_for_pct)) * 100.0
+    return raw_pct
+
+
 def _now_str() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -3087,6 +3119,7 @@ class PowerTraderHub(tk.Tk):
 
         self._build_menu()
         self._build_layout()
+        self._refresh_crypto_scan_button_state()
         self._bind_shortcuts()
         self.after(120, self._restore_ui_layout_state)
         self.after(50, lambda: self._apply_layout_preset(str(self.settings.get("ui_layout_preset", "auto") or "auto"), persist=False))
@@ -3102,18 +3135,32 @@ class PowerTraderHub(tk.Tk):
         self._last_chart_refresh = 0.0
         self._last_parallel_market_panels_refresh_ts = 0.0
         self._parallel_market_panels_refresh_interval_s = 2.0
+        self._market_panel_idle_refresh_s = 8.0
         self._last_log_panel_refresh_ts = 0.0
         self._log_panel_refresh_interval_s = 2.5
         self._last_chart_legend_refresh_ts = 0.0
         self._chart_legend_refresh_interval_s = 1.5
         self._log_style_cooldown_s = 3.0
         self._log_style_last_ts: Dict[str, float] = {}
+        self._runtime_cards_refresh_s = 2.0
+        self._crypto_scan_busy = False
+        self._crypto_scan_requested_ts = 0.0
+        self._crypto_scan_timeout_s = 20.0
+        self._crypto_scan_requested_sig: Tuple[int, int] = (0, 0)
+        self._manual_sell_feedback_refresh_s = 2.0
+        self._manual_sell_feedback_last_ts = 0.0
+        self._training_status_refresh_s = 2.5
+        self._training_status_cache: Dict[Tuple[str, ...], Tuple[float, Dict[str, str]]] = {}
+        self._running_trainers_cache: Dict[str, Any] = {}
+        self._training_symbols_cache: Dict[str, Any] = {}
+        self._neural_overview_last_refresh_ts = 0.0
         self._trade_history_agg_mtime: Optional[float] = None
         self._trade_history_agg_last_calc_ts = 0.0
         self._trade_history_agg_refresh_s = 20.0
         self._trade_history_agg_dca24h: Dict[str, int] = {}
         self._trade_history_agg_realized: Dict[str, float] = {}
         self._runtime_snapshot_cache: Dict[str, Any] = {}
+        self._hub_perf_stats: Dict[str, Any] = {}
         self._file_watch_panel_force_interval_s = 8.0
         self._file_watch_log_force_interval_s = 8.0
         self._file_watch_chart_force_interval_s = 20.0
@@ -4080,11 +4127,17 @@ class PowerTraderHub(tk.Tk):
     def _set_badge_style(self, label: Optional[tk.Label], text: str, tone: str = "muted") -> None:
         if label is None:
             return
-        palette = BADGE_STYLES.get(str(tone or "muted").strip().lower(), BADGE_STYLES["muted"])
+        tone_key = str(tone or "muted").strip().lower()
+        text_payload = f" {str(text or '').strip()} "
+        sig = (text_payload, tone_key)
+        if getattr(label, "_pt_badge_sig", None) == sig:
+            return
+        setattr(label, "_pt_badge_sig", sig)
+        palette = BADGE_STYLES.get(tone_key, BADGE_STYLES["muted"])
         bg, fg, border = palette
         try:
             label.configure(
-                text=f" {str(text or '').strip()} ",
+                text=text_payload,
                 bg=bg,
                 fg=fg,
                 highlightbackground=border,
@@ -9344,10 +9397,14 @@ class PowerTraderHub(tk.Tk):
         widget = panel.get("notes_text")
         if not widget:
             return
+        payload = str(text or "").strip() + "\n"
+        if panel.get("last_notes_payload") == payload:
+            return
+        panel["last_notes_payload"] = payload
         try:
             widget.configure(state="normal")
             widget.delete("1.0", "end")
-            widget.insert("1.0", str(text or "").strip() + "\n")
+            widget.insert("1.0", payload)
             widget.configure(state="disabled")
         except Exception:
             pass
@@ -12657,6 +12714,17 @@ class PowerTraderHub(tk.Tk):
         schema = payload.get("schema", {}) if isinstance(payload.get("schema", {}), dict) else {}
         cols = tuple(schema.get("columns", ()) or panel.get("positions_columns", ()) or ())
         summary_txt = str(payload.get("summary", "") or "").strip()
+        fallback_summary = str((lines[0] if lines else "") or "").strip()
+        row_sig: List[Tuple[str, ...]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_sig.append(tuple(str(row.get(col, "") or "") for col in cols))
+        positions_sig = (cols, tuple(row_sig), summary_txt, fallback_summary)
+        if panel.get("last_positions_sig") == positions_sig:
+            panel["positions_rows"] = list(rows)
+            return
+        panel["last_positions_sig"] = positions_sig
         panel["positions_rows"] = list(rows)
 
         def _set_summary(text: str) -> None:
@@ -12710,7 +12778,7 @@ class PowerTraderHub(tk.Tk):
         else:
             _set_summary(summary_txt or f"Open positions: {inserted}")
         if (inserted == 0) and lines:
-            _set_summary(str(lines[0]).strip() or "No open positions.")
+            _set_summary(fallback_summary or "No open positions.")
 
     def _forex_row_realized_from_payload(self, row: Dict[str, Any]) -> Optional[float]:
         payload = row.get("payload", {}) if isinstance(row, dict) else {}
@@ -12839,7 +12907,7 @@ class PowerTraderHub(tk.Tk):
                     realized_val = self._forex_row_realized_from_payload(row if isinstance(row, dict) else {})
                 if realized_val is None:
                     realized_val = self._coerce_float_value(row.get("pnl_usd", None))
-                    realized_is_estimate = realized_val is not None
+                    realized_is_estimate = False
             else:
                 for key in ("realized_pnl", "realized_pl", "realized_profit_usd", "pnl_usd", "pl", "realized"):
                     raw = row.get(key, None)
@@ -14755,21 +14823,33 @@ class PowerTraderHub(tk.Tk):
         }
 
     def _refresh_parallel_market_panels(self) -> None:
+        started_at = time.perf_counter()
+        now_ts = float(time.time())
+        active_market_key = str(self._active_market_key() or "crypto").strip().lower()
         awareness = build_awareness_payload()
         broker_awareness = awareness.get("brokers", {}) if isinstance(awareness.get("brokers", {}), dict) else {}
-        runtime_snapshot = _safe_read_json(self._runtime_state_file_path()) or {}
+        runtime_state_path = self._runtime_state_file_path()
+        loop_status_path = os.path.join(self.hub_dir, "market_loop_status.json")
+        trends_path = os.path.join(self.hub_dir, "market_trends.json")
+        runtime_snapshot = _safe_read_json(runtime_state_path) or {}
         if not isinstance(runtime_snapshot, dict):
             runtime_snapshot = {}
-        loop_status = _safe_read_json(os.path.join(self.hub_dir, "market_loop_status.json")) or {}
+        loop_status = _safe_read_json(loop_status_path) or {}
         if not isinstance(loop_status, dict):
             loop_status = {}
-        trends_payload = _safe_read_json(os.path.join(self.hub_dir, "market_trends.json")) or {}
+        trends_payload = _safe_read_json(trends_path) or {}
         if not isinstance(trends_payload, dict):
             trends_payload = {}
+        global_runtime_sig = self._path_sig(runtime_state_path)
+        global_loop_sig = self._path_sig(loop_status_path)
+        global_trends_sig = self._path_sig(trends_path)
+        idle_refresh_s = max(4.0, float(getattr(self, "_market_panel_idle_refresh_s", 8.0) or 8.0))
+        idle_bucket = int(now_ts // idle_refresh_s)
         walkforward_report = runtime_snapshot.get("walkforward_report", {}) if isinstance(runtime_snapshot.get("walkforward_report", {}), dict) else {}
         confidence_calibration = runtime_snapshot.get("confidence_calibration", {}) if isinstance(runtime_snapshot.get("confidence_calibration", {}), dict) else {}
         shadow_scorecards = runtime_snapshot.get("shadow_scorecards", {}) if isinstance(runtime_snapshot.get("shadow_scorecards", {}), dict) else {}
         for market_key, panel in self.market_panels.items():
+            panel_is_active = str(market_key or "").strip().lower() == active_market_key
             snap = self._market_settings_snapshot(market_key)
             configured = bool(snap.get("configured"))
             endpoint = str(snap.get("endpoint", "") or "").strip()
@@ -14781,6 +14861,37 @@ class PowerTraderHub(tk.Tk):
             diag_path = self.market_scan_diag_paths.get(market_key, "")
             thinker_path = self.market_thinker_paths.get(market_key, "")
             history_path = os.path.join(self.market_state_dirs.get(market_key, self.hub_dir), "execution_audit.jsonl")
+            focus_var = panel.get("instrument_var")
+            view_var = panel.get("market_view_var")
+            focus_sel = str((focus_var.get() if focus_var else "ACCOUNT") or "ACCOUNT").strip().upper()
+            view_sel = str((view_var.get() if view_var else "Overview") or "Overview").strip()
+            auto_scan_on = bool((panel.get("auto_scan_var").get() if panel.get("auto_scan_var") else True))
+            auto_step_on = bool((panel.get("auto_step_var").get() if panel.get("auto_step_var") else True))
+            panel_idle_bucket = idle_bucket if panel_is_active else int(now_ts // max(10.0, float(idle_refresh_s)))
+            panel_source_sig = (
+                global_runtime_sig if panel_is_active else (),
+                global_loop_sig if panel_is_active else (),
+                global_trends_sig if panel_is_active else (),
+                panel_idle_bucket,
+                self._path_sig(status_path),
+                self._path_sig(str(trader_status_path or "")),
+                self._path_sig(str(thinker_path or "")),
+                self._path_sig(str(diag_path or "")),
+                self._path_sig(history_path),
+                bool(configured),
+                endpoint,
+                broker,
+                focus_sel,
+                view_sel,
+                auto_scan_on,
+                auto_step_on,
+                bool(self._market_test_busy.get(market_key, False)),
+                bool(self._market_thinker_busy.get(market_key, False)),
+                bool(self._market_trader_busy.get(market_key, False)),
+            )
+            if panel.get("last_refresh_source_sig") == panel_source_sig:
+                continue
+            panel["last_refresh_source_sig"] = panel_source_sig
             bundle = load_market_status_bundle(
                 status_path=status_path,
                 trader_path=str(trader_status_path or ""),
@@ -14942,6 +15053,7 @@ class PowerTraderHub(tk.Tk):
                 state_line += f" | Gate={gate_reason[:56]}"
             gate_flags = trader_data.get("entry_gate_flags", {}) if isinstance(trader_data.get("entry_gate_flags", {}), dict) else {}
             policy_data = trader_data.get("automation_policy", {}) if isinstance(trader_data.get("automation_policy", {}), dict) else {}
+            allocator_data = trader_data.get("opportunity_allocator", {}) if isinstance(trader_data.get("opportunity_allocator", {}), dict) else {}
             if gate_flags:
                 try:
                     rej = float(gate_flags.get("reject_rate_pct", 0.0) or 0.0)
@@ -14967,6 +15079,13 @@ class PowerTraderHub(tk.Tk):
                 compliance_status = str(compliance.get("status_text", "") or "").strip()
                 if market_key == "stocks" and compliance_status:
                     state_line += f" | {compliance_status[:56]}"
+            if allocator_data:
+                alloc_summary = str(allocator_data.get("summary", "") or "").strip()
+                alloc_decision = str(allocator_data.get("decision", "") or "").strip().lower()
+                if alloc_summary:
+                    state_line += f" | Portfolio={alloc_summary[:68]}"
+                elif alloc_decision:
+                    state_line += f" | Portfolio={alloc_decision.title()}"
             try:
                 entry_size_scale = float(trader_data.get("entry_size_scale", 1.0) or 1.0)
                 if entry_size_scale < 0.999:
@@ -15104,13 +15223,12 @@ class PowerTraderHub(tk.Tk):
             except Exception:
                 pass
             try:
-                self._refresh_market_watchlist_overview(market_key, thinker_data=thinker_data)
-                self._refresh_market_watchlist_visibility(market_key)
+                if panel_is_active:
+                    self._refresh_market_watchlist_overview(market_key, thinker_data=thinker_data)
+                    self._refresh_market_watchlist_visibility(market_key)
             except Exception:
                 pass
             action_hint = ""
-            auto_scan_on = bool((panel.get("auto_scan_var").get() if panel.get("auto_scan_var") else True))
-            auto_step_on = bool((panel.get("auto_step_var").get() if panel.get("auto_step_var") else True))
             if not configured:
                 action_hint = f"Next: add {broker} credentials in Settings, then click Test {broker} Connection."
             elif bool(self._market_test_busy.get(market_key, False)):
@@ -15219,6 +15337,8 @@ class PowerTraderHub(tk.Tk):
                         daily_guard_var.set(self._market_daily_guard_text(market_key, trader_data))
                     except Exception:
                         pass
+            if not panel_is_active:
+                continue
             self._set_market_positions(
                 market_key,
                 list(status_data.get("positions_preview", []) or []),
@@ -15610,6 +15730,18 @@ class PowerTraderHub(tk.Tk):
                     )
             except Exception:
                 pass
+        try:
+            elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+            perf = self._hub_perf_stats if isinstance(self._hub_perf_stats, dict) else {}
+            tick_count = int(perf.get("market_panel_refresh_count", 0) or 0) + 1
+            ema_ms = float(perf.get("market_panel_refresh_ema_ms", 0.0) or 0.0)
+            ema_ms = (0.85 * ema_ms) + (0.15 * float(elapsed_ms)) if ema_ms > 0.0 else float(elapsed_ms)
+            perf["market_panel_refresh_count"] = tick_count
+            perf["market_panel_refresh_last_ms"] = round(float(elapsed_ms), 2)
+            perf["market_panel_refresh_ema_ms"] = round(float(ema_ms), 2)
+            self._hub_perf_stats = perf
+        except Exception:
+            pass
 
     def _refresh_market_overview_fallback(self) -> None:
         for market_key, panel in self.market_panels.items():
@@ -16386,6 +16518,14 @@ class PowerTraderHub(tk.Tk):
     def _runner_is_running(self) -> bool:
         return self._pid_is_alive(self._read_runner_pid())
 
+    @staticmethod
+    def _path_sig(path: str) -> Tuple[int, int]:
+        try:
+            st = os.stat(str(path or ""))
+            return int(getattr(st, "st_mtime_ns", 0) or 0), int(getattr(st, "st_size", 0) or 0)
+        except Exception:
+            return 0, 0
+
     def _read_runner_status(self) -> Dict[str, Any]:
         data = _safe_read_json(self.trader_status_path)
         if isinstance(data, dict):
@@ -16537,10 +16677,56 @@ class PowerTraderHub(tk.Tk):
             except Exception:
                 pass
 
+    def _refresh_crypto_scan_button_state(self) -> None:
+        btn = getattr(self, "btn_crypto_run_scan", None)
+        if btn is None:
+            return
+        try:
+            is_busy = bool(getattr(self, "_crypto_scan_busy", False))
+            btn.configure(
+                state=("disabled" if is_busy else "normal"),
+                text=("Scanning..." if is_busy else "Run Scan"),
+            )
+        except Exception:
+            pass
+
+    def _mark_crypto_scan_requested(self, timeout_s: float) -> None:
+        try:
+            self._crypto_scan_busy = True
+            self._crypto_scan_requested_ts = float(time.time())
+            self._crypto_scan_timeout_s = max(5.0, float(timeout_s or 20.0))
+            self._crypto_scan_requested_sig = self._path_sig(self.crypto_dynamic_status_path)
+        except Exception:
+            self._crypto_scan_busy = True
+        self._refresh_crypto_scan_button_state()
+
+    def _maybe_complete_crypto_scan_feedback(self) -> None:
+        if not bool(getattr(self, "_crypto_scan_busy", False)):
+            return
+        done = False
+        try:
+            current_sig = self._path_sig(self.crypto_dynamic_status_path)
+            requested_sig = tuple(getattr(self, "_crypto_scan_requested_sig", (0, 0)) or (0, 0))
+            if current_sig != requested_sig and current_sig != (0, 0):
+                done = True
+            requested_ts = float(getattr(self, "_crypto_scan_requested_ts", 0.0) or 0.0)
+            timeout_s = max(5.0, float(getattr(self, "_crypto_scan_timeout_s", 20.0) or 20.0))
+            if requested_ts > 0.0 and (time.time() - requested_ts) >= timeout_s:
+                done = True
+        except Exception:
+            done = True
+        if done:
+            self._crypto_scan_busy = False
+            self._refresh_crypto_scan_button_state()
+
     def _run_crypto_scan_now(self) -> None:
+        if bool(getattr(self, "_crypto_scan_busy", False)):
+            return
         if self._runner_is_running():
+            self._mark_crypto_scan_requested(timeout_s=20.0)
             self._refresh_crypto_dashboard_snapshot()
             return
+        self._mark_crypto_scan_requested(timeout_s=60.0)
         self.start_neural()
 
     def _on_crypto_auto_scan_toggle(self) -> None:
@@ -16646,6 +16832,24 @@ class PowerTraderHub(tk.Tk):
             return False
 
     def _crypto_training_candidate_symbols(self) -> List[str]:
+        base = str(self.settings.get("main_neural_dir", self.project_dir) or self.project_dir).strip() or self.project_dir
+        if not os.path.isabs(base):
+            base = os.path.abspath(os.path.join(self.project_dir, base))
+        dynamic_sig = self._path_sig(self.crypto_dynamic_status_path)
+        cache_sig = (
+            tuple(str(c or "").strip().upper() for c in list(self.coins or []) if str(c or "").strip()),
+            tuple(sorted(str(c or "").strip().upper() for c in list(self.trainers.keys()) if str(c or "").strip())),
+            str(base),
+            dynamic_sig,
+        )
+        now_ts = float(time.time())
+        cache = self.__dict__.get("_training_symbols_cache", {})
+        if isinstance(cache, dict):
+            if cache.get("sig") == cache_sig and (now_ts - float(cache.get("ts", 0.0) or 0.0)) < 8.0:
+                cached_symbols = list(cache.get("symbols", []) or [])
+                if cached_symbols:
+                    return cached_symbols
+
         symbols: List[str] = []
         seen = set()
 
@@ -16671,9 +16875,6 @@ class PowerTraderHub(tk.Tk):
         for coin in self.trainers.keys():
             _add(coin)
 
-        base = str(self.settings.get("main_neural_dir", self.project_dir) or self.project_dir).strip() or self.project_dir
-        if not os.path.isabs(base):
-            base = os.path.abspath(os.path.join(self.project_dir, base))
         try:
             for name in sorted(os.listdir(base)):
                 path = os.path.join(base, name)
@@ -16687,6 +16888,11 @@ class PowerTraderHub(tk.Tk):
                 _add(name)
         except Exception:
             pass
+        self._training_symbols_cache = {
+            "sig": cache_sig,
+            "ts": now_ts,
+            "symbols": list(symbols),
+        }
         return symbols
 
     def _sync_crypto_training_selectors(self, symbols: Optional[List[str]] = None) -> None:
@@ -16713,6 +16919,18 @@ class PowerTraderHub(tk.Tk):
             pass
 
     def _running_trainers(self) -> List[str]:
+        now_ts = float(time.time())
+        symbols = self._crypto_training_candidate_symbols()
+        cache_sig = (
+            tuple(symbols),
+            tuple(sorted(str(c or "").strip().upper() for c in list(self.trainers.keys()) if str(c or "").strip())),
+        )
+        cache = self.__dict__.get("_running_trainers_cache", {})
+        refresh_s = max(1.0, float(self.__dict__.get("_training_status_refresh_s", 2.5) or 2.5))
+        if isinstance(cache, dict):
+            if cache.get("sig") == cache_sig and (now_ts - float(cache.get("ts", 0.0) or 0.0)) < refresh_s:
+                return list(cache.get("running", []) or [])
+
         running: List[str] = []
 
         # Trainers launched by this GUI instance
@@ -16724,7 +16942,7 @@ class PowerTraderHub(tk.Tk):
                 pass
 
         # Trainers launched elsewhere: look at per-coin status file
-        for c in self._crypto_training_candidate_symbols():
+        for c in symbols:
             try:
                 coin = (c or "").strip().upper()
                 folder = self.coin_folders.get(coin, "") or self._crypto_coin_folder_path(coin)
@@ -16756,15 +16974,31 @@ class PowerTraderHub(tk.Tk):
             if cc and cc not in seen:
                 seen.add(cc)
                 out.append(cc)
+        self._running_trainers_cache = {"sig": cache_sig, "ts": now_ts, "running": list(out)}
         return out
 
     def _training_status_map(self, coins: Optional[List[str]] = None) -> Dict[str, str]:
         """
         Returns {coin: "TRAINED" | "TRAINING" | "NOT TRAINED"}.
         """
+        candidates = [str(c or "").strip().upper() for c in list(coins or self.coins or []) if str(c or "").strip()]
+        cache_key = tuple(candidates)
+        now_ts = float(time.time())
+        refresh_s = max(1.0, float(self.__dict__.get("_training_status_refresh_s", 2.5) or 2.5))
+        cache = self.__dict__.get("_training_status_cache", {})
+        if isinstance(cache, dict):
+            hit = cache.get(cache_key)
+            if isinstance(hit, tuple) and len(hit) == 2:
+                hit_ts, hit_payload = hit
+                try:
+                    age_s = now_ts - float(hit_ts or 0.0)
+                except Exception:
+                    age_s = refresh_s + 1.0
+                if age_s < refresh_s and isinstance(hit_payload, dict):
+                    return dict(hit_payload)
+
         running = set(self._running_trainers())
         out: Dict[str, str] = {}
-        candidates = [str(c or "").strip().upper() for c in list(coins or self.coins or []) if str(c or "").strip()]
         for c in candidates:
             coin = str(c or "").strip().upper()
             if coin in running:
@@ -16773,6 +17007,16 @@ class PowerTraderHub(tk.Tk):
                 out[coin] = "TRAINED"
             else:
                 out[coin] = "NOT TRAINED"
+        if not isinstance(cache, dict):
+            cache = {}
+        cache[cache_key] = (now_ts, dict(out))
+        if len(cache) > 32:
+            try:
+                for stale_key in list(cache.keys())[: max(1, len(cache) - 24)]:
+                    cache.pop(stale_key, None)
+            except Exception:
+                pass
+        self._training_status_cache = cache
         return out
 
     def train_selected_coin(self) -> None:
@@ -16937,6 +17181,8 @@ class PowerTraderHub(tk.Tk):
     def stop_all_scripts(self) -> None:
         self._audit_operator_action("stop_trades_requested", {"source": "ui"})
         self._auto_start_trader_pending = False
+        self._crypto_scan_busy = False
+        self._refresh_crypto_scan_button_state()
         self._request_runner_stop(wait_s=5.0)
 
         # Also reset the runner-ready gate file (best-effort)
@@ -16988,7 +17234,14 @@ class PowerTraderHub(tk.Tk):
 
     # ---- refresh loop ----
     def _drain_queue_to_text(self, q: "queue.Queue[str]", txt: tk.Text, max_lines: int = 2500) -> None:
-
+        try:
+            if hasattr(txt, "winfo_ismapped") and (not bool(txt.winfo_ismapped())):
+                while True:
+                    q.get_nowait()
+        except queue.Empty:
+            return
+        except Exception:
+            pass
         try:
             changed = False
             while True:
@@ -17060,6 +17313,9 @@ class PowerTraderHub(tk.Tk):
         prefix_path: Optional[str] = None,
     ) -> None:
         try:
+            if hasattr(txt, "winfo_ismapped") and (not bool(txt.winfo_ismapped())):
+                return
+
             def _tail_lines(fp: str, lim: int) -> List[str]:
                 try:
                     with open(fp, "rb") as f:
@@ -17144,8 +17400,10 @@ class PowerTraderHub(tk.Tk):
             pass
 
     def _tick(self) -> None:
+        tick_started = time.perf_counter()
         fetcher_changed = False
         now_ts = float(time.time())
+        self._maybe_complete_crypto_scan_feedback()
         try:
             if hasattr(self, "fetcher") and self.fetcher:
                 fetcher_changed = bool(self.fetcher.drain_results())
@@ -17309,109 +17567,124 @@ class PowerTraderHub(tk.Tk):
                     self.crypto_auto_step_var.set(desired_step)
         except Exception:
             pass
-        runtime_snapshot: Dict[str, Any] = {}
+        runtime_snapshot: Dict[str, Any] = self._runtime_snapshot_cache if isinstance(self._runtime_snapshot_cache, dict) else {}
+        runtime_cards_due = True
         try:
-            runtime_snapshot = _safe_read_json(self.runtime_state_path) or {}
-            self._runtime_snapshot_cache = runtime_snapshot if isinstance(runtime_snapshot, dict) else {}
-            bh = runtime_snapshot.get("broker_health", {}) if isinstance(runtime_snapshot.get("broker_health", {}), dict) else {}
-            aq = runtime_snapshot.get("api_quota", {}) if isinstance(runtime_snapshot.get("api_quota", {}), dict) else {}
-            total_15m = int(aq.get("total_15m", 0) or 0)
-            def _fmt_state(key: str, default_name: str) -> str:
-                row = bh.get(key, {}) if isinstance(bh.get(key, {}), dict) else {}
-                state = str(row.get("state", "ok") or "ok").upper()
-                q15 = int(row.get("quota_15m", 0) or 0)
-                if state not in {"OK", "WARNING", "ERROR"}:
-                    state = "OK"
-                return f"{default_name} {state}({q15})"
-            broker_txt = (
-                "Broker API: "
-                + _fmt_state("alpaca", "Alpaca")
-                + " | "
-                + _fmt_state("oanda", "OANDA")
-                + " | "
-                + _fmt_state("kucoin", "KuCoin")
-                + f" | quota15m={total_15m}"
+            runtime_sig = self._path_sig(self.runtime_state_path)
+            refresh_bucket = int(
+                now_ts // max(1.0, float(getattr(self, "_runtime_cards_refresh_s", 2.0) or 2.0))
             )
-            self.lbl_broker_health.config(text=broker_txt)
-            checks = runtime_snapshot.get("checks", {}) if isinstance(runtime_snapshot.get("checks", {}), dict) else {}
-            active_market_key = self._active_market_key()
-            scoped_alerts = self._scoped_alert_snapshot(runtime_snapshot, active_market_key)
-            guard = runtime_snapshot.get("execution_guard", {}) if isinstance(runtime_snapshot.get("execution_guard", {}), dict) else {}
-            incidents = runtime_snapshot.get("incidents_last_200", {}) if isinstance(runtime_snapshot.get("incidents_last_200", {}), dict) else {}
-            drawdown_guard = runtime_snapshot.get("drawdown_guard", {}) if isinstance(runtime_snapshot.get("drawdown_guard", {}), dict) else {}
-            stop_flag = runtime_snapshot.get("stop_flag", {}) if isinstance(runtime_snapshot.get("stop_flag", {}), dict) else {}
-            market_loop = runtime_snapshot.get("market_loop", {}) if isinstance(runtime_snapshot.get("market_loop", {}), dict) else {}
-            incident_trend = runtime_snapshot.get("incident_trend", {}) if isinstance(runtime_snapshot.get("incident_trend", {}), dict) else {}
-            pnl_dec = runtime_snapshot.get("pnl_decomposition", {}) if isinstance(runtime_snapshot.get("pnl_decomposition", {}), dict) else {}
-            latency_hist = runtime_snapshot.get("broker_latency_histogram", {}) if isinstance(runtime_snapshot.get("broker_latency_histogram", {}), dict) else {}
-            eq_anom = runtime_snapshot.get("equity_curve_anomaly", {}) if isinstance(runtime_snapshot.get("equity_curve_anomaly", {}), dict) else {}
-            stale_history = runtime_snapshot.get("stale_history", {}) if isinstance(runtime_snapshot.get("stale_history", {}), dict) else {}
-            feature_flags = runtime_snapshot.get("feature_flags", {}) if isinstance(runtime_snapshot.get("feature_flags", {}), dict) else {}
-            notification_center = runtime_snapshot.get("notification_center", {}) if isinstance(runtime_snapshot.get("notification_center", {}), dict) else {}
-            shadow_scorecards = runtime_snapshot.get("shadow_scorecards", {}) if isinstance(runtime_snapshot.get("shadow_scorecards", {}), dict) else {}
-            market_regimes = runtime_snapshot.get("market_regimes", {}) if isinstance(runtime_snapshot.get("market_regimes", {}), dict) else {}
-            guard_markets = guard.get("markets", {}) if isinstance(guard.get("markets", {}), dict) else {}
-            guard_active = 0
-            ts_now = int(runtime_snapshot.get("ts", 0) or 0)
-            for row in guard_markets.values():
-                if not isinstance(row, dict):
-                    continue
-                if int(row.get("disabled_until", 0) or 0) > ts_now:
-                    guard_active += 1
-            scoped_recent_count = 0
+            runtime_cards_sig = (
+                runtime_sig,
+                refresh_bucket,
+                runtime_state,
+                bool(neural_running),
+                bool(trader_running),
+            )
+            runtime_cards_due = getattr(self, "_runtime_cards_last_sig", None) != runtime_cards_sig
+            if runtime_cards_due:
+                self._runtime_cards_last_sig = runtime_cards_sig
+        except Exception:
+            runtime_cards_due = True
+
+        if runtime_cards_due:
             try:
-                now_ts_f = float(time.time())
-                scoped_items = scoped_alerts.get("items", []) if isinstance(scoped_alerts.get("items", []), list) else []
-                for row in scoped_items:
-                    if not isinstance(row, dict):
-                        continue
-                    sev_txt = self._normalize_alert_severity(row.get("severity", "info"))
-                    if sev_txt not in {"critical", "warning"}:
-                        continue
-                    ts_val = float(row.get("ts", 0) or 0.0)
-                    if ts_val > 0.0 and (now_ts_f - ts_val) <= 3600.0:
-                        scoped_recent_count += 1
-            except Exception:
+                runtime_snapshot = _safe_read_json(self.runtime_state_path) or {}
+                self._runtime_snapshot_cache = runtime_snapshot if isinstance(runtime_snapshot, dict) else {}
+                bh = runtime_snapshot.get("broker_health", {}) if isinstance(runtime_snapshot.get("broker_health", {}), dict) else {}
+                aq = runtime_snapshot.get("api_quota", {}) if isinstance(runtime_snapshot.get("api_quota", {}), dict) else {}
+                total_15m = int(aq.get("total_15m", 0) or 0)
+
+                def _fmt_state(key: str, default_name: str) -> str:
+                    row = bh.get(key, {}) if isinstance(bh.get(key, {}), dict) else {}
+                    state = str(row.get("state", "ok") or "ok").upper()
+                    q15 = int(row.get("quota_15m", 0) or 0)
+                    if state not in {"OK", "WARNING", "ERROR"}:
+                        state = "OK"
+                    return f"{default_name} {state}({q15})"
+
+                broker_txt = (
+                    "Broker API: "
+                    + _fmt_state("alpaca", "Alpaca")
+                    + " | "
+                    + _fmt_state("oanda", "OANDA")
+                    + " | "
+                    + _fmt_state("kucoin", "KuCoin")
+                    + f" | quota15m={total_15m}"
+                )
+                self.lbl_broker_health.config(text=broker_txt)
+
+                checks = runtime_snapshot.get("checks", {}) if isinstance(runtime_snapshot.get("checks", {}), dict) else {}
+                active_market_key = self._active_market_key()
+                scoped_alerts = self._scoped_alert_snapshot(runtime_snapshot, active_market_key)
+                guard = runtime_snapshot.get("execution_guard", {}) if isinstance(runtime_snapshot.get("execution_guard", {}), dict) else {}
+                drawdown_guard = runtime_snapshot.get("drawdown_guard", {}) if isinstance(runtime_snapshot.get("drawdown_guard", {}), dict) else {}
+                stop_flag = runtime_snapshot.get("stop_flag", {}) if isinstance(runtime_snapshot.get("stop_flag", {}), dict) else {}
+                market_loop = runtime_snapshot.get("market_loop", {}) if isinstance(runtime_snapshot.get("market_loop", {}), dict) else {}
+                incident_trend = runtime_snapshot.get("incident_trend", {}) if isinstance(runtime_snapshot.get("incident_trend", {}), dict) else {}
+                pnl_dec = runtime_snapshot.get("pnl_decomposition", {}) if isinstance(runtime_snapshot.get("pnl_decomposition", {}), dict) else {}
+                latency_hist = runtime_snapshot.get("broker_latency_histogram", {}) if isinstance(runtime_snapshot.get("broker_latency_histogram", {}), dict) else {}
+                eq_anom = runtime_snapshot.get("equity_curve_anomaly", {}) if isinstance(runtime_snapshot.get("equity_curve_anomaly", {}), dict) else {}
+                stale_history = runtime_snapshot.get("stale_history", {}) if isinstance(runtime_snapshot.get("stale_history", {}), dict) else {}
+                feature_flags = runtime_snapshot.get("feature_flags", {}) if isinstance(runtime_snapshot.get("feature_flags", {}), dict) else {}
+                guard_markets = guard.get("markets", {}) if isinstance(guard.get("markets", {}), dict) else {}
+
+                guard_active = 0
+                ts_now = int(runtime_snapshot.get("ts", 0) or 0)
+                for row in guard_markets.values():
+                    if isinstance(row, dict) and int(row.get("disabled_until", 0) or 0) > ts_now:
+                        guard_active += 1
+
                 scoped_recent_count = 0
-            ck_txt = (
-                "Checklist: "
-                + f"checks={'PASS' if bool(checks.get('ok', False)) else 'FAIL'} | "
-                + f"alerts={str(scoped_alerts.get('severity', 'ok') or 'ok').upper()} | "
-                + f"quota={str(aq.get('status', 'n/a') or 'n/a').upper()} | "
-                + f"guard={'ON' if guard_active > 0 else 'OFF'} | "
-                + f"inc1h={scoped_recent_count}"
-            )
-            self.lbl_system_checklist.config(text=ck_txt)
-            dd_recent = bool(drawdown_guard.get("triggered_recent", False))
-            dd_txt = "TRIGGERED" if dd_recent else "OK"
-            sf_active = bool(stop_flag.get("active", False))
-            sf_txt = "ON" if sf_active else "OFF"
-            sf_reason = str(stop_flag.get("reason", "") or "").strip().lower()
-            sf_details = stop_flag.get("details", {}) if isinstance(stop_flag.get("details", {}), dict) else {}
-            try:
-                loop_age = max(0, int(time.time()) - int(market_loop.get("ts", 0) or 0))
-            except Exception:
-                loop_age = -1
-            if loop_age >= 0 and loop_age <= 600:
-                loop_txt = f"{loop_age}s old"
-            else:
-                loop_txt = "stale"
-            cooldown_hint = ""
-            if sf_active and sf_reason == "drawdown_guard":
                 try:
-                    cooloff_s = max(60, int(float(self.settings.get("global_drawdown_resume_cooloff_s", 14400) or 14400)))
+                    now_ts_f = float(time.time())
+                    scoped_items = scoped_alerts.get("items", []) if isinstance(scoped_alerts.get("items", []), list) else []
+                    for row in scoped_items:
+                        if not isinstance(row, dict):
+                            continue
+                        sev_txt = self._normalize_alert_severity(row.get("severity", "info"))
+                        if sev_txt not in {"critical", "warning"}:
+                            continue
+                        ts_val = float(row.get("ts", 0) or 0.0)
+                        if ts_val > 0.0 and (now_ts_f - ts_val) <= 3600.0:
+                            scoped_recent_count += 1
                 except Exception:
-                    cooloff_s = 14400
-                trig_ts = int(sf_details.get("triggered_ts", stop_flag.get("ts", 0)) or 0)
-                rem = max(0, int((trig_ts + cooloff_s) - time.time())) if trig_ts > 0 else 0
-                if rem > 0:
-                    cooldown_hint = f" | cooloff {max(1, rem // 60)}m"
-                else:
-                    cooldown_hint = " | ready for ack/recovery check"
-            self.lbl_runtime_guard.config(
-                text=f"Safety: stop-flag {sf_txt}{cooldown_hint} | drawdown guard {dd_txt} | market loops {loop_txt}"
-            )
-            try:
+                    scoped_recent_count = 0
+
+                ck_txt = (
+                    "Checklist: "
+                    + f"checks={'PASS' if bool(checks.get('ok', False)) else 'FAIL'} | "
+                    + f"alerts={str(scoped_alerts.get('severity', 'ok') or 'ok').upper()} | "
+                    + f"quota={str(aq.get('status', 'n/a') or 'n/a').upper()} | "
+                    + f"guard={'ON' if guard_active > 0 else 'OFF'} | "
+                    + f"inc1h={scoped_recent_count}"
+                )
+                self.lbl_system_checklist.config(text=ck_txt)
+
+                dd_recent = bool(drawdown_guard.get("triggered_recent", False))
+                sf_active = bool(stop_flag.get("active", False))
+                sf_reason = str(stop_flag.get("reason", "") or "").strip().lower()
+                sf_details = stop_flag.get("details", {}) if isinstance(stop_flag.get("details", {}), dict) else {}
+                try:
+                    loop_age = max(0, int(time.time()) - int(market_loop.get("ts", 0) or 0))
+                except Exception:
+                    loop_age = -1
+                loop_txt = f"{loop_age}s old" if 0 <= loop_age <= 600 else "stale"
+                sf_txt = "ON" if sf_active else "OFF"
+                dd_txt = "TRIGGERED" if dd_recent else "OK"
+                cooldown_hint = ""
+                if sf_active and sf_reason == "drawdown_guard":
+                    try:
+                        cooloff_s = max(60, int(float(self.settings.get("global_drawdown_resume_cooloff_s", 14400) or 14400)))
+                    except Exception:
+                        cooloff_s = 14400
+                    trig_ts = int(sf_details.get("triggered_ts", stop_flag.get("ts", 0)) or 0)
+                    rem = max(0, int((trig_ts + cooloff_s) - time.time())) if trig_ts > 0 else 0
+                    cooldown_hint = f" | cooloff {max(1, rem // 60)}m" if rem > 0 else " | ready for ack/recovery check"
+                self.lbl_runtime_guard.config(
+                    text=f"Safety: stop-flag {sf_txt}{cooldown_hint} | drawdown guard {dd_txt} | market loops {loop_txt}"
+                )
+
                 kucoin_row = bh.get("kucoin", {}) if isinstance(bh.get("kucoin", {}), dict) else {}
                 kucoin_state = str(kucoin_row.get("state", "ok") or "ok").strip().lower()
                 checks_ok = bool(checks.get("ok", False))
@@ -17430,52 +17703,37 @@ class PowerTraderHub(tk.Tk):
                 self._set_badge_style(getattr(self, "crypto_chip_broker", None), f"Broker: {'OK' if broker_ok else 'NO'}", tone=("good" if broker_ok else "bad"))
                 self._set_badge_style(getattr(self, "crypto_chip_orders", None), f"Orders: {'OK' if orders_ok else 'NO'}", tone=("good" if orders_ok else "warn"))
                 self._set_badge_style(getattr(self, "crypto_chip_cycle", None), cycle_txt, tone=cycle_tone)
-            except Exception:
-                pass
 
-            try:
                 spark = str(incident_trend.get("sparkline", "") or "").strip()
                 c1 = int((incident_trend.get("counts", {}) if isinstance(incident_trend.get("counts", {}), dict) else {}).get("1h", 0) or 0)
                 self.lbl_runtime_card_incidents.config(text=(f"{spark}" if spark else f"1h incidents: {c1}"))
-            except Exception:
-                pass
-            try:
+
                 rz = float(pnl_dec.get("realized_usd", 0.0) or 0.0)
                 ur = float(pnl_dec.get("unrealized_usd", 0.0) or 0.0)
                 fees = float(pnl_dec.get("fees_usd", 0.0) or 0.0)
                 self.lbl_runtime_card_pnl.config(text=f"R {rz:+.2f} | U {ur:+.2f} | Fees {fees:.2f}")
-            except Exception:
-                pass
-            try:
+
                 p95 = float(latency_hist.get("p95_s", 0.0) or 0.0)
                 avg = float(latency_hist.get("avg_s", 0.0) or 0.0)
                 smp = int(latency_hist.get("samples", 0) or 0)
                 self.lbl_runtime_card_latency.config(text=f"avg {avg:.2f}s | p95 {p95:.2f}s | n={smp}")
-            except Exception:
-                pass
-            try:
+
                 if bool(eq_anom.get("active", False)):
                     d = str(eq_anom.get("direction", "flat") or "flat").strip().upper()
                     dp = float(eq_anom.get("delta_prev_pct", 0.0) or 0.0)
                     self.lbl_runtime_card_anomaly.config(text=f"ACTIVE {d} {dp:+.2f}%")
                 else:
                     self.lbl_runtime_card_anomaly.config(text="No active anomaly")
-            except Exception:
-                pass
-            try:
+
                 st = str(stale_history.get("state", "N/A") or "N/A").upper()
                 age_s = int(stale_history.get("age_s", -1) or -1)
-                age_txt = (f"{age_s}s" if age_s >= 0 else "N/A")
+                age_txt = f"{age_s}s" if age_s >= 0 else "N/A"
                 self.lbl_runtime_card_stale.config(text=f"{st} | age {age_txt}")
-            except Exception:
-                pass
-            try:
+
                 en = int(feature_flags.get("enabled_count", 0) or 0)
                 total = int(feature_flags.get("total_count", 0) or 0)
                 self.lbl_runtime_card_flags.config(text=f"{en}/{total} enabled")
-            except Exception:
-                pass
-            try:
+
                 by_sev = scoped_alerts.get("by_severity", {}) if isinstance(scoped_alerts.get("by_severity", {}), dict) else {}
                 c = int(by_sev.get("critical", 0) or 0)
                 w = int(by_sev.get("warning", 0) or 0)
@@ -17485,8 +17743,12 @@ class PowerTraderHub(tk.Tk):
                 )
             except Exception:
                 pass
-        except Exception:
-            pass
+        elif not runtime_snapshot:
+            try:
+                runtime_snapshot = _safe_read_json(self.runtime_state_path) or {}
+                self._runtime_snapshot_cache = runtime_snapshot if isinstance(runtime_snapshot, dict) else {}
+            except Exception:
+                runtime_snapshot = {}
 
         # Start All is now a toggle (Start/Stop)
         try:
@@ -17681,7 +17943,13 @@ class PowerTraderHub(tk.Tk):
 
         # trade history (now mtime-cached inside)
         self._refresh_trade_history()
-        self._refresh_manual_sell_feedback()
+        manual_feedback_refresh_s = max(
+            1.0,
+            float(getattr(self, "_manual_sell_feedback_refresh_s", 2.0) or 2.0),
+        )
+        if (now_ts - float(getattr(self, "_manual_sell_feedback_last_ts", 0.0) or 0.0)) >= manual_feedback_refresh_s:
+            self._manual_sell_feedback_last_ts = now_ts
+            self._refresh_manual_sell_feedback()
 
         try:
             self._flush_pending_while_you_were_gone_popup()
@@ -17832,6 +18100,18 @@ class PowerTraderHub(tk.Tk):
             next_tick_s = max(1.0, float(self.settings.get("ui_refresh_seconds", 1.0) or 1.0))
         except Exception:
             next_tick_s = 1.0
+        try:
+            elapsed_ms = (time.perf_counter() - tick_started) * 1000.0
+            perf = self._hub_perf_stats if isinstance(self._hub_perf_stats, dict) else {}
+            tick_count = int(perf.get("tick_count", 0) or 0) + 1
+            ema_ms = float(perf.get("tick_ema_ms", 0.0) or 0.0)
+            ema_ms = (0.90 * ema_ms) + (0.10 * float(elapsed_ms)) if ema_ms > 0.0 else float(elapsed_ms)
+            perf["tick_count"] = tick_count
+            perf["tick_last_ms"] = round(float(elapsed_ms), 2)
+            perf["tick_ema_ms"] = round(float(ema_ms), 2)
+            self._hub_perf_stats = perf
+        except Exception:
+            pass
         self.after(int(next_tick_s * 1000), self._tick)
 
 
@@ -18452,6 +18732,10 @@ class PowerTraderHub(tk.Tk):
             fg = "#FFCC66"
         elif str(level).lower().strip() in {"err", "error", "bad"}:
             fg = "#FF6B57"
+        sig = (str(text or ""), str(fg))
+        if getattr(lbl, "_pt_status_sig", None) == sig:
+            return
+        setattr(lbl, "_pt_status_sig", sig)
         try:
             lbl.config(text=str(text or ""), foreground=fg)
         except Exception:
@@ -19016,7 +19300,10 @@ class PowerTraderHub(tk.Tk):
             return
 
         now_ts = float(time.time())
-        if (now_ts - float(getattr(self, "_crypto_watchlist_last_refresh_ts", 0.0) or 0.0)) < 2.0:
+        current_page = str(self.__dict__.get("_current_chart_page", "ACCOUNT") or "ACCOUNT").strip().upper()
+        visible = current_page == "ACCOUNT"
+        refresh_s = 2.0 if visible else 10.0
+        if (now_ts - float(getattr(self, "_crypto_watchlist_last_refresh_ts", 0.0) or 0.0)) < refresh_s:
             return
         self._crypto_watchlist_last_refresh_ts = now_ts
 
@@ -19190,10 +19477,11 @@ class PowerTraderHub(tk.Tk):
             if len(rows) >= watchlist_limit:
                 break
 
-        meta_txt = (
+        meta_txt_base = (
             f"Top candidates {len(rows)} | active set {len(current_set)} | "
-            f"min edge {min_edge:.3f}% | updated {time.strftime('%H:%M:%S', time.localtime(now_ts))}"
+            f"min edge {min_edge:.3f}%"
         )
+        meta_txt = f"{meta_txt_base} | updated {time.strftime('%H:%M:%S', time.localtime(now_ts))}"
         sig = (
             tuple(
                 (
@@ -19208,7 +19496,7 @@ class PowerTraderHub(tk.Tk):
                 )
                 for r in rows
             ),
-            meta_txt,
+            meta_txt_base,
         )
         if getattr(self, "_crypto_watchlist_last_sig", None) == sig:
             return
@@ -19323,7 +19611,7 @@ class PowerTraderHub(tk.Tk):
         if box is None:
             return
 
-        current_page = str(getattr(self, "_current_chart_page", "ACCOUNT") or "ACCOUNT").strip().upper()
+        current_page = str(self.__dict__.get("_current_chart_page", "ACCOUNT") or "ACCOUNT").strip().upper()
         should_show = (current_page == "ACCOUNT")
 
         try:
@@ -19567,6 +19855,11 @@ class PowerTraderHub(tk.Tk):
                 trust_score = 0.0
             if trust_score > 0.0:
                 status_note = (status_note + " | " if status_note else "") + f"Trust {trust_score:.0f}/100"
+        allocator = detail.get("opportunity_allocator", {}) if isinstance(detail.get("opportunity_allocator", {}), dict) else {}
+        if allocator:
+            allocator_summary = str(allocator.get("summary", "") or "").strip()
+            if allocator_summary:
+                status_note = (status_note + " | " if status_note else "") + allocator_summary
         gate_reason = str(detail.get("entry_eval_top_reason", "") or "").strip()
         if gate_reason:
             status_note = (status_note + " | " if status_note else "") + f"Gate: {gate_reason}"
@@ -19938,7 +20231,8 @@ class PowerTraderHub(tk.Tk):
                 px = obj.get("price", None)
                 pnl = obj.get("realized_profit_usd", None)
 
-                pnl_pct = obj.get("pnl_pct", None)
+                pnl_pct = _effective_trade_pnl_pct(obj if isinstance(obj, dict) else {})
+                buy_pnl_pct = _float_or_none(obj.get("pnl_pct", None))
 
                 px_txt = _fmt_price(px) if px is not None else "N/A"
 
@@ -19955,7 +20249,7 @@ class PowerTraderHub(tk.Tk):
                 if side == "SELL":
                     show_trade_pnl_pct = pnl_pct
                 elif side == "BUY" and tag == "DCA":
-                    show_trade_pnl_pct = pnl_pct
+                    show_trade_pnl_pct = buy_pnl_pct
 
                 if show_trade_pnl_pct is not None:
                     try:
@@ -20141,6 +20435,14 @@ class PowerTraderHub(tk.Tk):
         """
         if not hasattr(self, "neural_tiles"):
             return
+
+        now_ts = float(time.time())
+        current_page = str(getattr(self, "_current_chart_page", "ACCOUNT") or "ACCOUNT").strip().upper()
+        visible = current_page == "ACCOUNT"
+        refresh_s = 1.5 if visible else 8.0
+        if (now_ts - float(getattr(self, "_neural_overview_last_refresh_ts", 0.0) or 0.0)) < refresh_s:
+            return
+        self._neural_overview_last_refresh_ts = now_ts
 
         # Keep coin_folders aligned with current settings/coins
         try:
@@ -21493,9 +21795,34 @@ class PowerTraderHub(tk.Tk):
                 stock_day = int(float(tuned.get("stock_max_day_trades", self.settings.get("stock_max_day_trades", 3)) or 3))
             except Exception:
                 stock_day = 3
+            try:
+                stock_cap = float(tuned.get("stock_max_total_exposure_pct", self.settings.get("stock_max_total_exposure_pct", 0.0)) or 0.0)
+            except Exception:
+                stock_cap = 0.0
+            try:
+                forex_cap = float(tuned.get("forex_max_total_exposure_pct", self.settings.get("forex_max_total_exposure_pct", 0.0)) or 0.0)
+            except Exception:
+                forex_cap = 0.0
+            try:
+                market_cap = float(tuned.get("market_max_total_exposure_pct", self.settings.get("market_max_total_exposure_pct", 0.0)) or 0.0)
+            except Exception:
+                market_cap = 0.0
+            try:
+                stock_daily_loss_pct = float(tuned.get("stock_max_daily_loss_pct", self.settings.get("stock_max_daily_loss_pct", 0.0)) or 0.0)
+            except Exception:
+                stock_daily_loss_pct = 0.0
+            try:
+                forex_daily_loss_pct = float(tuned.get("forex_max_daily_loss_pct", self.settings.get("forex_max_daily_loss_pct", 0.0)) or 0.0)
+            except Exception:
+                forex_daily_loss_pct = 0.0
+            stock_daily_txt = f"{stock_daily_loss_pct:.1f}% daily loss guard" if stock_daily_loss_pct > 0.0 else "daily loss guard off"
+            forex_daily_txt = f"{forex_daily_loss_pct:.1f}% daily loss guard" if forex_daily_loss_pct > 0.0 else "daily loss guard off"
+            global_cap_txt = f"{market_cap:.0f}%" if market_cap > 0.0 else "off"
             return (
-                f"Effective policy now: Stocks ${stock_notional:.0f}/trade, max {stock_open} open, max {stock_day} day-trades; "
-                f"Forex {forex_units} units/trade, max {forex_open} open."
+                f"Effective policy now: Stocks ${stock_notional:.0f}/trade, max {stock_open} open, max {stock_day} day-trades, "
+                f"cap {stock_cap:.0f}% ({stock_daily_txt}); "
+                f"Forex {forex_units} units/trade, max {forex_open} open, cap {forex_cap:.0f}% ({forex_daily_txt}); "
+                f"Global cap {global_cap_txt}."
             )
 
         def _sync_settings_mode_ui(*_args: Any) -> None:

@@ -174,6 +174,9 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
     inactive_warn_sub = 0
     inactive_err_sub = 0
     inactive_cadence_err_sub = 0
+    # Sleep-resume diagnostics are environmental telemetry, not runtime health regressions.
+    inactive_warn_sub += _event_severity_count(evt_src, "runner_sleep_resume_detected", ["warning", "warn"])
+    inactive_err_sub += _event_severity_count(evt_src, "runner_sleep_resume_detected", ["critical", "error", "high"])
     if not startup_checks_active:
         inactive_warn_sub += _event_severity_count(evt_src, "runner_startup_check", ["warning", "warn"])
         inactive_err_sub += _event_severity_count(evt_src, "runner_startup_check", ["critical", "error", "high"])
