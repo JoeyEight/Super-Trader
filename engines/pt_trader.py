@@ -326,7 +326,12 @@ def _build_base_paths(main_dir_in: str, coins_in: list) -> dict:
 crypto_symbols = ['BTC', 'ETH', 'XRP', 'BNB', 'DOGE']
 
 # Default main_dir behavior if settings are missing
-main_dir = BASE_DIR
+_default_coin_workspace = os.path.join(BASE_DIR, "market_data", "coins")
+try:
+	os.makedirs(_default_coin_workspace, exist_ok=True)
+except Exception:
+	pass
+main_dir = _default_coin_workspace
 base_paths = {"BTC": os.path.join(main_dir, "BTC")}
 TRADE_START_LEVEL = 3
 START_ALLOC_PCT = 0.5
@@ -380,6 +385,16 @@ def _refresh_paths_and_symbols():
 
 	coins = s.get("coins") or list(crypto_symbols)
 	mndir = s.get("main_neural_dir") or main_dir
+	try:
+		mndir = str(mndir or "").strip()
+	except Exception:
+		mndir = ""
+	if mndir and (not os.path.isabs(mndir)):
+		mndir = os.path.abspath(os.path.join(BASE_DIR, mndir))
+	preferred_workspace = os.path.join(BASE_DIR, "market_data", "coins")
+	if (not mndir) or (os.path.abspath(mndir) == os.path.abspath(BASE_DIR)):
+		if os.path.isdir(preferred_workspace):
+			mndir = preferred_workspace
 	TRADE_START_LEVEL = max(1, min(int(s.get("trade_start_level", TRADE_START_LEVEL) or TRADE_START_LEVEL), 7))
 	START_ALLOC_PCT = normalize_start_allocation_pct(
 		s.get("start_allocation_pct", START_ALLOC_PCT),
@@ -439,7 +454,16 @@ def _refresh_paths_and_symbols():
 
 	# Keep it safe if folder isn't real on this machine
 	if not os.path.isdir(mndir):
-		mndir = BASE_DIR
+		try:
+			os.makedirs(mndir, exist_ok=True)
+		except Exception:
+			pass
+	if not os.path.isdir(mndir):
+		mndir = preferred_workspace
+		try:
+			os.makedirs(mndir, exist_ok=True)
+		except Exception:
+			pass
 
 	crypto_symbols = list(coins)
 	main_dir = mndir

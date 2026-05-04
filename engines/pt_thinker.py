@@ -364,12 +364,26 @@ _gui_settings_cache = {
 	"mtime": None,
 	"path": None,
 	"coins": ['BTC', 'ETH', 'XRP', 'BNB', 'DOGE'],  # fallback defaults
+	"main_neural_dir": os.path.join(BASE_DIR, "market_data", "coins"),
 }
 
 DEFAULT_DYNAMIC_POOL = [
 	"BTC", "ETH", "XRP", "BNB", "DOGE", "SOL", "ADA", "PAXG",
 	"AVAX", "LINK", "LTC", "UNI", "AAVE", "DOT", "ATOM", "MATIC",
 ]
+
+
+def _resolve_coin_workspace_dir(raw_main_dir) -> str:
+	preferred_workspace = os.path.join(BASE_DIR, "market_data", "coins")
+	try:
+		mndir = str(raw_main_dir or "").strip()
+	except Exception:
+		mndir = ""
+	if mndir and (not os.path.isabs(mndir)):
+		mndir = os.path.abspath(os.path.join(BASE_DIR, mndir))
+	if mndir and (os.path.abspath(mndir) != os.path.abspath(BASE_DIR)):
+		return mndir
+	return preferred_workspace
 
 
 def _cached_current_price(sym: str, max_age_s: float = 900.0):
@@ -437,9 +451,11 @@ def _load_gui_coins() -> list:
 		if not coins:
 			coins = list(_gui_settings_cache["coins"])
 
+		main_neural_dir = _resolve_coin_workspace_dir(data.get("main_neural_dir", _gui_settings_cache.get("main_neural_dir")))
 		_gui_settings_cache["mtime"] = mtime
 		_gui_settings_cache["path"] = settings_path
 		_gui_settings_cache["coins"] = coins
+		_gui_settings_cache["main_neural_dir"] = main_neural_dir
 		return list(coins)
 	except Exception:
 		return list(_gui_settings_cache["coins"])
@@ -549,7 +565,12 @@ CURRENT_COINS = list(COIN_SYMBOLS)
 
 def coin_folder(sym: str) -> str:
 	sym = sym.upper()
-	return os.path.join(BASE_DIR, sym)
+	base_dir = _resolve_coin_workspace_dir(_gui_settings_cache.get("main_neural_dir"))
+	try:
+		os.makedirs(base_dir, exist_ok=True)
+	except Exception:
+		pass
+	return os.path.join(base_dir, sym)
 
 
 # --- training freshness gate (mirrors pt_hub.py) ---

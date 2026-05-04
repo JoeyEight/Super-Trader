@@ -5,7 +5,8 @@ Super Trader is a multi-market trading hub with three coordinated engines:
 - Stocks (Alpaca-backed)
 - Forex (OANDA-backed)
 
-The desktop hub UI is in `ui/pt_hub.py`, with runtime orchestration in `runtime/pt_runner.py`.
+The desktop hub UI implementation is in `ui/hub/main.py` (legacy compatibility shim at `ui/pt_hub.py`), with runtime orchestration in `runtime/pt_runner.py`.
+Crypto coin workspaces are now managed under `market_data/coins` by default (auto-migrated from legacy root-level coin folders when needed).
 Primary repository: `https://github.com/JoeyEight/Super-Trader.git`
 
 ## Safety First
@@ -22,7 +23,7 @@ Primary repository: `https://github.com/JoeyEight/Super-Trader.git`
 - `tests/` unit/integration tests
 - `docs/` runbook/changelog/checklists
 - `hub_data/` runtime output (status, logs, diagnostics, incidents)
-- `<COIN>/` coin-specific model/data directories (crypto training/runtime)
+- `market_data/coins/<COIN>/` coin-specific model/data directories (crypto training/runtime)
 
 ## Install
 Recommended Python: `3.10.x`
