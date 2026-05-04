@@ -25,6 +25,62 @@ def _safe_read_jsonl(path: str, max_lines: int = 6000) -> List[Dict[str, Any]]:
     return out
 
 
+def _trade_history_to_execution_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for row in list(rows or []):
+        if not isinstance(row, dict):
+            continue
+        side = str(row.get("side", "") or "").strip().lower()
+        symbol = str(row.get("symbol", "") or "").strip().upper()
+        if not symbol:
+            continue
+        score = _f(row.get("score", row.get("dynamic_score", 0.0)), 0.0)
+        ts = int(_f(row.get("ts", 0.0), 0.0))
+        if side == "buy":
+            out.append(
+                {
+                    "ts": ts,
+                    "event": "entry",
+                    "ok": True,
+                    "symbol": symbol,
+                    "score": float(score),
+                    "payload": dict(row),
+                }
+            )
+            continue
+        if side != "sell":
+            continue
+        pnl_pct = _f(row.get("pnl_pct", 0.0), 0.0)
+        realized = _f(row.get("realized_profit_usd", 0.0), 0.0)
+        ok = bool((realized >= 0.0) or (pnl_pct >= 0.0))
+        out.append(
+            {
+                "ts": ts,
+                "event": "exit",
+                "ok": bool(ok),
+                "symbol": symbol,
+                "score": float(score),
+                "pnl_pct": float(pnl_pct),
+                "pnl_usd": float(realized),
+                "payload": dict(row),
+            }
+        )
+    return out
+
+
+def _calibration_rows_for_market(hub_dir: str, market: str) -> List[Dict[str, Any]]:
+    mk = str(market or "").strip().lower()
+    if mk in {"stocks", "forex"}:
+        return _safe_read_jsonl(os.path.join(hub_dir, mk, "execution_audit.jsonl"), max_lines=8000)
+    if mk == "crypto":
+        rows = _safe_read_jsonl(os.path.join(hub_dir, "crypto", "execution_audit.jsonl"), max_lines=10000)
+        if rows:
+            return rows
+        legacy = _safe_read_jsonl(os.path.join(hub_dir, "trade_history.jsonl"), max_lines=12000)
+        return _trade_history_to_execution_rows(legacy)
+    return []
+
+
 def _f(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -131,10 +187,10 @@ def build_market_confidence_calibration(
     target_success_pct: float = 55.0,
 ) -> Dict[str, Any]:
     m = str(market or "").strip().lower()
-    if m not in {"stocks", "forex"}:
+    if m not in {"stocks", "forex", "crypto"}:
         return {"market": m, "state": "ERROR", "msg": "unsupported market"}
 
-    rows = _safe_read_jsonl(os.path.join(hub_dir, m, "execution_audit.jsonl"), max_lines=8000)
+    rows = _calibration_rows_for_market(hub_dir, m)
     curve = _build_curve(rows)
     rec = _recommended_threshold(curve, base_threshold=base_threshold, min_samples=min_samples, target_success_pct=target_success_pct)
 
@@ -164,10 +220,18 @@ def build_confidence_calibration_payload(hub_dir: str, settings: Dict[str, Any])
     s = settings if isinstance(settings, dict) else {}
     stock_thr = _f(s.get("stock_score_threshold", 0.2), 0.2)
     fx_thr = _f(s.get("forex_score_threshold", 0.2), 0.2)
+    crypto_thr = _f(s.get("crypto_dynamic_min_projected_edge_pct", s.get("crypto_allocator_signal_floor", 0.15)), 0.15)
     min_samples = max(6, int(_f(s.get("adaptive_confidence_min_samples", 18), 18)))
     target_success = max(30.0, min(90.0, _f(s.get("adaptive_confidence_target_success_pct", 55.0), 55.0)))
     return {
         "ts": int(time.time()),
+        "crypto": build_market_confidence_calibration(
+            hub_dir,
+            "crypto",
+            base_threshold=crypto_thr,
+            min_samples=min_samples,
+            target_success_pct=target_success,
+        ),
         "stocks": build_market_confidence_calibration(
             hub_dir,
             "stocks",

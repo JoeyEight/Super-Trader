@@ -1,6 +1,6 @@
+# Core runtime dependencies
 colorama==0.4.6
 cryptography==44.0.0
-duckdb==1.5.1
 kucoin-python==1.0.20
 matplotlib==3.10.8
 orjson==3.11.8
@@ -8,10 +8,13 @@ Pillow==10.4.0
 pandas==2.2.3
 prometheus-client==0.24.1
 psutil==6.1.1
-py-spy==0.4.1
 PyNaCl==1.5.0
-pytest-xdist==3.8.0
 python-dotenv==1.0.1
 requests==2.32.3
-uv==0.11.3
 watchdog==6.0.0
+
+# Test / diagnostics / tooling
+pytest==9.0.2
+pytest-xdist==3.8.0
+py-spy==0.4.1
+uv==0.11.3

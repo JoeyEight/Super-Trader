@@ -284,7 +284,10 @@ def build_market_automation_policy(
         "forex": "forex_max_total_exposure_pct",
     }.get(mk, "max_total_exposure_pct")
     exposure_cap_pct = max(0.0, float(_f(cfg.get(exposure_cap_key, 0.0), 0.0)))
+    independent_mode = bool(cfg.get("market_independent_execution_enabled", False))
     global_exposure_cap_pct = max(0.0, float(_f(cfg.get("market_max_total_exposure_pct", 0.0), 0.0)))
+    if independent_mode:
+        global_exposure_cap_pct = 0.0
     effective_limits = dict(effective_limits or {})
     effective_limits["market_exposure_cap_pct"] = round(float(exposure_cap_pct), 4)
     effective_limits["global_exposure_cap_pct"] = round(float(global_exposure_cap_pct), 4)
@@ -293,6 +296,8 @@ def build_market_automation_policy(
         daily_loss_usd_key = "stock_max_daily_loss_usd" if mk == "stocks" else "forex_max_daily_loss_usd"
         effective_limits["daily_loss_pct"] = round(max(0.0, float(_f(cfg.get(daily_loss_pct_key, 0.0), 0.0))), 4)
         effective_limits["daily_loss_usd"] = round(max(0.0, float(_f(cfg.get(daily_loss_usd_key, 0.0), 0.0))), 4)
+    if independent_mode:
+        summary_bits.append("market execution independence enabled")
     summary = "; ".join([part for part in summary_bits if str(part or "").strip()][:4])
     if not summary:
         summary = f"{profile_label(profile)} policy active"

@@ -27,8 +27,8 @@ def _migrate_v2_to_v3(data: Dict[str, Any], notes: List[str]) -> None:
         data["paper_only_unless_checklist_green"] = True
         notes.append("paper_only_unless_checklist_green: defaulted true")
     if "key_rotation_warn_days" not in data:
-        data["key_rotation_warn_days"] = 90
-        notes.append("key_rotation_warn_days: defaulted 90")
+        data["key_rotation_warn_days"] = 0
+        notes.append("key_rotation_warn_days: defaulted 0 (endpoint-managed key lifecycle)")
 
 
 def migrate_settings(raw: Dict[str, Any] | None) -> Tuple[Dict[str, Any], List[str], int, int]:

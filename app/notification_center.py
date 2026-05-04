@@ -36,6 +36,46 @@ _STARTUP_CHECK_INFO_WARNINGS = {
     "stale_pid_file_removed",
 }
 
+_OPENAI_ERROR_STATUSES = {
+    "timeout",
+    "request_error",
+    "http_error",
+    "invalid_json",
+    "empty_response",
+    "malformed_response",
+    "schema_validation_failed",
+    "runner_exception",
+}
+
+# Transient/unavailable OpenAI statuses should not page the user when the app
+# already falls back to local logic. Reserve warning-level severity for hard
+# integration failures that likely need code/config intervention.
+_OPENAI_HARD_ERROR_STATUSES = {
+    "malformed_response",
+    "schema_validation_failed",
+    "runner_exception",
+}
+
+_OPENAI_INCIDENT_RUNTIME_KEY = {
+    "openai_nightly_review_status": "openai_nightly_review",
+    "openai_position_review_status": "openai_position_review",
+    "openai_capital_planner_status": "openai_capital_planner",
+    "openai_root_cause_status": "openai_root_cause_analysis",
+    "openai_strategy_optimizer_status": "openai_strategy_optimizer",
+    "openai_explanations_status": "openai_explanations",
+    "openai_market_context_status": "openai_market_context",
+    "openai_postmortem_status": "openai_postmortem_analysis",
+}
+
+_OPENAI_INFO_DISABLED_STATUSES = {
+    "",
+    "disabled",
+    "live_disabled",
+    "paper_disabled",
+    "idle",
+    "not_requested",
+}
+
 
 def _safe_read_json(path: str) -> Dict[str, Any]:
     try:
@@ -72,6 +112,29 @@ def _sev(v: str) -> str:
     return "info"
 
 
+def _openai_status_is_error(status: Any) -> bool:
+    return str(status or "").strip().lower() in _OPENAI_ERROR_STATUSES
+
+
+def _openai_status_is_hard_error(status: Any) -> bool:
+    return str(status or "").strip().lower() in _OPENAI_HARD_ERROR_STATUSES
+
+
+def _openai_incident_is_actionable(row: Dict[str, Any], runtime_state: Dict[str, Any]) -> bool:
+    evt = str(row.get("event", "") or "").strip().lower()
+    if evt in _OPENAI_INCIDENT_RUNTIME_KEY:
+        key = _OPENAI_INCIDENT_RUNTIME_KEY[evt]
+        payload = runtime_state.get(key, {}) if isinstance(runtime_state.get(key, {}), dict) else {}
+        if not payload:
+            return False
+        status = str(payload.get("status", "") or "").strip().lower()
+        running = bool(payload.get("running", False))
+        return _openai_status_is_hard_error(status) and (not running)
+    if evt.startswith("openai_"):
+        return False
+    return True
+
+
 def _severity_rank(v: str) -> int:
     sev = _sev(v)
     if sev == "critical":
@@ -81,6 +144,36 @@ def _severity_rank(v: str) -> int:
     if sev == "ok":
         return 0
     return 1
+
+
+def _openai_should_emit_status_row(
+    *,
+    status: Any,
+    running: bool,
+    change_applied: bool = False,
+) -> bool:
+    st = str(status or "").strip().lower()
+    if bool(running):
+        return False
+    if _openai_status_is_hard_error(st):
+        return True
+    if st in _OPENAI_INFO_DISABLED_STATUSES:
+        return False
+    if st == "ok" and bool(change_applied):
+        return True
+    return False
+
+
+def _row_is_actionable_or_issue(row: Dict[str, Any]) -> bool:
+    if not isinstance(row, dict):
+        return False
+    severity = _sev(str(row.get("severity", "info") or "info"))
+    if severity in {"critical", "warning"}:
+        return True
+    action = row.get("action", {}) if isinstance(row.get("action", {}), dict) else {}
+    if str(action.get("setting_key", "") or "").strip():
+        return True
+    return bool(row.get("change_applied", False))
 
 
 def _market_from_incident(row: Dict[str, Any]) -> str:
@@ -670,11 +763,8 @@ def _automation_policy_rows(runtime_state: Dict[str, Any], ts_now: int) -> List[
         if not summary:
             continue
         trust_score = _f(row.get("runtime_trust_score", 0.0), 0.0)
-        allow_entries = bool(row.get("allow_new_entries", True))
         compliance_status = str(row.get("compliance_status", "") or "").strip()
         severity = "info"
-        if not allow_entries:
-            severity = "warning"
         if trust_score > 0.0 and trust_score < 35.0:
             severity = "critical"
         title = f"{str(_market_label(market)).title()} automation policy"
@@ -706,8 +796,6 @@ def _cross_market_opportunity_rows(runtime_state: Dict[str, Any], ts_now: int) -
     decisions = payload.get("decisions", {}) if isinstance(payload.get("decisions", {}), dict) else {}
     deprioritized = payload.get("deprioritized_markets", []) if isinstance(payload.get("deprioritized_markets", []), list) else []
     severity = "info"
-    if any(str((row or {}).get("decision", "") or "").strip().lower() == "block" for row in deprioritized if isinstance(row, dict)):
-        severity = "warning"
     if not summary and best_market:
         summary = f"Best current opportunity: {str(_market_label(best_market)).title()}"
     if not summary:
@@ -724,6 +812,69 @@ def _cross_market_opportunity_rows(runtime_state: Dict[str, Any], ts_now: int) -
             "message": summary[:220],
         }
     ]
+    ai = payload.get("openai_decision", {}) if isinstance(payload.get("openai_decision", {}), dict) else {}
+    ai_enabled = bool(ai.get("enabled", False))
+    ai_active = bool(ai.get("active", False))
+    ai_status = str(ai.get("status", "") or "").strip().lower()
+    ai_summary = str(ai.get("summary", "") or "").strip()
+    if ai_enabled and ai_status and not ai_summary and ai_status not in {"ok", "not_requested"}:
+        ai_summary = "AI portfolio decision unavailable; local allocator is active."
+    ai_applied = bool(ai_active and bool(ai.get("applied", False)))
+    if ai_enabled and ai_summary and (_openai_status_is_hard_error(ai_status) or ai_applied):
+        ai_severity = "info"
+        if ai_applied:
+            ai_title = "AI portfolio decision applied"
+        elif ai_active:
+            ai_title = "AI portfolio decision advisory"
+        else:
+            ai_title = "AI portfolio decision fallback"
+            if _openai_status_is_hard_error(ai_status):
+                ai_severity = "warning"
+        rows.append(
+            {
+                "id": f"cross_market_openai_{ts_now}",
+                "ts": int(ts_now),
+                "severity": ai_severity,
+                "market": "global",
+                "source": "opportunity_allocator",
+                "title": ai_title,
+                "message": ai_summary[:220],
+                "change_applied": bool(ai_applied),
+            }
+        )
+    ai_position_actions = ai.get("position_actions", []) if isinstance(ai.get("position_actions", []), list) else []
+    if ai_enabled and ai_position_actions and ai_applied:
+        for idx, prow in enumerate(ai_position_actions[:3]):
+            if not isinstance(prow, dict):
+                continue
+            action = str(prow.get("action", "") or "").strip().lower()
+            symbol = str(prow.get("symbol", "") or "").strip().upper()
+            market = str(prow.get("market", "") or "").strip().lower()
+            reason = str(prow.get("reason", "") or "").strip()
+            if not symbol or not action:
+                continue
+            sev = "info"
+            title = f"AI position review: {action.upper()} {symbol}"
+            if action == "block_add":
+                title = f"AI position review: BLOCK ADD {symbol}"
+            msg_bits: List[str] = []
+            if reason:
+                msg_bits.append(reason[:170])
+            conf = _f(prow.get("confidence", 0.0), 0.0)
+            if conf > 0.0:
+                msg_bits.append(f"confidence {conf:.2f}")
+            rows.append(
+                {
+                    "id": f"cross_market_openai_position_{idx}_{ts_now}",
+                    "ts": int(ts_now),
+                    "severity": sev,
+                    "market": market or "global",
+                    "source": "opportunity_allocator",
+                    "title": title,
+                    "message": " | ".join(msg_bits)[:220] if msg_bits else f"AI recommends {action} for {symbol}.",
+                    "change_applied": True,
+                }
+            )
     for row in deprioritized[:2]:
         if not isinstance(row, dict):
             continue
@@ -732,7 +883,7 @@ def _cross_market_opportunity_rows(runtime_state: Dict[str, Any], ts_now: int) -
         message = str(row.get("summary", "") or "").strip()
         if not mk or not message:
             continue
-        sev = "warning" if decision == "block" else "info"
+        sev = "info"
         rows.append(
             {
                 "id": f"cross_market_{mk}_{ts_now}",
@@ -750,6 +901,369 @@ def _cross_market_opportunity_rows(runtime_state: Dict[str, Any], ts_now: int) -
         if top_decision:
             rows[0]["message"] = f"{rows[0]['message']} | Decision: {top_decision}"
     return rows
+
+
+def _openai_nightly_review_rows(runtime_state: Dict[str, Any], ts_now: int) -> List[Dict[str, Any]]:
+    rs = runtime_state if isinstance(runtime_state, dict) else {}
+    payload = rs.get("openai_nightly_review", {}) if isinstance(rs.get("openai_nightly_review", {}), dict) else {}
+    if not payload:
+        return []
+    running = bool(payload.get("running", False))
+    status = str(payload.get("status", "") or "").strip().lower()
+    summary = str(payload.get("summary", "") or "").strip()
+    applied_count = int(max(0.0, _f(payload.get("applied_tuning_count", 0), 0.0)))
+    should_emit = _openai_should_emit_status_row(
+        status=status,
+        running=running,
+        change_applied=(applied_count > 0),
+    )
+    if not should_emit:
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    if _openai_status_is_hard_error(status):
+        message = summary or "Nightly AI trade review failed; local logic remains active."
+        rows.append(
+            {
+                "id": f"openai_nightly_review_{ts_now}",
+                "ts": int(ts_now),
+                "severity": "warning",
+                "market": "global",
+                "source": "openai_nightly_review",
+                "title": "AI nightly trade review fallback",
+                "message": message[:220],
+            }
+        )
+        return rows
+
+    # Status OK and changes applied.
+    rows.append(
+        {
+            "id": f"openai_nightly_review_tuning_{ts_now}",
+            "ts": int(ts_now),
+            "severity": "info",
+            "market": "global",
+            "source": "openai_nightly_review",
+            "title": "AI nightly tuning applied",
+            "message": (
+                f"{applied_count} low-risk setting change(s) were auto-applied by nightly review"
+                + (
+                    f"; verified {int(max(0.0, _f(payload.get('persisted_verified_count', 0), 0.0)))} persisted."
+                    if int(max(0.0, _f(payload.get("persisted_verified_count", 0), 0.0))) > 0
+                    else "."
+                )
+            )[:220],
+            "change_applied": True,
+        }
+    )
+    applied_rows = payload.get("applied_tuning", []) if isinstance(payload.get("applied_tuning", []), list) else []
+    for idx, row in enumerate(applied_rows[:4]):
+        if not isinstance(row, dict):
+            continue
+        key = str(row.get("setting_key", "") or "").strip()
+        old_val = row.get("old_value")
+        new_val = row.get("new_value")
+        reason = str(row.get("reason", "") or "").strip()
+        if not key:
+            continue
+        msg = f"{key}: {old_val} -> {new_val}"
+        if reason:
+            msg = f"{msg} | {reason[:120]}"
+        rows.append(
+            {
+                "id": f"openai_nightly_review_tuning_item_{idx}_{ts_now}",
+                "ts": int(ts_now),
+                "severity": "info",
+                "market": "global",
+                "source": "openai_nightly_review",
+                "title": f"Applied: {key}"[:120],
+                "message": msg[:220],
+                "change_applied": True,
+            }
+        )
+    return rows
+
+
+def _openai_position_review_rows(runtime_state: Dict[str, Any], ts_now: int) -> List[Dict[str, Any]]:
+    rs = runtime_state if isinstance(runtime_state, dict) else {}
+    payload = rs.get("openai_position_review", {}) if isinstance(rs.get("openai_position_review", {}), dict) else {}
+    if not payload:
+        return []
+    running = bool(payload.get("running", False))
+    status = str(payload.get("status", "") or "").strip().lower()
+    summary = str(payload.get("summary", "") or "").strip()
+    if not _openai_should_emit_status_row(status=status, running=running, change_applied=False):
+        return []
+    if not _openai_status_is_hard_error(status):
+        return []
+    return [
+        {
+            "id": f"openai_position_review_{ts_now}",
+            "ts": int(ts_now),
+            "severity": "warning",
+            "market": "global",
+            "source": "openai_position_review",
+            "title": "AI position review fallback",
+            "message": (summary or "AI position review failed; local logic remains active.")[:220],
+        }
+    ]
+
+
+def _openai_capital_planner_rows(runtime_state: Dict[str, Any], ts_now: int) -> List[Dict[str, Any]]:
+    rs = runtime_state if isinstance(runtime_state, dict) else {}
+    payload = rs.get("openai_capital_planner", {}) if isinstance(rs.get("openai_capital_planner", {}), dict) else {}
+    if not payload:
+        return []
+    running = bool(payload.get("running", False))
+    status = str(payload.get("status", "") or "").strip().lower()
+    summary = str(payload.get("summary", "") or "").strip()
+    if not _openai_should_emit_status_row(status=status, running=running, change_applied=False):
+        return []
+    if not _openai_status_is_hard_error(status):
+        return []
+    return [
+        {
+            "id": f"openai_capital_planner_{ts_now}",
+            "ts": int(ts_now),
+            "severity": "warning",
+            "market": "global",
+            "source": "openai_capital_planner",
+            "title": "AI capital planner fallback",
+            "message": (summary or "AI capital planner failed; local allocator remains active.")[:220],
+        }
+    ]
+
+
+def _openai_root_cause_rows(runtime_state: Dict[str, Any], ts_now: int) -> List[Dict[str, Any]]:
+    rs = runtime_state if isinstance(runtime_state, dict) else {}
+    payload = rs.get("openai_root_cause_analysis", {}) if isinstance(rs.get("openai_root_cause_analysis", {}), dict) else {}
+    if not payload:
+        return []
+    running = bool(payload.get("running", False))
+    status = str(payload.get("status", "") or "").strip().lower()
+    summary = str(payload.get("summary", "") or "").strip()
+    if not _openai_should_emit_status_row(status=status, running=running, change_applied=False):
+        return []
+    if not _openai_status_is_hard_error(status):
+        return []
+    return [
+        {
+            "id": f"openai_root_cause_{ts_now}",
+            "ts": int(ts_now),
+            "severity": "warning",
+            "market": "global",
+            "source": "openai_root_cause_analysis",
+            "title": "AI root-cause analysis fallback",
+            "message": (summary or "AI root-cause analysis failed; local diagnostics remain active.")[:220],
+        }
+    ]
+
+
+def _openai_strategy_optimizer_rows(runtime_state: Dict[str, Any], ts_now: int) -> List[Dict[str, Any]]:
+    rs = runtime_state if isinstance(runtime_state, dict) else {}
+    payload = rs.get("openai_strategy_optimizer", {}) if isinstance(rs.get("openai_strategy_optimizer", {}), dict) else {}
+    if not payload:
+        return []
+    running = bool(payload.get("running", False))
+    status = str(payload.get("status", "") or "").strip().lower()
+    summary = str(payload.get("summary", "") or "").strip()
+    applied_count = int(max(0.0, _f(payload.get("applied_tuning_count", 0), 0.0)))
+    should_emit = _openai_should_emit_status_row(
+        status=status,
+        running=running,
+        change_applied=(applied_count > 0),
+    )
+    if not should_emit:
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    if _openai_status_is_hard_error(status):
+        rows.append(
+            {
+                "id": f"openai_strategy_optimizer_{ts_now}",
+                "ts": int(ts_now),
+                "severity": "warning",
+                "market": "global",
+                "source": "openai_strategy_optimizer",
+                "title": "AI strategy optimizer fallback",
+                "message": (summary or "AI strategy optimizer failed; local strategy remains active.")[:220],
+            }
+        )
+        return rows
+
+    rows.append(
+        {
+            "id": f"openai_strategy_optimizer_{ts_now}",
+            "ts": int(ts_now),
+            "severity": "info",
+            "market": "global",
+            "source": "openai_strategy_optimizer",
+            "title": "AI strategy tuning applied",
+            "message": (
+                f"{applied_count} low-risk strategy setting change(s) were auto-applied"
+                + (
+                    f"; verified {int(max(0.0, _f(payload.get('persisted_verified_count', 0), 0.0)))} persisted."
+                    if int(max(0.0, _f(payload.get("persisted_verified_count", 0), 0.0))) > 0
+                    else "."
+                )
+            )[:220],
+            "change_applied": True,
+        }
+    )
+    applied_rows = payload.get("applied_tuning", []) if isinstance(payload.get("applied_tuning", []), list) else []
+    for idx, row in enumerate(applied_rows[:4]):
+        if not isinstance(row, dict):
+            continue
+        key = str(row.get("setting_key", "") or "").strip()
+        old_val = row.get("old_value")
+        new_val = row.get("new_value")
+        reason = str(row.get("reason", "") or "").strip()
+        if not key:
+            continue
+        msg = f"{key}: {old_val} -> {new_val}"
+        if reason:
+            msg = f"{msg} | {reason[:120]}"
+        rows.append(
+            {
+                "id": f"openai_strategy_optimizer_item_{idx}_{ts_now}",
+                "ts": int(ts_now),
+                "severity": "info",
+                "market": "global",
+                "source": "openai_strategy_optimizer",
+                "title": f"Applied: {key}"[:120],
+                "message": msg[:220],
+                "change_applied": True,
+            }
+        )
+    return rows
+
+
+def _openai_market_context_rows(runtime_state: Dict[str, Any], ts_now: int) -> List[Dict[str, Any]]:
+    rs = runtime_state if isinstance(runtime_state, dict) else {}
+    payload = rs.get("openai_market_context", {}) if isinstance(rs.get("openai_market_context", {}), dict) else {}
+    if not payload:
+        return []
+    running = bool(payload.get("running", False))
+    status = str(payload.get("status", "") or "").strip().lower()
+    summary = str(payload.get("summary", "") or "").strip()
+    if not _openai_should_emit_status_row(status=status, running=running, change_applied=False):
+        return []
+    if not _openai_status_is_hard_error(status):
+        return []
+    return [
+        {
+            "id": f"openai_market_context_{ts_now}",
+            "ts": int(ts_now),
+            "severity": "warning",
+            "market": "global",
+            "source": "openai_market_context",
+            "title": "AI market context fallback",
+            "message": (summary or "AI market context scoring failed; local context logic remains active.")[:220],
+        }
+    ]
+
+
+def _openai_postmortem_rows(runtime_state: Dict[str, Any], ts_now: int) -> List[Dict[str, Any]]:
+    rs = runtime_state if isinstance(runtime_state, dict) else {}
+    payload = rs.get("openai_postmortem_analysis", {}) if isinstance(rs.get("openai_postmortem_analysis", {}), dict) else {}
+    if not payload:
+        return []
+    running = bool(payload.get("running", False))
+    status = str(payload.get("status", "") or "").strip().lower()
+    summary = str(payload.get("summary", "") or "").strip()
+    applied_count = int(max(0.0, _f(payload.get("applied_tuning_count", 0), 0.0)))
+    should_emit = _openai_should_emit_status_row(
+        status=status,
+        running=running,
+        change_applied=(applied_count > 0),
+    )
+    if not should_emit:
+        return []
+    rows: List[Dict[str, Any]] = []
+    if _openai_status_is_hard_error(status):
+        rows.append(
+            {
+                "id": f"openai_postmortem_{ts_now}",
+                "ts": int(ts_now),
+                "severity": "warning",
+                "market": "global",
+                "source": "openai_postmortem_analysis",
+                "title": "AI postmortem analysis fallback",
+                "message": (summary or "AI postmortem analysis failed; local postmortem remains available.")[:220],
+            }
+        )
+        return rows
+
+    rows.append(
+        {
+            "id": f"openai_postmortem_{ts_now}",
+            "ts": int(ts_now),
+            "severity": "info",
+            "market": "global",
+            "source": "openai_postmortem_analysis",
+            "title": "AI postmortem tuning applied",
+            "message": (
+                f"{applied_count} low-risk postmortem tuning change(s) were auto-applied"
+                + (
+                    f"; verified {int(max(0.0, _f(payload.get('persisted_verified_count', 0), 0.0)))} persisted."
+                    if int(max(0.0, _f(payload.get("persisted_verified_count", 0), 0.0))) > 0
+                    else "."
+                )
+            )[:220],
+            "change_applied": True,
+        }
+    )
+    applied_rows = payload.get("applied_tuning", []) if isinstance(payload.get("applied_tuning", []), list) else []
+    for idx, row in enumerate(applied_rows[:4]):
+        if not isinstance(row, dict):
+            continue
+        key = str(row.get("setting_key", "") or "").strip()
+        old_val = row.get("old_value")
+        new_val = row.get("new_value")
+        reason = str(row.get("reason", "") or "").strip()
+        if not key:
+            continue
+        msg = f"{key}: {old_val} -> {new_val}"
+        if reason:
+            msg = f"{msg} | {reason[:120]}"
+        rows.append(
+            {
+                "id": f"openai_postmortem_tuning_{idx}_{ts_now}",
+                "ts": int(ts_now),
+                "severity": "info",
+                "market": "global",
+                "source": "openai_postmortem_analysis",
+                "title": f"Applied: {key}"[:120],
+                "message": msg[:220],
+                "change_applied": True,
+            }
+        )
+    return rows
+
+
+def _openai_explanation_rows(runtime_state: Dict[str, Any], ts_now: int) -> List[Dict[str, Any]]:
+    rs = runtime_state if isinstance(runtime_state, dict) else {}
+    payload = rs.get("openai_explanations", {}) if isinstance(rs.get("openai_explanations", {}), dict) else {}
+    if not payload:
+        return []
+    running = bool(payload.get("running", False))
+    status = str(payload.get("status", "") or "").strip().lower()
+    summary = str(payload.get("summary", "") or "").strip()
+    if not _openai_should_emit_status_row(status=status, running=running, change_applied=False):
+        return []
+    if not _openai_status_is_hard_error(status):
+        return []
+    return [
+        {
+            "id": f"openai_explanations_{ts_now}",
+            "ts": int(ts_now),
+            "severity": "warning",
+            "market": "global",
+            "source": "openai_explanations",
+            "title": "AI explanations fallback",
+            "message": (summary or "AI explanations failed; local explanation text remains active.")[:220],
+        }
+    ]
 
 
 def build_notification_center_payload(
@@ -784,6 +1298,14 @@ def build_notification_center_payload(
         )
     out_rows.extend(_automation_policy_rows(rs, ts_now))
     out_rows.extend(_cross_market_opportunity_rows(rs, ts_now))
+    out_rows.extend(_openai_nightly_review_rows(rs, ts_now))
+    out_rows.extend(_openai_position_review_rows(rs, ts_now))
+    out_rows.extend(_openai_capital_planner_rows(rs, ts_now))
+    out_rows.extend(_openai_root_cause_rows(rs, ts_now))
+    out_rows.extend(_openai_strategy_optimizer_rows(rs, ts_now))
+    out_rows.extend(_openai_market_context_rows(rs, ts_now))
+    out_rows.extend(_openai_postmortem_rows(rs, ts_now))
+    out_rows.extend(_openai_explanation_rows(rs, ts_now))
 
     trends = rs.get("market_trends", {}) if isinstance(rs.get("market_trends", {}), dict) else {}
     for market in ("stocks", "forex"):
@@ -818,7 +1340,10 @@ def build_notification_center_payload(
             out_rows.append(
                 row
             )
-        if rel_score < 70.0:
+        has_rel_signal = isinstance(rel, dict) and any(
+            key in rel for key in ("score", "samples", "source_count", "source_failures", "as_of_ts")
+        )
+        if has_rel_signal and rel_score < 70.0:
             message = f"Reliability score {rel_score:.1f}/100."
             action = _action_for_market_trend_row(market, "Data reliability degraded", message)
             row = {
@@ -855,6 +1380,8 @@ def build_notification_center_payload(
     for row in list(incidents_rows or []):
         if not isinstance(row, dict):
             continue
+        if not _openai_incident_is_actionable(row, rs):
+            continue
         if not _incident_is_active(row, rs):
             continue
         ts = int(float(row.get("ts", 0) or 0))
@@ -878,6 +1405,11 @@ def build_notification_center_payload(
         if action:
             out_row["action"] = action
         out_rows.append(out_row)
+
+    # Keep notifications focused on actual issues or concrete changes:
+    # - warning/critical issues always show
+    # - info rows show only when they carry a quick-action or confirmed applied change
+    out_rows = [row for row in out_rows if _row_is_actionable_or_issue(row)]
 
     out_rows = _dedupe_notification_rows(out_rows)
     out_rows = sorted(

@@ -60,6 +60,7 @@ class TestSettingsSanitize(unittest.TestCase):
             "forex_replay_adaptive_enabled": "no",
             "forex_replay_adaptive_weight": "-5",
             "forex_replay_adaptive_step_cap_pct": "200",
+            "forex_stale_hold_near_flat_pct": "999",
             "forex_mtf_confirm_max_pairs": "999",
             "runtime_alert_cadence_warn_count": "0",
             "runtime_alert_cadence_crit_count": "0",
@@ -133,6 +134,7 @@ class TestSettingsSanitize(unittest.TestCase):
         self.assertFalse(bool(out["forex_replay_adaptive_enabled"]))
         self.assertEqual(float(out["forex_replay_adaptive_weight"]), 0.0)
         self.assertEqual(float(out["forex_replay_adaptive_step_cap_pct"]), 90.0)
+        self.assertEqual(float(out["forex_stale_hold_near_flat_pct"]), 5.0)
         self.assertEqual(int(out["forex_mtf_confirm_max_pairs"]), 128)
         self.assertEqual(int(out["runtime_alert_cadence_warn_count"]), 1)
         self.assertEqual(int(out["runtime_alert_cadence_crit_count"]), 1)

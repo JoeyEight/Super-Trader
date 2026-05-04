@@ -50,7 +50,12 @@ from app.operator_notes import (
     read_recent_operator_note_entries,
     write_operator_notes_markdown,
 )
-from app.settings_utils import sanitize_settings, recommend_market_profile_overrides, normalize_settings_profile
+from app.settings_utils import (
+    PROFILE_MANUAL_OVERRIDE_ALLOWLIST,
+    sanitize_settings,
+    recommend_market_profile_overrides,
+    normalize_settings_profile,
+)
 from app.live_mode_guard import evaluate_live_mode_checklist
 from app.market_awareness import build_awareness_payload
 from app.health_rules import evaluate_runtime_alerts
@@ -71,11 +76,13 @@ from brokers.broker_oanda import OandaBrokerClient
 from app.credential_utils import (
     alpaca_credential_paths,
     get_alpaca_creds,
+    get_openai_api_key,
     get_oanda_creds,
     get_twelvedata_api_key,
     get_robinhood_creds_from_env,
     normalize_start_allocation_pct,
     oanda_credential_paths,
+    openai_credential_path,
     robinhood_credential_paths,
     twelvedata_credential_path,
     get_robinhood_creds_from_files,
@@ -94,8 +101,29 @@ DARK_FG = "#C7D1DB"
 DARK_MUTED = "#8B949E"
 DARK_ACCENT = "#00FF66"   
 DARK_ACCENT2 = "#00E5FF"   
+CYAN = DARK_ACCENT2
 DARK_SELECT_BG = "#17324A"
 DARK_SELECT_FG = "#00FF66"
+
+# Chart-only palette tuned for a "terminal neon" look while keeping draw ops light.
+CHART_BG = "#04070C"
+CHART_PANEL = "#071019"
+CHART_PANEL_ALT = "#0A1622"
+CHART_BORDER = "#1D3A2C"
+CHART_GRID = "#113323"
+CHART_GRID_ALT = "#0C271B"
+CHART_TITLE = "#3BFF9A"
+CHART_TEXT = "#BFD2CC"
+CHART_MUTED = "#7FA097"
+CHART_UP = "#2BFF8B"
+CHART_DOWN = "#FF667D"
+CHART_LINE_MAIN = "#35E7FF"
+CHART_LINE_GLOW = "#0E5C73"
+CHART_LINE_ALT = "#45FFA8"
+CHART_FILL_MAIN = "#0B1D2F"
+CHART_EMA_FAST = "#35E7FF"
+CHART_EMA_SLOW = "#FFC857"
+CHART_LAST = "#35E7FF"
 BADGE_STYLES: Dict[str, Tuple[str, str, str]] = {
     "good": ("#0F2B1D", "#6CFFB0", "#1E5A3C"),
     "warn": ("#2C2312", "#FFD27A", "#6A5324"),
@@ -464,6 +492,12 @@ DEFAULT_SETTINGS = {
     "crypto_dynamic_auto_train": True,
     "crypto_dynamic_max_trainers": 1,
     "crypto_dynamic_rotation_cooldown_s": 900,
+    "crypto_replay_adaptive_enabled": True,
+    "crypto_replay_adaptive_weight": 0.35,
+    "crypto_replay_adaptive_step_cap_pct": 40.0,
+    "crypto_min_calib_prob_live_guarded": 0.50,
+    "crypto_min_samples_live_guarded": 6,
+    "crypto_allocator_signal_floor": 0.15,
     "crypto_max_open_positions": 8,
     "news_event_enabled": True,
     "news_event_refresh_s": 900.0,
@@ -611,6 +645,7 @@ DEFAULT_SETTINGS = {
     "forex_max_signal_age_seconds": 300,
     "forex_reject_drift_warn_pct": 65.0,
     "market_max_total_exposure_pct": 0.0,
+    "market_independent_execution_enabled": False,
     "market_bg_stocks_interval_s": 15.0,
     "market_bg_forex_interval_s": 10.0,
     "market_intelligence_interval_s": 180.0,
@@ -633,13 +668,14 @@ DEFAULT_SETTINGS = {
     "broker_order_retry_after_cap_s": 300.0,
     "adaptive_confidence_min_samples": 18,
     "adaptive_confidence_target_success_pct": 55.0,
+    "replay_target_entries_crypto": 5,
     "replay_target_entries_stocks": 3,
     "replay_target_entries_forex": 4,
     "operator_notes_max_entries": 120,
     "market_loop_jitter_pct": 0.10,
     "market_settings_reload_interval_s": 8.0,
     "paper_only_unless_checklist_green": True,
-    "key_rotation_warn_days": 90,
+    "key_rotation_warn_days": 0,
     "data_cache_max_age_days": 14.0,
     "scanner_quality_max_age_days": 14.0,
     "data_cache_max_total_mb": 300,
@@ -1346,12 +1382,12 @@ class CandleChart(ttk.Frame):
     def _apply_dark_chart_style(self) -> None:
         """Apply dark styling (called on init and after every ax.clear())."""
         try:
-            self.fig.patch.set_facecolor(DARK_BG)
-            self.ax.set_facecolor(DARK_PANEL)
-            self.ax.tick_params(colors=DARK_FG)
+            self.fig.patch.set_facecolor(CHART_BG)
+            self.ax.set_facecolor(CHART_PANEL)
+            self.ax.tick_params(colors=CHART_TEXT)
             for spine in self.ax.spines.values():
-                spine.set_color(DARK_BORDER)
-            self.ax.grid(True, color=DARK_BORDER, linewidth=0.6, alpha=0.35)
+                spine.set_color(CHART_BORDER)
+            self.ax.grid(True, color=CHART_GRID, linewidth=0.65, alpha=0.45, linestyle="--")
         except Exception:
             pass
 
@@ -1769,13 +1805,13 @@ class CandleChart(ttk.Frame):
         if not candles:
             self._legend_panel_text = f"{self.coin}: waiting for candle data..."
             self._legend_rows = [
-                {"label": "Green candle", "meaning": "Price closed above open for that bar.", "color": DARK_ACCENT, "dash": (), "sample": "square"},
-                {"label": "Red candle", "meaning": "Price closed below open for that bar.", "color": "#FF6B57", "dash": (), "sample": "square"},
-                {"label": "Long neural level", "meaning": "Blue support/reference level from neural model.", "color": "blue", "dash": ()},
-                {"label": "Short neural level", "meaning": "Orange resistance/reference level from neural model.", "color": "orange", "dash": ()},
-                {"label": "Trail line (★)", "meaning": "Trailing sell threshold once armed.", "color": "green", "dash": ()},
-                {"label": "Next DCA (◆)", "meaning": "Next averaging-buy trigger level.", "color": "red", "dash": ()},
-                {"label": "Average cost (●)", "meaning": "Current blended entry price.", "color": "yellow", "dash": ()},
+                {"label": "Green candle", "meaning": "Price closed above open for that bar.", "color": CHART_UP, "dash": (), "sample": "square"},
+                {"label": "Red candle", "meaning": "Price closed below open for that bar.", "color": CHART_DOWN, "dash": (), "sample": "square"},
+                {"label": "Long neural level", "meaning": "Blue support/reference level from neural model.", "color": CHART_LINE_MAIN, "dash": ()},
+                {"label": "Short neural level", "meaning": "Orange resistance/reference level from neural model.", "color": CHART_EMA_SLOW, "dash": ()},
+                {"label": "Trail line (★)", "meaning": "Trailing sell threshold once armed.", "color": CHART_UP, "dash": ()},
+                {"label": "Next DCA (◆)", "meaning": "Next averaging-buy trigger level.", "color": CHART_DOWN, "dash": ()},
+                {"label": "Average cost (●)", "meaning": "Current blended entry price.", "color": CHART_EMA_SLOW, "dash": ()},
             ]
             self._legend_note = "Chart is loading. Legend previews the indicator meanings."
             self._legend_tooltip_text = ""
@@ -1791,13 +1827,13 @@ class CandleChart(ttk.Frame):
                 err = ""
             spinner_char = ["|", "/", "-", "\\"][int(time.time() * 6.0) % 4]
             if err:
-                self.ax.set_title(f"{self.coin} ({tf}) - feed retry {spinner_char}", color=DARK_FG)
+                self.ax.set_title(f"{self.coin} ({tf}) - feed retry {spinner_char}", color=CHART_TITLE)
                 try:
                     self.neural_status_label.config(text=f"Neural: N/A | retrying feed")
                 except Exception:
                     pass
             else:
-                self.ax.set_title(f"{self.coin} ({tf}) - loading {spinner_char}", color=DARK_FG)
+                self.ax.set_title(f"{self.coin} ({tf}) - loading {spinner_char}", color=CHART_TITLE)
             try:
                 self.ax.text(
                     0.5,
@@ -1806,9 +1842,9 @@ class CandleChart(ttk.Frame):
                     transform=self.ax.transAxes,
                     ha="center",
                     va="center",
-                    color=DARK_ACCENT2,
+                    color=CHART_LINE_MAIN,
                     fontsize=12,
-                    bbox={"facecolor": DARK_PANEL, "edgecolor": DARK_BORDER, "pad": 8},
+                    bbox={"facecolor": CHART_PANEL, "edgecolor": CHART_BORDER, "pad": 8},
                 )
             except Exception:
                 pass
@@ -1830,7 +1866,7 @@ class CandleChart(ttk.Frame):
             l = float(c["low"])
 
             up = cl >= o
-            candle_color = "green" if up else "red"
+            candle_color = CHART_UP if up else CHART_DOWN
 
             # wick
             self.ax.plot([i, i], [l, h], linewidth=1, color=candle_color)
@@ -1887,7 +1923,7 @@ class CandleChart(ttk.Frame):
                 artist = self.ax.axhline(
                     y=yy,
                     linewidth=1,
-                    color="blue",
+                    color=CHART_LINE_MAIN,
                     alpha=(0.8 if show_detailed_levels else 0.65),
                 )
                 line_hover_targets.append({
@@ -1912,7 +1948,7 @@ class CandleChart(ttk.Frame):
                 artist = self.ax.axhline(
                     y=yy,
                     linewidth=1,
-                    color="orange",
+                    color=CHART_EMA_SLOW,
                     alpha=(0.8 if show_detailed_levels else 0.65),
                 )
                 line_hover_targets.append({
@@ -1936,7 +1972,7 @@ class CandleChart(ttk.Frame):
         try:
             if trail_line is not None and float(trail_line) > 0:
                 yy = float(trail_line)
-                artist = self.ax.axhline(y=yy, linewidth=1.5, color="green", alpha=0.95)
+                artist = self.ax.axhline(y=yy, linewidth=1.5, color=CHART_UP, alpha=0.95)
                 line_hover_targets.append({
                     "y": yy,
                     "artist": artist,
@@ -1956,7 +1992,7 @@ class CandleChart(ttk.Frame):
         try:
             if dca_line_price is not None and float(dca_line_price) > 0:
                 yy = float(dca_line_price)
-                artist = self.ax.axhline(y=yy, linewidth=1.5, color="red", alpha=0.95)
+                artist = self.ax.axhline(y=yy, linewidth=1.5, color=CHART_DOWN, alpha=0.95)
                 line_hover_targets.append({
                     "y": yy,
                     "artist": artist,
@@ -1977,7 +2013,7 @@ class CandleChart(ttk.Frame):
         try:
             if avg_cost_basis is not None and float(avg_cost_basis) > 0:
                 yy = float(avg_cost_basis)
-                artist = self.ax.axhline(y=yy, linewidth=1.5, color="yellow", alpha=0.95)
+                artist = self.ax.axhline(y=yy, linewidth=1.5, color=CHART_EMA_SLOW, alpha=0.95)
                 line_hover_targets.append({
                     "y": yy,
                     "artist": artist,
@@ -1998,7 +2034,7 @@ class CandleChart(ttk.Frame):
         try:
             if current_buy_price is not None and float(current_buy_price) > 0:
                 yy = float(current_buy_price)
-                artist = self.ax.axhline(y=yy, linewidth=1.5, color="purple", alpha=0.95)
+                artist = self.ax.axhline(y=yy, linewidth=1.5, color=CHART_LINE_MAIN, alpha=0.95)
                 if show_detailed_levels:
                     line_hover_targets.append({
                         "y": yy,
@@ -2019,7 +2055,7 @@ class CandleChart(ttk.Frame):
         try:
             if current_sell_price is not None and float(current_sell_price) > 0:
                 yy = float(current_sell_price)
-                artist = self.ax.axhline(y=yy, linewidth=1.5, color="teal", alpha=0.95)
+                artist = self.ax.axhline(y=yy, linewidth=1.5, color=CHART_LINE_ALT, alpha=0.95)
                 if show_detailed_levels:
                     line_hover_targets.append({
                         "y": yy,
@@ -2153,27 +2189,27 @@ class CandleChart(ttk.Frame):
                 {
                     "label": "Green candle",
                     "meaning": "Price closed above open for that bar.",
-                    "color": DARK_ACCENT,
+                    "color": CHART_UP,
                     "dash": (),
                     "sample": "square",
                 },
                 {
                     "label": "Red candle",
                     "meaning": "Price closed below open for that bar.",
-                    "color": "#FF6B57",
+                    "color": CHART_DOWN,
                     "dash": (),
                     "sample": "square",
                 },
                 {
                     "label": "Long neural level",
                     "meaning": "Blue support/reference level from neural model.",
-                    "color": "blue",
+                    "color": CHART_LINE_MAIN,
                     "dash": (),
                 },
                 {
                     "label": "Short neural level",
                     "meaning": "Orange resistance/reference level from neural model.",
-                    "color": "orange",
+                    "color": CHART_EMA_SLOW,
                     "dash": (),
                 },
                 {
@@ -2182,7 +2218,7 @@ class CandleChart(ttk.Frame):
                         f"Trailing sell threshold ({trail_text}). "
                         "Crossing back through it can trigger a sell."
                     ),
-                    "color": "green",
+                    "color": CHART_UP,
                     "dash": (),
                 },
                 {
@@ -2191,13 +2227,13 @@ class CandleChart(ttk.Frame):
                         f"Next averaging-buy trigger ({dca_text}). "
                         "Touching this line makes the next DCA buy eligible."
                     ),
-                    "color": "red",
+                    "color": CHART_DOWN,
                     "dash": (),
                 },
                 {
                     "label": "Average cost (●)",
                     "meaning": f"Current blended entry price ({avg_text}).",
-                    "color": "yellow",
+                    "color": CHART_EMA_SLOW,
                     "dash": (),
                 },
             ]
@@ -2207,13 +2243,13 @@ class CandleChart(ttk.Frame):
                         {
                             "label": "Ask line (A)",
                             "meaning": f"Current buy-side market reference ({ask_text}).",
-                            "color": "purple",
+                            "color": CHART_LINE_MAIN,
                             "dash": (),
                         },
                         {
                             "label": "Bid line (B)",
                             "meaning": f"Current sell-side market reference ({bid_text}).",
-                            "color": "teal",
+                            "color": CHART_LINE_ALT,
                             "dash": (),
                         },
                     ]
@@ -2265,10 +2301,10 @@ class CandleChart(ttk.Frame):
 
                     if side == "buy":
                         label = "DCA" if tag == "DCA" else "BUY"
-                        color = "purple" if tag == "DCA" else "red"
+                        color = "#8DE7FF" if tag == "DCA" else CHART_UP
                     elif side == "sell":
                         label = "SELL"
-                        color = "green"
+                        color = CHART_DOWN
                     else:
                         continue
 
@@ -2323,7 +2359,7 @@ class CandleChart(ttk.Frame):
                         xytext=(0, 10),
                         ha="center",
                         fontsize=8,
-                        color=DARK_FG,
+                        color=CHART_TEXT,
                         zorder=7,
                     )
         except Exception:
@@ -2332,7 +2368,7 @@ class CandleChart(ttk.Frame):
 
         self.ax.set_xlim(-0.5, (len(candles) - 0.5) + 0.6)
 
-        self.ax.set_title(f"{self.coin} ({tf})", color=DARK_FG)
+        self.ax.set_title(f"{self.coin} ({tf})", color=CHART_TITLE)
 
 
 
@@ -2593,12 +2629,12 @@ class AccountValueChart(ttk.Frame):
 
     def _apply_dark_chart_style(self) -> None:
         try:
-            self.fig.patch.set_facecolor(DARK_BG)
-            self.ax.set_facecolor(DARK_PANEL)
-            self.ax.tick_params(colors=DARK_FG)
+            self.fig.patch.set_facecolor(CHART_BG)
+            self.ax.set_facecolor(CHART_PANEL)
+            self.ax.tick_params(colors=CHART_TEXT)
             for spine in self.ax.spines.values():
-                spine.set_color(DARK_BORDER)
-            self.ax.grid(True, color=DARK_BORDER, linewidth=0.6, alpha=0.35)
+                spine.set_color(CHART_BORDER)
+            self.ax.grid(True, color=CHART_GRID, linewidth=0.65, alpha=0.45, linestyle="--")
         except Exception:
             pass
 
@@ -2727,7 +2763,7 @@ class AccountValueChart(ttk.Frame):
 
         if not points:
             spinner_char = ["|", "/", "-", "\\"][int(time.time() * 6.0) % 4]
-            self.ax.set_title(f"Account Value - loading {spinner_char}", color=DARK_FG)
+            self.ax.set_title(f"Account Value - loading {spinner_char}", color=CHART_TITLE)
             self.last_update_label.config(text="Last: N/A")
             try:
                 self.ax.text(
@@ -2737,9 +2773,9 @@ class AccountValueChart(ttk.Frame):
                     transform=self.ax.transAxes,
                     ha="center",
                     va="center",
-                    color=DARK_ACCENT2,
+                    color=CHART_LINE_MAIN,
                     fontsize=12,
-                    bbox={"facecolor": DARK_PANEL, "edgecolor": DARK_BORDER, "pad": 8},
+                    bbox={"facecolor": CHART_PANEL, "edgecolor": CHART_BORDER, "pad": 8},
                 )
             except Exception:
                 pass
@@ -2750,7 +2786,10 @@ class AccountValueChart(ttk.Frame):
         # Only show cent-level changes (hide sub-cent noise)
         ys = [round(p[1], 2) for p in points]
 
-        self.ax.plot(xs, ys, linewidth=1.5)
+        if len(xs) >= 2:
+            self.ax.fill_between(xs, ys, [min(ys)] * len(ys), color=CHART_FILL_MAIN, alpha=0.52)
+            self.ax.plot(xs, ys, linewidth=3.0, color=CHART_LINE_GLOW)
+        self.ax.plot(xs, ys, linewidth=1.6, color=CHART_LINE_MAIN)
 
         # --- Trade dots (BUY / DCA / SELL) for ALL coins ---
         try:
@@ -2768,10 +2807,10 @@ class AccountValueChart(ttk.Frame):
 
                     if side == "buy":
                         action_label = "DCA" if tag == "DCA" else "BUY"
-                        color = "purple" if tag == "DCA" else "red"
+                        color = "#8DE7FF" if tag == "DCA" else CHART_UP
                     elif side == "sell":
                         action_label = "SELL"
-                        color = "green"
+                        color = CHART_DOWN
                     else:
                         continue
 
@@ -2812,7 +2851,7 @@ class AccountValueChart(ttk.Frame):
                         xytext=(0, 10),
                         ha="center",
                         fontsize=8,
-                        color=DARK_FG,
+                        color=CHART_TEXT,
                         zorder=7,
                     )
 
@@ -3763,18 +3802,7 @@ class PowerTraderHub(tk.Tk):
             seq = [str(p).strip() for p in raw if str(p).strip()]
         else:
             seq = []
-        allowed = {
-            "crypto_max_open_positions",
-            "stock_max_open_positions",
-            "forex_max_open_positions",
-            "stock_trade_notional_usd",
-            "forex_trade_units",
-            "stock_score_threshold",
-            "forex_score_threshold",
-            "stock_min_samples_live_guarded",
-            "forex_min_samples_live_guarded",
-        }
-        return {k for k in seq if k in allowed}
+        return {k for k in seq if k in PROFILE_MANUAL_OVERRIDE_ALLOWLIST}
 
     def _market_money_text(
         self,
@@ -4250,6 +4278,7 @@ class PowerTraderHub(tk.Tk):
             "forex_trailing_gap_pct": 0.15,
             "forex_max_total_exposure_pct": 0.0,
             "market_max_total_exposure_pct": 0.0,
+            "market_independent_execution_enabled": False,
             "global_max_drawdown_pct": 0.0,
             "global_drawdown_auto_resume_enabled": True,
             "global_drawdown_resume_cooloff_s": 14400,
@@ -4825,21 +4854,17 @@ class PowerTraderHub(tk.Tk):
     def _notification_payload(self) -> Dict[str, Any]:
         path = os.path.join(self.hub_dir, "notification_center.json")
         runtime_snapshot = _safe_read_json(self._runtime_state_file_path()) or {}
-        has_live_runtime = isinstance(runtime_snapshot, dict) and any(
-            key in runtime_snapshot for key in ("ts", "alerts", "market_trends", "scan_cadence", "shadow_scorecards", "exposure_map")
-        )
-        if has_live_runtime:
-            try:
-                live_runtime = dict(runtime_snapshot)
-                live_runtime["alerts"] = evaluate_runtime_alerts(
-                    live_runtime,
-                    sanitize_settings(dict(self.settings) if isinstance(getattr(self, "settings", {}), dict) else {}, defaults=DEFAULT_SETTINGS),
-                )
-                rebuilt = build_notification_center_from_hub(self.hub_dir, runtime_state=live_runtime)
-                if isinstance(rebuilt, dict):
-                    return rebuilt
-            except Exception:
-                pass
+        try:
+            live_runtime = dict(runtime_snapshot) if isinstance(runtime_snapshot, dict) else {}
+            live_runtime["alerts"] = evaluate_runtime_alerts(
+                live_runtime,
+                sanitize_settings(dict(self.settings) if isinstance(getattr(self, "settings", {}), dict) else {}, defaults=DEFAULT_SETTINGS),
+            )
+            rebuilt = build_notification_center_from_hub(self.hub_dir, runtime_state=live_runtime)
+            if isinstance(rebuilt, dict):
+                return rebuilt
+        except Exception:
+            pass
         row = _safe_read_json(path) or {}
         if isinstance(row, dict) and row:
             return row
@@ -5838,7 +5863,7 @@ class PowerTraderHub(tk.Tk):
             "",
         ]
         scope_norm = str(scope or "both").strip().lower()
-        markets = ["stocks", "forex"] if scope_norm not in {"stocks", "forex"} else [scope_norm]
+        markets = ["crypto", "stocks", "forex"] if scope_norm not in {"crypto", "stocks", "forex"} else [scope_norm]
         for market in markets:
             row = data.get(market, {}) if isinstance(data.get(market, {}), dict) else {}
             if not row:
@@ -5887,7 +5912,7 @@ class PowerTraderHub(tk.Tk):
             return
         self._replay_busy = True
         market_norm = str(market or "both").strip().lower()
-        if market_norm not in {"both", "stocks", "forex"}:
+        if market_norm not in {"both", "crypto", "stocks", "forex"}:
             market_norm = "both"
         self._audit_operator_action("rejection_replay_requested", {"market": market_norm})
 
@@ -5906,6 +5931,10 @@ class PowerTraderHub(tk.Tk):
                     }
                 _safe_write_json(self.rejection_replay_path, payload)
                 if isinstance(full, dict):
+                    _safe_write_json(
+                        os.path.join(self.hub_dir, "rejection_replay_crypto.json"),
+                        {"ts": int(time.time()), "crypto": (full.get("crypto", {}) if isinstance(full.get("crypto", {}), dict) else {})},
+                    )
                     _safe_write_json(
                         os.path.join(self.hub_dir, "rejection_replay_stocks.json"),
                         {"ts": int(time.time()), "stocks": (full.get("stocks", {}) if isinstance(full.get("stocks", {}), dict) else {})},
@@ -6892,13 +6921,13 @@ class PowerTraderHub(tk.Tk):
                 return
 
             fig = Figure(figsize=(11.0, 5.2), dpi=110)
-            fig.patch.set_facecolor(DARK_BG)
+            fig.patch.set_facecolor(CHART_BG)
             ax = fig.add_subplot(111)
-            ax.set_facecolor(DARK_PANEL)
-            ax.tick_params(colors=DARK_FG)
+            ax.set_facecolor(CHART_PANEL)
+            ax.tick_params(colors=CHART_TEXT)
             for sp in ax.spines.values():
-                sp.set_color(DARK_BORDER)
-            ax.grid(True, color=DARK_BORDER, linewidth=0.7, alpha=0.35)
+                sp.set_color(CHART_BORDER)
+            ax.grid(True, color=CHART_GRID, linewidth=0.7, alpha=0.45, linestyle="--")
 
             closes = [float(r["c"]) for r in parsed]
             lows = [float(r["l"]) for r in parsed]
@@ -6913,7 +6942,7 @@ class PowerTraderHub(tk.Tk):
                     h = float(row["h"])
                     l = float(row["l"])
                     up = c >= o
-                    color = DARK_ACCENT if up else "#FF6B57"
+                    color = CHART_UP if up else CHART_DOWN
                     ax.plot([i, i], [l, h], linewidth=1, color=color)
                     bottom = min(o, c)
                     height = max(1e-12, abs(c - o))
@@ -6922,13 +6951,15 @@ class PowerTraderHub(tk.Tk):
                             (i - 0.34, bottom),
                             0.68,
                             height,
-                            facecolor=(color if up else DARK_PANEL),
+                            facecolor=(color if up else CHART_PANEL_ALT),
                             edgecolor=color,
                             linewidth=1,
                         )
                     )
             else:
-                ax.plot(xs, closes, linewidth=1.8, color=DARK_ACCENT2)
+                ax.plot(xs, closes, linewidth=3.2, color=CHART_LINE_GLOW)
+                ax.plot(xs, closes, linewidth=1.8, color=CHART_LINE_MAIN)
+                ax.fill_between(xs, closes, [min(closes)] * len(closes), color=CHART_FILL_MAIN, alpha=0.52)
 
             def _ema(vals: List[float], period: int) -> List[float]:
                 if not vals:
@@ -6942,9 +6973,9 @@ class PowerTraderHub(tk.Tk):
             ema_fast = _ema(closes, 9)
             ema_slow = _ema(closes, 21)
             if len(ema_fast) == n:
-                ax.plot(xs, ema_fast, linewidth=1.7, color="#00E5FF")
+                ax.plot(xs, ema_fast, linewidth=1.7, color=CHART_EMA_FAST)
             if len(ema_slow) == n:
-                ax.plot(xs, ema_slow, linewidth=1.7, color="#FFD166")
+                ax.plot(xs, ema_slow, linewidth=1.7, color=CHART_EMA_SLOW)
 
             delta_pct = 0.0
             try:
@@ -6954,9 +6985,9 @@ class PowerTraderHub(tk.Tk):
                 delta_pct = 0.0
             ax.set_title(
                 f"{market_key.title()} {focus} | {n} bars | delta {delta_pct:+.2f}% | src {chart_source}",
-                color=DARK_FG,
+                color=CHART_TITLE,
             )
-            ax.axhline(closes[-1], color=DARK_ACCENT2, linewidth=1.0, linestyle="--", alpha=0.8)
+            ax.axhline(closes[-1], color=CHART_LAST, linewidth=1.0, linestyle="--", alpha=0.8)
             ax.set_xlim(-0.5, (n - 0.5) + 0.6)
 
             vmin = min(lows)
@@ -6983,7 +7014,7 @@ class PowerTraderHub(tk.Tk):
                         lbl = raw_t[5:16] if len(raw_t) >= 16 else raw_t
                     tick_lbl.append(lbl or f"bar {i + 1}")
                 ax.set_xticks(tick_x)
-                ax.set_xticklabels(tick_lbl, fontsize=8, color=DARK_FG)
+                ax.set_xticklabels(tick_lbl, fontsize=8, color=CHART_TEXT)
 
             out_path = self._next_chart_export_path(f"{market_key}_chart")
             fig.savefig(out_path, dpi=160, facecolor=fig.get_facecolor())
@@ -13547,7 +13578,7 @@ class PowerTraderHub(tk.Tk):
             16,
             anchor="nw",
             text="Account Value",
-            fill=DARK_ACCENT,
+            fill=CHART_TITLE,
             font=(self._live_log_font.cget("family"), max(10, int(self._live_log_font.cget("size")) + 3), "bold"),
         )
         summary_bits = [
@@ -13561,7 +13592,7 @@ class PowerTraderHub(tk.Tk):
             40,
             anchor="nw",
             text=" | ".join(summary_bits),
-            fill=DARK_MUTED,
+            fill=CHART_MUTED,
             font=(self._live_log_font.cget("family"), max(8, int(self._live_log_font.cget("size")))),
         )
         if not points:
@@ -13574,7 +13605,7 @@ class PowerTraderHub(tk.Tk):
                 spin_cy - spin_r,
                 spin_cx + spin_r,
                 spin_cy + spin_r,
-                outline=DARK_BORDER,
+                outline=CHART_BORDER,
                 width=2,
             )
             canvas.create_arc(
@@ -13585,7 +13616,7 @@ class PowerTraderHub(tk.Tk):
                 start=spin_phase,
                 extent=110,
                 style="arc",
-                outline=DARK_ACCENT2,
+                outline=CHART_LINE_MAIN,
                 width=3,
             )
             spinner_char = ["|", "/", "-", "\\"][int(time.time() * 6.0) % 4]
@@ -13594,7 +13625,7 @@ class PowerTraderHub(tk.Tk):
                 spin_cy,
                 anchor="center",
                 text=spinner_char,
-                fill=DARK_ACCENT2,
+                fill=CHART_LINE_MAIN,
                 font=(self._live_log_font.cget("family"), max(10, int(self._live_log_font.cget("size")) + 1), "bold"),
             )
             canvas.create_text(
@@ -13602,7 +13633,7 @@ class PowerTraderHub(tk.Tk):
                 spin_cy + 34,
                 anchor="center",
                 text="Loading account history...",
-                fill=DARK_MUTED,
+                fill=CHART_MUTED,
                 font=(self._live_log_font.cget("family"), max(9, int(self._live_log_font.cget("size")))),
             )
             return
@@ -13624,7 +13655,7 @@ class PowerTraderHub(tk.Tk):
         yr = max(1e-9, y_max - y_min)
         n = len(points)
 
-        canvas.create_rectangle(plot_left, plot_top, plot_right, plot_bot, outline=DARK_BORDER, fill=DARK_PANEL2)
+        canvas.create_rectangle(plot_left, plot_top, plot_right, plot_bot, outline=CHART_BORDER, fill=CHART_PANEL)
 
         def _x_for(idx: int) -> float:
             if n <= 1:
@@ -13637,26 +13668,30 @@ class PowerTraderHub(tk.Tk):
         for gy in range(5):
             frac = float(gy) / 4.0
             y = plot_top + frac * (plot_bot - plot_top)
-            canvas.create_line(plot_left, y, plot_right, y, fill=DARK_BORDER)
+            grid_color = CHART_GRID_ALT if (gy % 2) else CHART_GRID
+            canvas.create_line(plot_left, y, plot_right, y, fill=grid_color, dash=(2, 3))
             val = y_max - (frac * yr)
             canvas.create_text(
                 plot_right - 4,
                 y - 1,
                 anchor="ne",
                 text=f"${val:,.2f}",
-                fill=DARK_MUTED,
+                fill=CHART_MUTED,
                 font=(self._live_log_font.cget("family"), max(8, int(self._live_log_font.cget("size")))),
             )
         for gx in range(6):
             frac = float(gx) / 5.0
             x = plot_left + frac * (plot_right - plot_left)
-            canvas.create_line(x, plot_top, x, plot_bot, fill=DARK_BORDER)
+            canvas.create_line(x, plot_top, x, plot_bot, fill=CHART_GRID, dash=(2, 3))
 
         pts: List[float] = []
         for idx, val in enumerate(values):
             pts.extend([_x_for(idx), _y_for(val)])
         if len(pts) >= 4:
-            canvas.create_line(*pts, fill=DARK_ACCENT2, width=2, smooth=True)
+            fill_poly: List[float] = [plot_left, plot_bot] + pts + [plot_right, plot_bot]
+            canvas.create_polygon(*fill_poly, fill=CHART_FILL_MAIN, outline="")
+            canvas.create_line(*pts, fill=CHART_LINE_GLOW, width=4, smooth=True)
+            canvas.create_line(*pts, fill=CHART_LINE_MAIN, width=2, smooth=True)
 
         plotted_markers: List[Tuple[float, str, float, float, str]] = []
         for ts_f, event, ident in list(marker_rows or []):
@@ -13665,7 +13700,7 @@ class PowerTraderHub(tk.Tk):
             idx = min(range(len(tss)), key=lambda i: abs(float(tss[i]) - ts_f))
             x = _x_for(idx)
             y = _y_for(values[idx])
-            color = DARK_ACCENT if event == "entry" else "#FFB347"
+            color = CHART_UP if event == "entry" else CHART_DOWN
             canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill=color, outline=color)
             label = f"{ident} {'BUY' if event == 'entry' else 'EXIT'}".strip()
             plotted_markers.append((ts_f, label, x, y, color))
@@ -13688,10 +13723,10 @@ class PowerTraderHub(tk.Tk):
                     _x_for(idx),
                     plot_bot + 2,
                     anchor="n",
-                    text=lbl,
-                    fill=DARK_MUTED,
-                    font=(self._live_log_font.cget("family"), max(8, int(self._live_log_font.cget("size")))),
-                )
+                text=lbl,
+                fill=CHART_MUTED,
+                font=(self._live_log_font.cget("family"), max(8, int(self._live_log_font.cget("size")))),
+            )
 
         if isinstance(hover_store, dict):
             hover_store["chart_hover_data"] = {
@@ -13731,17 +13766,19 @@ class PowerTraderHub(tk.Tk):
             return False
         try:
             fig = Figure(figsize=(11.0, 5.2), dpi=110)
-            fig.patch.set_facecolor(DARK_BG)
+            fig.patch.set_facecolor(CHART_BG)
             ax = fig.add_subplot(111)
-            ax.set_facecolor(DARK_PANEL)
-            ax.tick_params(colors=DARK_FG)
+            ax.set_facecolor(CHART_PANEL)
+            ax.tick_params(colors=CHART_TEXT)
             for sp in ax.spines.values():
-                sp.set_color(DARK_BORDER)
-            ax.grid(True, color=DARK_BORDER, linewidth=0.7, alpha=0.35)
+                sp.set_color(CHART_BORDER)
+            ax.grid(True, color=CHART_GRID, linewidth=0.7, alpha=0.45, linestyle="--")
 
             values = [round(float(val), 2) for _, val in points]
             xs = list(range(len(points)))
-            ax.plot(xs, values, linewidth=2.0, color=DARK_ACCENT2)
+            ax.plot(xs, values, linewidth=3.4, color=CHART_LINE_GLOW)
+            ax.plot(xs, values, linewidth=1.9, color=CHART_LINE_MAIN)
+            ax.fill_between(xs, values, [min(values)] * len(values), color=CHART_FILL_MAIN, alpha=0.52)
             ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _pos: f"${y:,.2f}"))
 
             n = len(points)
@@ -13749,7 +13786,7 @@ class PowerTraderHub(tk.Tk):
             tick_x = [xs[i] for i in tick_idxs]
             tick_lbl = [self._format_ui_timestamp(points[i][0], include_date=(n > 20)) for i in tick_idxs]
             ax.set_xticks(tick_x)
-            ax.set_xticklabels(tick_lbl, fontsize=8, color=DARK_FG)
+            ax.set_xticklabels(tick_lbl, fontsize=8, color=CHART_TEXT)
 
             portfolio = self._crypto_portfolio_snapshot()
             ax.set_title(
@@ -13757,7 +13794,7 @@ class PowerTraderHub(tk.Tk):
                     f"Account Value | Value {portfolio.get('total_account_value', 'N/A')} | "
                     f"Buying power {portfolio.get('buying_power', 'N/A')} | Open {portfolio.get('open_positions', '0')}"
                 ),
-                color=DARK_FG,
+                color=CHART_TITLE,
             )
             fig.savefig(out_path, dpi=160, facecolor=fig.get_facecolor())
             return True
@@ -13843,7 +13880,7 @@ class PowerTraderHub(tk.Tk):
             height = 320
         try:
             canvas.delete("all")
-            canvas.create_rectangle(0, 0, width, height, fill=DARK_PANEL2, outline=DARK_BORDER)
+            canvas.create_rectangle(0, 0, width, height, fill=CHART_PANEL_ALT, outline=CHART_BORDER)
             panel["chart_hover_data"] = {}
             panel["chart_hover_idx"] = -1
             panel["chart_table_tooltips"] = {}
@@ -14327,7 +14364,7 @@ class PowerTraderHub(tk.Tk):
                 16,
                 anchor="nw",
                 text=title_txt,
-                fill=DARK_ACCENT,
+                fill=CHART_TITLE,
                 font=(self._live_log_font.cget("family"), max(10, int(self._live_log_font.cget("size")) + 3), "bold"),
             )
 
@@ -14345,7 +14382,7 @@ class PowerTraderHub(tk.Tk):
                     40,
                     anchor="nw",
                     text=body,
-                    fill=DARK_MUTED,
+                    fill=CHART_MUTED,
                     width=max(280, width - 36),
                     font=(self._live_log_font.cget("family"), max(8, int(self._live_log_font.cget("size")))),
                 )
@@ -14357,7 +14394,7 @@ class PowerTraderHub(tk.Tk):
                     48,
                     anchor="nw",
                     text=body,
-                    fill=DARK_FG,
+                    fill=CHART_TEXT,
                     width=max(210, text_right - 24),
                     font=(self._live_log_font.cget("family"), max(9, int(self._live_log_font.cget("size")) + 1)),
                 )
@@ -14409,7 +14446,7 @@ class PowerTraderHub(tk.Tk):
                     y_max = vmax + pad
                     yr = max(1e-9, y_max - y_min)
 
-                    canvas.create_rectangle(plot_left, plot_top, plot_right, plot_bot, outline=DARK_BORDER, fill=DARK_PANEL2)
+                    canvas.create_rectangle(plot_left, plot_top, plot_right, plot_bot, outline=CHART_BORDER, fill=CHART_PANEL)
 
                     def _x_for(i: int, total: int) -> float:
                         if total <= 1:
@@ -14423,20 +14460,21 @@ class PowerTraderHub(tk.Tk):
                     for gy in range(5):
                         frac = float(gy) / 4.0
                         y = plot_top + frac * (plot_bot - plot_top)
-                        canvas.create_line(plot_left, y, plot_right, y, fill=DARK_BORDER)
+                        grid_color = CHART_GRID_ALT if (gy % 2) else CHART_GRID
+                        canvas.create_line(plot_left, y, plot_right, y, fill=grid_color, dash=(2, 3))
                         price = y_max - (frac * yr)
                         canvas.create_text(
                             plot_right - 4,
                             y - 1,
                             anchor="ne",
                             text=_fmt_px(price),
-                            fill=DARK_MUTED,
+                            fill=CHART_MUTED,
                             font=(self._live_log_font.cget("family"), max(8, int(self._live_log_font.cget("size")))),
                         )
                     for gx in range(6):
                         frac = float(gx) / 5.0
                         x = plot_left + frac * (plot_right - plot_left)
-                        canvas.create_line(x, plot_top, x, plot_bot, fill=DARK_BORDER)
+                        canvas.create_line(x, plot_top, x, plot_bot, fill=CHART_GRID, dash=(2, 3))
 
                     n = len(parsed)
                     dx = (plot_right - plot_left) / float(max(1, n))
@@ -14451,7 +14489,7 @@ class PowerTraderHub(tk.Tk):
                             yh = _y_for(float(row["h"]))
                             yl = _y_for(float(row["l"]))
                             up = float(row["c"]) >= float(row["o"])
-                            color = DARK_ACCENT if up else "#FF6B57"
+                            color = CHART_UP if up else CHART_DOWN
                             canvas.create_line(x, yh, x, yl, fill=color, width=1)
                             y1 = min(yo, yc)
                             y2 = max(yo, yc)
@@ -14463,13 +14501,17 @@ class PowerTraderHub(tk.Tk):
                                 x + candle_w,
                                 y2,
                                 outline=color,
-                                fill=(color if up else DARK_PANEL),
+                                fill=(color if up else CHART_PANEL_ALT),
                             )
                     else:
                         line_pts: List[float] = []
                         for i, v in enumerate(closes):
                             line_pts.extend([_x_for(i, n), _y_for(v)])
-                        canvas.create_line(*line_pts, fill=DARK_ACCENT2, width=2, smooth=True)
+                        if len(line_pts) >= 4:
+                            poly_pts: List[float] = [plot_left, plot_bot] + line_pts + [plot_right, plot_bot]
+                            canvas.create_polygon(*poly_pts, fill=CHART_FILL_MAIN, outline="")
+                            canvas.create_line(*line_pts, fill=CHART_LINE_GLOW, width=4, smooth=True)
+                            canvas.create_line(*line_pts, fill=CHART_LINE_MAIN, width=2, smooth=True)
 
                     # Fast/slow EMA overlays for trend context.
                     ema_fast = _ema(closes, 9)
@@ -14481,9 +14523,9 @@ class PowerTraderHub(tk.Tk):
                         fast_pts.extend([x, _y_for(ema_fast[i])])
                         slow_pts.extend([x, _y_for(ema_slow[i])])
                     if len(fast_pts) >= 4:
-                        canvas.create_line(*fast_pts, fill="#00E5FF", width=2, smooth=True)
+                        canvas.create_line(*fast_pts, fill=CHART_EMA_FAST, width=2, smooth=True)
                     if len(slow_pts) >= 4:
-                        canvas.create_line(*slow_pts, fill="#FFD166", width=2, smooth=True)
+                        canvas.create_line(*slow_pts, fill=CHART_EMA_SLOW, width=2, smooth=True)
 
                     line_targets: List[Dict[str, Any]] = []
                     for row in list(benchmark_overlays or []):
@@ -14515,19 +14557,19 @@ class PowerTraderHub(tk.Tk):
                         plot_top - 10,
                         anchor="sw",
                         text="EMA 9 (cyan) | EMA 21 (gold) | hover benchmark lines for context",
-                        fill=DARK_MUTED,
+                        fill=CHART_MUTED,
                         font=(self._live_log_font.cget("family"), max(8, int(self._live_log_font.cget("size")))),
                     )
 
                     # Last price guide
                     last_y = _y_for(last_v)
-                    canvas.create_line(plot_left, last_y, plot_right, last_y, fill=DARK_ACCENT2, dash=(4, 3))
+                    canvas.create_line(plot_left, last_y, plot_right, last_y, fill=CHART_LAST, dash=(4, 3))
                     canvas.create_text(
                         plot_right - 4,
                         max(plot_top + 10, min(plot_bot - 10, last_y - 2)),
                         anchor="ne",
                         text=f"last {_fmt_px(last_v)}",
-                        fill=DARK_ACCENT2,
+                        fill=CHART_LAST,
                         font=(self._live_log_font.cget("family"), max(9, int(self._live_log_font.cget("size")))),
                     )
 
@@ -14553,7 +14595,7 @@ class PowerTraderHub(tk.Tk):
                                 plot_bot + 2,
                                 anchor="n",
                                 text=lbl,
-                                fill=DARK_MUTED,
+                                fill=CHART_MUTED,
                                 font=(self._live_log_font.cget("family"), max(8, int(self._live_log_font.cget("size")))),
                             )
 
@@ -14567,7 +14609,7 @@ class PowerTraderHub(tk.Tk):
                         "rows": list(parsed),
                         "line_targets": list(line_targets),
                     }
-                    trend_color = DARK_ACCENT if delta_pct >= 0 else "#FF6B57"
+                    trend_color = CHART_UP if delta_pct >= 0 else CHART_DOWN
                     focus_display = self._selected_market_focus_symbol(market_key, thinker_data) or "AUTO"
                     if focus_display and (focus_display != "AUTO"):
                         panel["focus_loading_symbol"] = ""
@@ -15086,6 +15128,23 @@ class PowerTraderHub(tk.Tk):
                     state_line += f" | Portfolio={alloc_summary[:68]}"
                 elif alloc_decision:
                     state_line += f" | Portfolio={alloc_decision.title()}"
+                ai_alloc = allocator_data.get("openai_decision", {}) if isinstance(allocator_data.get("openai_decision", {}), dict) else {}
+                ai_summary = str(ai_alloc.get("summary", "") or "").strip()
+                if ai_summary:
+                    state_line += f" | AI={ai_summary[:64]}"
+                planner_alloc = allocator_data.get("openai_capital_planner", {}) if isinstance(allocator_data.get("openai_capital_planner", {}), dict) else {}
+                planner_summary = str(planner_alloc.get("summary", "") or "").strip()
+                if planner_summary:
+                    state_line += f" | AIPlan={planner_summary[:64]}"
+                context_alloc = allocator_data.get("openai_market_context", {}) if isinstance(allocator_data.get("openai_market_context", {}), dict) else {}
+                context_summary = str(context_alloc.get("summary", "") or "").strip()
+                if context_summary:
+                    state_line += f" | Ctx={context_summary[:64]}"
+                matched_pos_action = ai_alloc.get("matched_position_action", {}) if isinstance(ai_alloc.get("matched_position_action", {}), dict) else {}
+                mp_action = str(matched_pos_action.get("action", "") or "").strip().lower()
+                mp_symbol = str(matched_pos_action.get("symbol", "") or "").strip().upper()
+                if mp_action and mp_symbol:
+                    state_line += f" | AIPos={mp_action.upper()} {mp_symbol}"
             try:
                 entry_size_scale = float(trader_data.get("entry_size_scale", 1.0) or 1.0)
                 if entry_size_scale < 0.999:
@@ -17424,9 +17483,9 @@ class PowerTraderHub(tk.Tk):
         self._log_panel_refresh_interval_s = float(log_refresh_s)
         self._maybe_apply_profile_autotune()
         watch_hints = self._consume_file_watch_hints()
-        runtime_dirty_hint = bool(watch_hints.get("runtime", True))
-        log_dirty_hint = bool(watch_hints.get("logs", True))
-        chart_dirty_hint = bool(watch_hints.get("charts", True))
+        runtime_dirty_hint = bool(watch_hints.get("runtime", False))
+        log_dirty_hint = bool(watch_hints.get("logs", False))
+        chart_dirty_hint = bool(watch_hints.get("charts", False))
         if not runner_live:
             try:
                 stocks_scan_s = max(5.0, float(self.settings.get("market_bg_stocks_interval_s", DEFAULT_SETTINGS.get("market_bg_stocks_interval_s", 15.0)) or 15.0))
@@ -18310,13 +18369,13 @@ class PowerTraderHub(tk.Tk):
                 rows = [dict(r) for r in raw_rows if isinstance(r, dict)]
             if not rows:
                 rows = [
-                    {"label": "Green candle", "meaning": "Price closed above open for that bar.", "color": DARK_ACCENT, "dash": (), "sample": "square"},
-                    {"label": "Red candle", "meaning": "Price closed below open for that bar.", "color": "#FF6B57", "dash": (), "sample": "square"},
-                    {"label": "Long neural level", "meaning": "Blue support/reference level from neural model.", "color": "blue", "dash": ()},
-                    {"label": "Short neural level", "meaning": "Orange resistance/reference level from neural model.", "color": "orange", "dash": ()},
-                    {"label": "Trail line (★)", "meaning": "Trailing sell threshold once armed.", "color": "green", "dash": ()},
-                    {"label": "Next DCA (◆)", "meaning": "Next averaging-buy trigger line.", "color": "red", "dash": ()},
-                    {"label": "Average cost (●)", "meaning": "Current blended entry price.", "color": "yellow", "dash": ()},
+                    {"label": "Green candle", "meaning": "Price closed above open for that bar.", "color": CHART_UP, "dash": (), "sample": "square"},
+                    {"label": "Red candle", "meaning": "Price closed below open for that bar.", "color": CHART_DOWN, "dash": (), "sample": "square"},
+                    {"label": "Long neural level", "meaning": "Blue support/reference level from neural model.", "color": CHART_LINE_MAIN, "dash": ()},
+                    {"label": "Short neural level", "meaning": "Orange resistance/reference level from neural model.", "color": CHART_EMA_SLOW, "dash": ()},
+                    {"label": "Trail line (★)", "meaning": "Trailing sell threshold once armed.", "color": CHART_UP, "dash": ()},
+                    {"label": "Next DCA (◆)", "meaning": "Next averaging-buy trigger line.", "color": CHART_DOWN, "dash": ()},
+                    {"label": "Average cost (●)", "meaning": "Current blended entry price.", "color": CHART_EMA_SLOW, "dash": ()},
                 ]
             note_txt = str(getattr(chart, "_legend_note", "") or "").strip()
             if not note_txt:
@@ -20929,6 +20988,7 @@ class PowerTraderHub(tk.Tk):
         setting_help: Dict[str, str] = {
             "Configuration mode:": "Preset Managed auto-fills and locks configurable fields. Self Managed lets you edit each setting manually.",
             "Preset profile:": "Safe prioritizes protection, Balanced is default, Aggressive increases opportunity capture, and Max Growth pushes highest legal automation intensity.",
+            "OpenAI API key:": "Global OpenAI key used for cross-market AI decisioning, nightly trade review, scheduled position review, capital planning, and root-cause diagnostics. Stored in keys/openai_api_key.txt.",
             "Main neural folder:": "Where per-coin model folders live. Example: moving this to a slow drive can slow training/startup.",
             "Coins (comma):": "Active crypto list. Example: BTC,ETH,SOL. Removing a coin stops active trading but keeps prior training files.",
             "Trade start level (1-7):": "Lower enters earlier with weaker confidence; higher waits for stronger confidence and trades less often.",
@@ -20949,7 +21009,7 @@ class PowerTraderHub(tk.Tk):
             "Alpaca secret key:": "Stocks secret credential. Never share this value.",
             "Alpaca base URL:": "Trading endpoint for live Alpaca orders.",
             "Alpaca data URL:": "Market data endpoint used by stock scanner.",
-            "Key rotation warn days:": "Warn when API credentials have aged past this many days so keys get rotated before expiry/incident.",
+            "Key rotation warn days:": "Optional local reminder only. Set 0 to disable local age-based rotation warnings and rely on endpoint/provider key lifecycle rules.",
             "KuCoin unsupported cooldown sec:": "Backoff after unsupported/blocked symbol responses. Higher values reduce repeated API lockouts.",
             "Crypto price error log cooldown sec:": "Log throttling for repeated crypto quote errors to keep logs readable.",
             "UI refresh seconds:": "Dashboard refresh cadence. Lower = fresher data but higher CPU usage.",
@@ -21328,7 +21388,7 @@ class PowerTraderHub(tk.Tk):
         market_fallback_snapshot_age_var = tk.StringVar(value=str(self.settings.get("market_fallback_snapshot_max_age_s", DEFAULT_SETTINGS.get("market_fallback_snapshot_max_age_s", 1800.0))))
         kucoin_unsupported_cooldown_var = tk.StringVar(value=str(self.settings.get("kucoin_unsupported_cooldown_s", DEFAULT_SETTINGS.get("kucoin_unsupported_cooldown_s", 21600.0))))
         crypto_price_error_log_cd_var = tk.StringVar(value=str(self.settings.get("crypto_price_error_log_cooldown_s", DEFAULT_SETTINGS.get("crypto_price_error_log_cooldown_s", 120.0))))
-        key_rotation_warn_days_var = tk.StringVar(value=str(self.settings.get("key_rotation_warn_days", DEFAULT_SETTINGS.get("key_rotation_warn_days", 90))))
+        key_rotation_warn_days_var = tk.StringVar(value=str(self.settings.get("key_rotation_warn_days", DEFAULT_SETTINGS.get("key_rotation_warn_days", 0))))
 
         hub_dir_var = tk.StringVar(value=self.settings.get("hub_data_dir", ""))
 
@@ -21374,6 +21434,7 @@ class PowerTraderHub(tk.Tk):
         settings_profile_var = tk.StringVar(value=_profile_to_label.get(_settings_profile_raw, "Balanced"))
         alpaca_status_var = tk.StringVar(value="")
         oanda_status_var = tk.StringVar(value="")
+        openai_status_var = tk.StringVar(value="")
         settings_mode_hint_var = tk.StringVar(value="")
 
         # Preset-managed mode locks these values to the selected profile.
@@ -21513,7 +21574,7 @@ class PowerTraderHub(tk.Tk):
                 "max_total_exposure_pct": 20.0,
                 "kucoin_unsupported_cooldown_s": 43200.0,
                 "crypto_price_error_log_cooldown_s": 240.0,
-                "key_rotation_warn_days": 60,
+                "key_rotation_warn_days": 0,
                 "ui_refresh_seconds": 1.2,
                 "chart_refresh_seconds": 12.0,
                 "candles_limit": 120,
@@ -21613,7 +21674,7 @@ class PowerTraderHub(tk.Tk):
                 "max_total_exposure_pct": 65.0,
                 "kucoin_unsupported_cooldown_s": 14400.0,
                 "crypto_price_error_log_cooldown_s": 60.0,
-                "key_rotation_warn_days": 45,
+                "key_rotation_warn_days": 0,
                 "ui_refresh_seconds": 0.8,
                 "chart_refresh_seconds": 6.0,
                 "candles_limit": 180,
@@ -21725,6 +21786,17 @@ class PowerTraderHub(tk.Tk):
                 return
             var.set(str(value))
 
+        def _apply_manual_override_pins(values: Dict[str, Any]) -> Dict[str, Any]:
+            out = dict(values or {})
+            manual_keys = self._profile_manual_override_keys()
+            for key in manual_keys:
+                if key not in out:
+                    continue
+                if key not in self.settings:
+                    continue
+                out[key] = self.settings.get(key)
+            return out
+
         def _apply_profile_to_form(profile_key: str) -> None:
             pkey = normalize_settings_profile(profile_key, default="balanced")
             base: Dict[str, Any] = {}
@@ -21737,6 +21809,7 @@ class PowerTraderHub(tk.Tk):
                     settings_source=self.settings,
                 )
             )
+            base = _apply_manual_override_pins(base)
             for key, value in base.items():
                 _set_var_from_profile(key, value)
 
@@ -21773,6 +21846,7 @@ class PowerTraderHub(tk.Tk):
                 profile_overrides.get(pkey, {}),
                 settings_source=self.settings,
             )
+            tuned = _apply_manual_override_pins(tuned if isinstance(tuned, dict) else {})
             if not isinstance(tuned, dict) or not tuned:
                 return ""
             try:
@@ -21807,6 +21881,12 @@ class PowerTraderHub(tk.Tk):
                 market_cap = float(tuned.get("market_max_total_exposure_pct", self.settings.get("market_max_total_exposure_pct", 0.0)) or 0.0)
             except Exception:
                 market_cap = 0.0
+            independent_market_mode = bool(
+                tuned.get(
+                    "market_independent_execution_enabled",
+                    self.settings.get("market_independent_execution_enabled", False),
+                )
+            )
             try:
                 stock_daily_loss_pct = float(tuned.get("stock_max_daily_loss_pct", self.settings.get("stock_max_daily_loss_pct", 0.0)) or 0.0)
             except Exception:
@@ -21817,7 +21897,7 @@ class PowerTraderHub(tk.Tk):
                 forex_daily_loss_pct = 0.0
             stock_daily_txt = f"{stock_daily_loss_pct:.1f}% daily loss guard" if stock_daily_loss_pct > 0.0 else "daily loss guard off"
             forex_daily_txt = f"{forex_daily_loss_pct:.1f}% daily loss guard" if forex_daily_loss_pct > 0.0 else "daily loss guard off"
-            global_cap_txt = f"{market_cap:.0f}%" if market_cap > 0.0 else "off"
+            global_cap_txt = "independent" if independent_market_mode else (f"{market_cap:.0f}%" if market_cap > 0.0 else "off")
             return (
                 f"Effective policy now: Stocks ${stock_notional:.0f}/trade, max {stock_open} open, max {stock_day} day-trades, "
                 f"cap {stock_cap:.0f}% ({stock_daily_txt}); "
@@ -21832,6 +21912,16 @@ class PowerTraderHub(tk.Tk):
             if role_key not in {"basic", "advanced", "admin"}:
                 role_key = "basic"
             effective_summary = _profile_effective_summary_text(profile_key)
+            manual_override_keys = [k for k in sorted(self._profile_manual_override_keys()) if k in profile_var_map]
+            manual_override_note = ""
+            if manual_override_keys:
+                preview = ", ".join(str(k) for k in manual_override_keys[:3])
+                if len(manual_override_keys) > 3:
+                    preview = f"{preview}, +{len(manual_override_keys) - 3} more"
+                manual_override_note = (
+                    f" Manual overrides pinned: {preview}."
+                    " Effective values shown below already include these pins."
+                )
             is_preset = bool(mode_key == "preset_managed")
             effective_locked = bool(is_preset)
             if is_preset:
@@ -21840,6 +21930,7 @@ class PowerTraderHub(tk.Tk):
                     (
                         f"Preset Managed is active: {str(settings_profile_var.get() or '').strip()} profile values are account-sized and locked."
                         + (f" {effective_summary}" if effective_summary else "")
+                        + manual_override_note
                     )
                 )
             else:
@@ -21848,11 +21939,13 @@ class PowerTraderHub(tk.Tk):
                     settings_mode_hint_var.set(
                         "Self Managed is active: fields are editable. Role mode is Basic; switch to Advanced/Admin if you need extra controls."
                         + (f" {effective_summary}" if effective_summary else "")
+                        + manual_override_note
                     )
                 else:
                     settings_mode_hint_var.set(
                         "Self Managed is active: you can edit all configurable fields manually."
                         + (f" {effective_summary}" if effective_summary else "")
+                        + manual_override_note
                     )
             for widget, restore_state in list(managed_controls):
                 try:
@@ -21914,6 +22007,52 @@ class PowerTraderHub(tk.Tk):
                 oanda_status_var.set("Incomplete ❌  |  Account ID missing")
             else:
                 oanda_status_var.set("Missing/invalid ❌  |  Add account ID + token")
+
+        def _refresh_openai_status() -> None:
+            env_openai = str(os.environ.get("OPENAI_API_KEY") or "").strip()
+            env_powertrader = str(os.environ.get("POWERTRADER_OPENAI_API_KEY") or "").strip()
+            file_key = ""
+            try:
+                with open(openai_credential_path(self.project_dir), "r", encoding="utf-8") as f:
+                    file_key = str(f.read() or "").strip()
+            except Exception:
+                file_key = ""
+            key_txt = str(get_openai_api_key(self.settings, base_dir=self.project_dir) or "").strip()
+            ai_enabled = bool(self.settings.get("openai_decision_enabled", False))
+            nightly_enabled = bool(self.settings.get("openai_nightly_review_enabled", False))
+            position_review_enabled = bool(self.settings.get("openai_position_review_enabled", False))
+            capital_planner_enabled = bool(self.settings.get("openai_capital_planner_enabled", False))
+            root_cause_enabled = bool(self.settings.get("openai_root_cause_enabled", False))
+            explanations_enabled = bool(self.settings.get("openai_explanations_enabled", False))
+            strategy_optimizer_enabled = bool(self.settings.get("openai_strategy_optimizer_enabled", False))
+            market_context_enabled = bool(self.settings.get("openai_market_context_enabled", False))
+            postmortem_enabled = bool(self.settings.get("openai_postmortem_enabled", False))
+            managed_auto_tuning_enabled = bool(self.settings.get("openai_managed_auto_tuning_enabled", DEFAULT_SETTINGS.get("openai_managed_auto_tuning_enabled", False)))
+            ai_mode_txt = (
+                f"AI {'ON' if ai_enabled else 'OFF'} | "
+                f"Nightly {'ON' if nightly_enabled else 'OFF'} | "
+                f"PosReview {'ON' if position_review_enabled else 'OFF'} | "
+                f"Planner {'ON' if capital_planner_enabled else 'OFF'} | "
+                f"RootCause {'ON' if root_cause_enabled else 'OFF'} | "
+                f"Explain {'ON' if explanations_enabled else 'OFF'} | "
+                f"Optimizer {'ON' if strategy_optimizer_enabled else 'OFF'} | "
+                f"Context {'ON' if market_context_enabled else 'OFF'} | "
+                f"Postmortem {'ON' if postmortem_enabled else 'OFF'} | "
+                f"AutoTune {'ON' if managed_auto_tuning_enabled else 'OFF'}"
+            )
+            if key_txt:
+                source = "file"
+                if env_openai:
+                    source = "env OPENAI_API_KEY"
+                elif env_powertrader:
+                    source = "env POWERTRADER_OPENAI_API_KEY"
+                elif file_key:
+                    source = "keys/openai_api_key.txt"
+                else:
+                    source = "legacy settings/env"
+                openai_status_var.set(f"{ai_mode_txt}  |  Configured ✅  |  Source {source} | Key {self._mask_secret(key_txt)}")
+            else:
+                openai_status_var.set(f"{ai_mode_txt}  |  Missing ❌  |  Add OpenAI API key for AI decision/review/planner/root-cause/explanations/optimizer/context/postmortem")
 
         def _open_alpaca_key_editor() -> None:
             dlg = tk.Toplevel(win)
@@ -22075,8 +22214,857 @@ class PowerTraderHub(tk.Tk):
             ttk.Button(btns, text="Save", command=_save_oanda).pack(side="left")
             ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="left", padx=(8, 0))
 
+        def _open_openai_key_editor() -> None:
+            dlg = tk.Toplevel(win)
+            dlg.title("OpenAI Decision Settings")
+            dlg.geometry("860x720")
+            dlg.minsize(760, 520)
+            dlg.transient(win)
+            try:
+                dlg.grab_set()
+            except Exception:
+                pass
+
+            viewport = ttk.Frame(dlg)
+            viewport.pack(fill="both", expand=True, padx=12, pady=12)
+            viewport.grid_rowconfigure(0, weight=1)
+            viewport.grid_columnconfigure(0, weight=1)
+
+            openai_canvas = tk.Canvas(
+                viewport,
+                bg=DARK_BG,
+                highlightthickness=1,
+                highlightbackground=DARK_BORDER,
+                bd=0,
+            )
+            openai_canvas.grid(row=0, column=0, sticky="nsew")
+
+            openai_scroll = ttk.Scrollbar(
+                viewport,
+                orient="vertical",
+                command=openai_canvas.yview,
+            )
+            openai_scroll.grid(row=0, column=1, sticky="ns")
+            openai_canvas.configure(yscrollcommand=openai_scroll.set)
+
+            body = ttk.Frame(openai_canvas)
+            openai_window = openai_canvas.create_window((0, 0), window=body, anchor="nw")
+            body.columnconfigure(1, weight=1)
+
+            def _update_openai_scrollbars(event=None) -> None:
+                try:
+                    c = openai_canvas
+                    win_id = openai_window
+                    c.update_idletasks()
+                    bbox = c.bbox(win_id)
+                    if not bbox:
+                        openai_scroll.grid_remove()
+                        return
+                    c.configure(scrollregion=bbox)
+                    content_h = int(bbox[3] - bbox[1])
+                    view_h = int(c.winfo_height())
+                    if content_h > (view_h + 1):
+                        openai_scroll.grid()
+                    else:
+                        openai_scroll.grid_remove()
+                        try:
+                            c.yview_moveto(0)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            def _on_openai_canvas_configure(e) -> None:
+                try:
+                    openai_canvas.itemconfigure(openai_window, width=int(e.width))
+                except Exception:
+                    pass
+                _update_openai_scrollbars()
+
+            def _scroll_openai_units(units: int) -> None:
+                try:
+                    if openai_scroll.winfo_ismapped():
+                        openai_canvas.yview_scroll(int(units), "units")
+                except Exception:
+                    pass
+
+            def _openai_wheel(e) -> None:
+                try:
+                    delta = int(getattr(e, "delta", 0) or 0)
+                    if delta == 0:
+                        return
+                    units = int(-delta / 120)
+                    if units == 0:
+                        units = -1 if delta > 0 else 1
+                    _scroll_openai_units(units)
+                except Exception:
+                    pass
+
+            openai_canvas.bind("<Configure>", _on_openai_canvas_configure, add="+")
+            body.bind("<Configure>", _update_openai_scrollbars, add="+")
+            openai_canvas.bind("<Enter>", lambda _e: openai_canvas.focus_set(), add="+")
+            openai_canvas.bind("<MouseWheel>", _openai_wheel, add="+")
+            openai_canvas.bind("<Button-4>", lambda _e: _scroll_openai_units(-3), add="+")
+            openai_canvas.bind("<Button-5>", lambda _e: _scroll_openai_units(3), add="+")
+            dlg.bind("<MouseWheel>", _openai_wheel, add="+")
+            dlg.bind("<Button-4>", lambda _e: _scroll_openai_units(-3), add="+")
+            dlg.bind("<Button-5>", lambda _e: _scroll_openai_units(3), add="+")
+            ttk.Label(
+                body,
+                text=(
+                    "This key and policy are global and apply to crypto, stocks, and forex.\n"
+                    "The model never places trades directly; hard local guards still decide execution."
+                ),
+                foreground=DARK_MUTED,
+                justify="left",
+                wraplength=700,
+            ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+
+            key_var = tk.StringVar(value=str(get_openai_api_key(self.settings, base_dir=self.project_dir) or ""))
+            ai_enabled_var = tk.BooleanVar(value=bool(self.settings.get("openai_decision_enabled", False)))
+            ai_live_enabled_var = tk.BooleanVar(value=bool(self.settings.get("openai_decision_live_enabled", True)))
+            ai_paper_enabled_var = tk.BooleanVar(value=bool(self.settings.get("openai_decision_paper_enabled", True)))
+            ai_require_local_var = tk.BooleanVar(value=bool(self.settings.get("openai_decision_require_local_pass_first", True)))
+            model_var = tk.StringVar(value=str(self.settings.get("openai_model", DEFAULT_SETTINGS.get("openai_model", "gpt-5.4-mini")) or "gpt-5.4-mini"))
+            timeout_var = tk.StringVar(value=str(self.settings.get("openai_timeout_s", DEFAULT_SETTINGS.get("openai_timeout_s", 6.0))))
+            max_candidates_var = tk.StringVar(value=str(self.settings.get("openai_decision_max_candidates_per_market", DEFAULT_SETTINGS.get("openai_decision_max_candidates_per_market", 3))))
+            decision_min_interval_var = tk.StringVar(value=str(self.settings.get("openai_decision_min_interval_s", DEFAULT_SETTINGS.get("openai_decision_min_interval_s", 0.0))))
+            decision_max_calls_day_var = tk.StringVar(value=str(self.settings.get("openai_decision_max_calls_per_day", DEFAULT_SETTINGS.get("openai_decision_max_calls_per_day", 24))))
+            decision_max_calls_week_var = tk.StringVar(value=str(self.settings.get("openai_decision_max_calls_per_week", DEFAULT_SETTINGS.get("openai_decision_max_calls_per_week", 120))))
+            endpoint_var = tk.StringVar(value=str(self.settings.get("openai_responses_endpoint", "") or ""))
+            nightly_enabled_var = tk.BooleanVar(value=bool(self.settings.get("openai_nightly_review_enabled", False)))
+            nightly_hour_var = tk.StringVar(value=str(self.settings.get("openai_nightly_review_hour_local", DEFAULT_SETTINGS.get("openai_nightly_review_hour_local", 2))))
+            nightly_lookback_var = tk.StringVar(value=str(self.settings.get("openai_nightly_review_lookback_days", DEFAULT_SETTINGS.get("openai_nightly_review_lookback_days", 7))))
+            nightly_model_var = tk.StringVar(value=str(self.settings.get("openai_nightly_review_model", self.settings.get("openai_model", DEFAULT_SETTINGS.get("openai_nightly_review_model", "gpt-5.4-mini"))) or "gpt-5.4-mini"))
+            nightly_timeout_var = tk.StringVar(value=str(self.settings.get("openai_nightly_review_timeout_s", DEFAULT_SETTINGS.get("openai_nightly_review_timeout_s", 12.0))))
+            nightly_max_events_var = tk.StringVar(value=str(self.settings.get("openai_nightly_review_max_events", DEFAULT_SETTINGS.get("openai_nightly_review_max_events", 5000))))
+            nightly_max_suggestions_var = tk.StringVar(value=str(self.settings.get("openai_nightly_review_max_suggestions", DEFAULT_SETTINGS.get("openai_nightly_review_max_suggestions", 12))))
+            nightly_write_report_var = tk.BooleanVar(value=bool(self.settings.get("openai_nightly_review_write_report_enabled", True)))
+            nightly_apply_tuning_var = tk.BooleanVar(value=bool(self.settings.get("openai_nightly_review_apply_tuning_enabled", False)))
+            position_review_enabled_var = tk.BooleanVar(value=bool(self.settings.get("openai_position_review_enabled", False)))
+            position_review_live_var = tk.BooleanVar(value=bool(self.settings.get("openai_position_review_live_enabled", True)))
+            position_review_paper_var = tk.BooleanVar(value=bool(self.settings.get("openai_position_review_paper_enabled", True)))
+            position_review_auto_act_var = tk.BooleanVar(value=bool(self.settings.get("openai_position_review_auto_act_enabled", False)))
+            position_review_interval_var = tk.StringVar(value=str(self.settings.get("openai_position_review_interval_s", DEFAULT_SETTINGS.get("openai_position_review_interval_s", 300.0))))
+            position_review_model_var = tk.StringVar(value=str(self.settings.get("openai_position_review_model", self.settings.get("openai_model", DEFAULT_SETTINGS.get("openai_position_review_model", "gpt-5.4-mini"))) or "gpt-5.4-mini"))
+            position_review_timeout_var = tk.StringVar(value=str(self.settings.get("openai_position_review_timeout_s", DEFAULT_SETTINGS.get("openai_position_review_timeout_s", 8.0))))
+            position_review_max_positions_var = tk.StringVar(value=str(self.settings.get("openai_position_review_max_positions", DEFAULT_SETTINGS.get("openai_position_review_max_positions", 48))))
+            capital_planner_enabled_var = tk.BooleanVar(value=bool(self.settings.get("openai_capital_planner_enabled", False)))
+            capital_planner_live_var = tk.BooleanVar(value=bool(self.settings.get("openai_capital_planner_live_enabled", True)))
+            capital_planner_paper_var = tk.BooleanVar(value=bool(self.settings.get("openai_capital_planner_paper_enabled", True)))
+            capital_planner_interval_var = tk.StringVar(value=str(self.settings.get("openai_capital_planner_interval_s", DEFAULT_SETTINGS.get("openai_capital_planner_interval_s", 180.0))))
+            capital_planner_model_var = tk.StringVar(value=str(self.settings.get("openai_capital_planner_model", self.settings.get("openai_model", DEFAULT_SETTINGS.get("openai_capital_planner_model", "gpt-5.4-mini"))) or "gpt-5.4-mini"))
+            capital_planner_timeout_var = tk.StringVar(value=str(self.settings.get("openai_capital_planner_timeout_s", DEFAULT_SETTINGS.get("openai_capital_planner_timeout_s", 6.0))))
+            capital_planner_max_candidates_var = tk.StringVar(value=str(self.settings.get("openai_capital_planner_max_candidates_per_market", DEFAULT_SETTINGS.get("openai_capital_planner_max_candidates_per_market", 3))))
+            root_cause_enabled_var = tk.BooleanVar(value=bool(self.settings.get("openai_root_cause_enabled", False)))
+            root_cause_live_var = tk.BooleanVar(value=bool(self.settings.get("openai_root_cause_live_enabled", True)))
+            root_cause_interval_var = tk.StringVar(value=str(self.settings.get("openai_root_cause_interval_s", DEFAULT_SETTINGS.get("openai_root_cause_interval_s", 240.0))))
+            root_cause_model_var = tk.StringVar(value=str(self.settings.get("openai_root_cause_model", self.settings.get("openai_model", DEFAULT_SETTINGS.get("openai_root_cause_model", "gpt-5.4-mini"))) or "gpt-5.4-mini"))
+            root_cause_timeout_var = tk.StringVar(value=str(self.settings.get("openai_root_cause_timeout_s", DEFAULT_SETTINGS.get("openai_root_cause_timeout_s", 8.0))))
+            root_cause_max_incidents_var = tk.StringVar(value=str(self.settings.get("openai_root_cause_max_incidents", DEFAULT_SETTINGS.get("openai_root_cause_max_incidents", 300))))
+            explanations_enabled_var = tk.BooleanVar(value=bool(self.settings.get("openai_explanations_enabled", False)))
+            explanations_live_var = tk.BooleanVar(value=bool(self.settings.get("openai_explanations_live_enabled", True)))
+            explanations_interval_var = tk.StringVar(value=str(self.settings.get("openai_explanations_interval_s", DEFAULT_SETTINGS.get("openai_explanations_interval_s", 3600.0))))
+            explanations_model_var = tk.StringVar(value=str(self.settings.get("openai_explanations_model", self.settings.get("openai_model", DEFAULT_SETTINGS.get("openai_explanations_model", "gpt-5.4-mini"))) or "gpt-5.4-mini"))
+            explanations_timeout_var = tk.StringVar(value=str(self.settings.get("openai_explanations_timeout_s", DEFAULT_SETTINGS.get("openai_explanations_timeout_s", 6.0))))
+            explanations_max_items_var = tk.StringVar(value=str(self.settings.get("openai_explanations_max_items", DEFAULT_SETTINGS.get("openai_explanations_max_items", 18))))
+            strategy_optimizer_enabled_var = tk.BooleanVar(value=bool(self.settings.get("openai_strategy_optimizer_enabled", False)))
+            strategy_optimizer_live_var = tk.BooleanVar(value=bool(self.settings.get("openai_strategy_optimizer_live_enabled", True)))
+            strategy_optimizer_auto_apply_var = tk.BooleanVar(value=bool(self.settings.get("openai_strategy_optimizer_auto_apply_enabled", False)))
+            strategy_optimizer_interval_var = tk.StringVar(value=str(self.settings.get("openai_strategy_optimizer_interval_s", DEFAULT_SETTINGS.get("openai_strategy_optimizer_interval_s", 3600.0))))
+            strategy_optimizer_model_var = tk.StringVar(value=str(self.settings.get("openai_strategy_optimizer_model", self.settings.get("openai_model", DEFAULT_SETTINGS.get("openai_strategy_optimizer_model", "gpt-5.4-mini"))) or "gpt-5.4-mini"))
+            strategy_optimizer_timeout_var = tk.StringVar(value=str(self.settings.get("openai_strategy_optimizer_timeout_s", DEFAULT_SETTINGS.get("openai_strategy_optimizer_timeout_s", 8.0))))
+            market_context_enabled_var = tk.BooleanVar(value=bool(self.settings.get("openai_market_context_enabled", False)))
+            market_context_live_var = tk.BooleanVar(value=bool(self.settings.get("openai_market_context_live_enabled", True)))
+            market_context_interval_var = tk.StringVar(value=str(self.settings.get("openai_market_context_interval_s", DEFAULT_SETTINGS.get("openai_market_context_interval_s", 300.0))))
+            market_context_model_var = tk.StringVar(value=str(self.settings.get("openai_market_context_model", self.settings.get("openai_model", DEFAULT_SETTINGS.get("openai_market_context_model", "gpt-5.4-mini"))) or "gpt-5.4-mini"))
+            market_context_timeout_var = tk.StringVar(value=str(self.settings.get("openai_market_context_timeout_s", DEFAULT_SETTINGS.get("openai_market_context_timeout_s", 6.0))))
+            market_context_max_items_var = tk.StringVar(value=str(self.settings.get("openai_market_context_max_items", DEFAULT_SETTINGS.get("openai_market_context_max_items", 24))))
+            postmortem_enabled_var = tk.BooleanVar(value=bool(self.settings.get("openai_postmortem_enabled", False)))
+            postmortem_interval_var = tk.StringVar(value=str(self.settings.get("openai_postmortem_interval_s", DEFAULT_SETTINGS.get("openai_postmortem_interval_s", 86400.0))))
+            postmortem_model_var = tk.StringVar(value=str(self.settings.get("openai_postmortem_model", self.settings.get("openai_model", DEFAULT_SETTINGS.get("openai_postmortem_model", "gpt-5.4-mini"))) or "gpt-5.4-mini"))
+            postmortem_timeout_var = tk.StringVar(value=str(self.settings.get("openai_postmortem_timeout_s", DEFAULT_SETTINGS.get("openai_postmortem_timeout_s", 12.0))))
+            postmortem_max_events_var = tk.StringVar(value=str(self.settings.get("openai_postmortem_max_events", DEFAULT_SETTINGS.get("openai_postmortem_max_events", 5000))))
+            postmortem_write_report_var = tk.BooleanVar(value=bool(self.settings.get("openai_postmortem_write_report_enabled", True)))
+            postmortem_auto_apply_var = tk.BooleanVar(value=bool(self.settings.get("openai_postmortem_auto_apply_tuning_enabled", False)))
+            managed_auto_tuning_var = tk.BooleanVar(value=bool(self.settings.get("openai_managed_auto_tuning_enabled", DEFAULT_SETTINGS.get("openai_managed_auto_tuning_enabled", False))))
+
+            ttk.Label(body, text="OpenAI API key:").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=key_var, show="*").grid(row=1, column=1, sticky="ew", pady=6)
+
+            ttk.Separator(body, orient="horizontal").grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10, 8))
+            ttk.Checkbutton(
+                body,
+                text="Enable OpenAI portfolio decision layer",
+                variable=ai_enabled_var,
+            ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(2, 4))
+            ttk.Checkbutton(
+                body,
+                text="Enable in live mode",
+                variable=ai_live_enabled_var,
+            ).grid(row=4, column=0, columnspan=3, sticky="w", pady=2)
+            ttk.Checkbutton(
+                body,
+                text="Enable in paper mode",
+                variable=ai_paper_enabled_var,
+            ).grid(row=5, column=0, columnspan=3, sticky="w", pady=2)
+            ttk.Checkbutton(
+                body,
+                text="Require local pass first (recommended)",
+                variable=ai_require_local_var,
+            ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(2, 6))
+
+            ttk.Label(body, text="Model:").grid(row=7, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=model_var).grid(row=7, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Timeout seconds (1-30):").grid(row=8, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=timeout_var).grid(row=8, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Max candidates/market (1-8):").grid(row=9, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=max_candidates_var).grid(row=9, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Decision min interval sec (0-604800):").grid(row=10, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=decision_min_interval_var).grid(row=10, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Decision max calls/day (1-5000):").grid(row=11, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=decision_max_calls_day_var).grid(row=11, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Decision max calls/week (1-50000):").grid(row=12, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=decision_max_calls_week_var).grid(row=12, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Responses endpoint (optional):").grid(row=13, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=endpoint_var).grid(row=13, column=1, sticky="ew", pady=6)
+
+            ttk.Label(
+                body,
+                text="Leave endpoint blank for default OpenAI endpoint.",
+                foreground=DARK_MUTED,
+                justify="left",
+                wraplength=700,
+            ).grid(row=14, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+            ttk.Separator(body, orient="horizontal").grid(row=15, column=0, columnspan=3, sticky="ew", pady=(6, 8))
+            ttk.Label(
+                body,
+                text="Nightly Trade Review (advisory by default)",
+                foreground=CYAN,
+                justify="left",
+            ).grid(row=16, column=0, columnspan=3, sticky="w", pady=(0, 4))
+            ttk.Checkbutton(
+                body,
+                text="Enable nightly OpenAI trade review",
+                variable=nightly_enabled_var,
+            ).grid(row=17, column=0, columnspan=3, sticky="w", pady=(2, 4))
+            ttk.Label(body, text="Nightly run hour (local 0-23):").grid(row=18, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=nightly_hour_var).grid(row=18, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Lookback days (1-30):").grid(row=19, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=nightly_lookback_var).grid(row=19, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Nightly model:").grid(row=20, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=nightly_model_var).grid(row=20, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Nightly timeout seconds (1-60):").grid(row=21, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=nightly_timeout_var).grid(row=21, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Nightly max events (200-50000):").grid(row=22, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=nightly_max_events_var).grid(row=22, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Nightly max suggestions (3-20):").grid(row=23, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=nightly_max_suggestions_var).grid(row=23, column=1, sticky="ew", pady=6)
+            ttk.Checkbutton(
+                body,
+                text="Write nightly report file",
+                variable=nightly_write_report_var,
+            ).grid(row=24, column=0, columnspan=3, sticky="w", pady=(2, 2))
+            ttk.Checkbutton(
+                body,
+                text="Allow low-risk auto-apply tuning (advanced)",
+                variable=nightly_apply_tuning_var,
+            ).grid(row=25, column=0, columnspan=3, sticky="w", pady=(2, 4))
+            ttk.Label(
+                body,
+                text="Auto-apply remains bounded to low-risk allowlisted settings and confidence thresholds.",
+                foreground=DARK_MUTED,
+                justify="left",
+                wraplength=700,
+            ).grid(row=26, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+            ttk.Separator(body, orient="horizontal").grid(row=27, column=0, columnspan=3, sticky="ew", pady=(6, 8))
+            ttk.Label(
+                body,
+                text="Scheduled Open-Position Review (advisory-first)",
+                foreground=CYAN,
+                justify="left",
+            ).grid(row=28, column=0, columnspan=3, sticky="w", pady=(0, 4))
+            ttk.Checkbutton(
+                body,
+                text="Enable scheduled OpenAI open-position review",
+                variable=position_review_enabled_var,
+            ).grid(row=29, column=0, columnspan=3, sticky="w", pady=(2, 4))
+            ttk.Checkbutton(
+                body,
+                text="Enable position review in live mode",
+                variable=position_review_live_var,
+            ).grid(row=30, column=0, columnspan=3, sticky="w", pady=2)
+            ttk.Checkbutton(
+                body,
+                text="Enable position review in paper mode",
+                variable=position_review_paper_var,
+            ).grid(row=31, column=0, columnspan=3, sticky="w", pady=2)
+            ttk.Label(body, text="Review interval seconds (30-604800):").grid(row=32, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=position_review_interval_var).grid(row=32, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Position review model:").grid(row=33, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=position_review_model_var).grid(row=33, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Position review timeout seconds (1-30):").grid(row=34, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=position_review_timeout_var).grid(row=34, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Max reviewed open positions (8-200):").grid(row=35, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=position_review_max_positions_var).grid(row=35, column=1, sticky="ew", pady=6)
+            ttk.Checkbutton(
+                body,
+                text="Allow advisory auto-action eligibility tagging (no direct trade placement)",
+                variable=position_review_auto_act_var,
+            ).grid(row=36, column=0, columnspan=3, sticky="w", pady=(2, 4))
+            ttk.Label(
+                body,
+                text="Local hard guards still remain authoritative for all add/reduce/exit permissions.",
+                foreground=DARK_MUTED,
+                justify="left",
+                wraplength=700,
+            ).grid(row=37, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+            ttk.Separator(body, orient="horizontal").grid(row=38, column=0, columnspan=3, sticky="ew", pady=(6, 8))
+            ttk.Label(
+                body,
+                text="Cross-Market Capital Planner (advisory-first)",
+                foreground=CYAN,
+                justify="left",
+            ).grid(row=39, column=0, columnspan=3, sticky="w", pady=(0, 4))
+            ttk.Checkbutton(
+                body,
+                text="Enable scheduled OpenAI capital planner",
+                variable=capital_planner_enabled_var,
+            ).grid(row=40, column=0, columnspan=3, sticky="w", pady=(2, 4))
+            ttk.Checkbutton(
+                body,
+                text="Enable capital planner in live mode",
+                variable=capital_planner_live_var,
+            ).grid(row=41, column=0, columnspan=3, sticky="w", pady=2)
+            ttk.Checkbutton(
+                body,
+                text="Enable capital planner in paper mode",
+                variable=capital_planner_paper_var,
+            ).grid(row=42, column=0, columnspan=3, sticky="w", pady=2)
+            ttk.Label(body, text="Planner interval seconds (30-604800):").grid(row=43, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=capital_planner_interval_var).grid(row=43, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Capital planner model:").grid(row=44, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=capital_planner_model_var).grid(row=44, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Planner timeout seconds (1-30):").grid(row=45, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=capital_planner_timeout_var).grid(row=45, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Planner max candidates/market (1-8):").grid(row=46, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=capital_planner_max_candidates_var).grid(row=46, column=1, sticky="ew", pady=6)
+            ttk.Label(
+                body,
+                text="Planner can prefer/deprioritize markets, but local hard safety/compliance gates still decide execution.",
+                foreground=DARK_MUTED,
+                justify="left",
+                wraplength=700,
+            ).grid(row=47, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+            ttk.Separator(body, orient="horizontal").grid(row=48, column=0, columnspan=3, sticky="ew", pady=(6, 8))
+            ttk.Label(
+                body,
+                text="Anomaly + Root-Cause Analysis (advisory-first)",
+                foreground=CYAN,
+                justify="left",
+            ).grid(row=49, column=0, columnspan=3, sticky="w", pady=(0, 4))
+            ttk.Checkbutton(
+                body,
+                text="Enable scheduled OpenAI anomaly and root-cause analysis",
+                variable=root_cause_enabled_var,
+            ).grid(row=50, column=0, columnspan=3, sticky="w", pady=(2, 4))
+            ttk.Checkbutton(
+                body,
+                text="Enable root-cause analysis in live mode",
+                variable=root_cause_live_var,
+            ).grid(row=51, column=0, columnspan=3, sticky="w", pady=2)
+            ttk.Label(body, text="Root-cause interval seconds (30-604800):").grid(row=52, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=root_cause_interval_var).grid(row=52, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Root-cause model:").grid(row=53, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=root_cause_model_var).grid(row=53, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Root-cause timeout seconds (1-30):").grid(row=54, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=root_cause_timeout_var).grid(row=54, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Root-cause max incidents (50-2000):").grid(row=55, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=root_cause_max_incidents_var).grid(row=55, column=1, sticky="ew", pady=6)
+            ttk.Label(
+                body,
+                text="AI may recommend monitor/throttle/pause, but local app rules remain authoritative and do not auto-disable trading.",
+                foreground=DARK_MUTED,
+                justify="left",
+                wraplength=700,
+            ).grid(row=56, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+            ttk.Separator(body, orient="horizontal").grid(row=57, column=0, columnspan=3, sticky="ew", pady=(6, 8))
+            ttk.Label(
+                body,
+                text="Journaling + Explanations (advisory text-only)",
+                foreground=CYAN,
+                justify="left",
+            ).grid(row=58, column=0, columnspan=3, sticky="w", pady=(0, 4))
+            ttk.Checkbutton(
+                body,
+                text="Enable OpenAI explanation generation",
+                variable=explanations_enabled_var,
+            ).grid(row=59, column=0, columnspan=3, sticky="w", pady=(2, 4))
+            ttk.Checkbutton(
+                body,
+                text="Enable explanations in live mode",
+                variable=explanations_live_var,
+            ).grid(row=60, column=0, columnspan=3, sticky="w", pady=2)
+            ttk.Label(body, text="Explanations interval seconds (120-604800):").grid(row=61, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=explanations_interval_var).grid(row=61, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Explanations model:").grid(row=62, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=explanations_model_var).grid(row=62, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Explanations timeout seconds (1-30):").grid(row=63, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=explanations_timeout_var).grid(row=63, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Explanations max items (4-64):").grid(row=64, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=explanations_max_items_var).grid(row=64, column=1, sticky="ew", pady=6)
+            ttk.Label(
+                body,
+                text="This only generates clearer explanations; it never changes execution permissions.",
+                foreground=DARK_MUTED,
+                justify="left",
+                wraplength=700,
+            ).grid(row=65, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+            ttk.Separator(body, orient="horizontal").grid(row=66, column=0, columnspan=3, sticky="ew", pady=(6, 8))
+            ttk.Label(
+                body,
+                text="Preset / Strategy Optimizer (advisory-first)",
+                foreground=CYAN,
+                justify="left",
+            ).grid(row=67, column=0, columnspan=3, sticky="w", pady=(0, 4))
+            ttk.Checkbutton(
+                body,
+                text="Enable OpenAI strategy optimizer",
+                variable=strategy_optimizer_enabled_var,
+            ).grid(row=68, column=0, columnspan=3, sticky="w", pady=(2, 4))
+            ttk.Checkbutton(
+                body,
+                text="Enable optimizer in live mode",
+                variable=strategy_optimizer_live_var,
+            ).grid(row=69, column=0, columnspan=3, sticky="w", pady=2)
+            ttk.Checkbutton(
+                body,
+                text="Allow low-risk auto-apply (clamped and validated)",
+                variable=strategy_optimizer_auto_apply_var,
+            ).grid(row=70, column=0, columnspan=3, sticky="w", pady=2)
+            ttk.Label(body, text="Optimizer interval seconds (30-604800):").grid(row=71, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=strategy_optimizer_interval_var).grid(row=71, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Optimizer model:").grid(row=72, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=strategy_optimizer_model_var).grid(row=72, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Optimizer timeout seconds (1-30):").grid(row=73, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=strategy_optimizer_timeout_var).grid(row=73, column=1, sticky="ew", pady=6)
+            ttk.Label(
+                body,
+                text="Optimizer recommendations are advisory by default and never bypass local execution/compliance guards.",
+                foreground=DARK_MUTED,
+                justify="left",
+                wraplength=700,
+            ).grid(row=74, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+            ttk.Separator(body, orient="horizontal").grid(row=75, column=0, columnspan=3, sticky="ew", pady=(6, 8))
+            ttk.Label(
+                body,
+                text="News / Event Context Scoring (advisory-first)",
+                foreground=CYAN,
+                justify="left",
+            ).grid(row=76, column=0, columnspan=3, sticky="w", pady=(0, 4))
+            ttk.Checkbutton(
+                body,
+                text="Enable OpenAI market context scoring",
+                variable=market_context_enabled_var,
+            ).grid(row=77, column=0, columnspan=3, sticky="w", pady=(2, 4))
+            ttk.Checkbutton(
+                body,
+                text="Enable market context scoring in live mode",
+                variable=market_context_live_var,
+            ).grid(row=78, column=0, columnspan=3, sticky="w", pady=2)
+            ttk.Label(body, text="Context interval seconds (30-604800):").grid(row=79, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=market_context_interval_var).grid(row=79, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Context model:").grid(row=80, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=market_context_model_var).grid(row=80, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Context timeout seconds (1-30):").grid(row=81, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=market_context_timeout_var).grid(row=81, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Context max symbol items (6-120):").grid(row=82, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=market_context_max_items_var).grid(row=82, column=1, sticky="ew", pady=6)
+            ttk.Label(
+                body,
+                text="Context scoring is an input to ranking/explanations and never overrides local hard safety gates.",
+                foreground=DARK_MUTED,
+                justify="left",
+                wraplength=700,
+            ).grid(row=83, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+            ttk.Separator(body, orient="horizontal").grid(row=84, column=0, columnspan=3, sticky="ew", pady=(6, 8))
+            ttk.Label(
+                body,
+                text="Backtest / Postmortem Analysis (offline advisory)",
+                foreground=CYAN,
+                justify="left",
+            ).grid(row=85, column=0, columnspan=3, sticky="w", pady=(0, 4))
+            ttk.Checkbutton(
+                body,
+                text="Enable OpenAI postmortem analysis service",
+                variable=postmortem_enabled_var,
+            ).grid(row=86, column=0, columnspan=3, sticky="w", pady=(2, 4))
+            ttk.Label(body, text="Postmortem interval seconds (300-604800):").grid(row=87, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=postmortem_interval_var).grid(row=87, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Postmortem model:").grid(row=88, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=postmortem_model_var).grid(row=88, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Postmortem timeout seconds (1-60):").grid(row=89, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=postmortem_timeout_var).grid(row=89, column=1, sticky="ew", pady=6)
+            ttk.Label(body, text="Postmortem max events (200-50000):").grid(row=90, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=postmortem_max_events_var).grid(row=90, column=1, sticky="ew", pady=6)
+            ttk.Checkbutton(
+                body,
+                text="Write postmortem report file under hub_data/openai/",
+                variable=postmortem_write_report_var,
+            ).grid(row=91, column=0, columnspan=3, sticky="w", pady=(2, 4))
+            ttk.Checkbutton(
+                body,
+                text="Allow low-risk postmortem tuning auto-apply (clamped and validated)",
+                variable=postmortem_auto_apply_var,
+            ).grid(row=92, column=0, columnspan=3, sticky="w", pady=(2, 2))
+            ttk.Checkbutton(
+                body,
+                text="Managed hands-off auto tuning (enable safe auto-apply across AI tuning services)",
+                variable=managed_auto_tuning_var,
+            ).grid(row=93, column=0, columnspan=3, sticky="w", pady=(2, 4))
+            ttk.Label(
+                body,
+                text="Postmortem analysis is asynchronous/offline and never places trades or bypasses local protections.",
+                foreground=DARK_MUTED,
+                justify="left",
+                wraplength=700,
+            ).grid(row=94, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+            btns = ttk.Frame(body)
+            btns.grid(row=95, column=0, columnspan=3, sticky="w", pady=(12, 0))
+
+            def _save_openai() -> None:
+                key_txt = str(key_var.get() or "").strip()
+                model_txt = str(model_var.get() or "").strip()
+                nightly_model_txt = str(nightly_model_var.get() or "").strip()
+                endpoint_txt = str(endpoint_var.get() or "").strip()
+                try:
+                    timeout_s = float(timeout_var.get())
+                except Exception:
+                    messagebox.showerror("Invalid timeout", "Timeout seconds must be a number between 1 and 30.")
+                    return
+                try:
+                    nightly_timeout_s = float(nightly_timeout_var.get())
+                except Exception:
+                    messagebox.showerror("Invalid nightly timeout", "Nightly timeout must be a number between 1 and 60.")
+                    return
+                try:
+                    max_candidates = int(float(max_candidates_var.get()))
+                except Exception:
+                    messagebox.showerror("Invalid max candidates", "Max candidates/market must be a number between 1 and 8.")
+                    return
+                try:
+                    decision_min_interval_s = float(decision_min_interval_var.get())
+                except Exception:
+                    messagebox.showerror("Invalid decision interval", "Decision min interval must be a number between 0 and 604800.")
+                    return
+                try:
+                    decision_max_calls_day = int(float(decision_max_calls_day_var.get()))
+                except Exception:
+                    messagebox.showerror("Invalid daily call cap", "Decision max calls/day must be a number between 1 and 5000.")
+                    return
+                try:
+                    decision_max_calls_week = int(float(decision_max_calls_week_var.get()))
+                except Exception:
+                    messagebox.showerror("Invalid weekly call cap", "Decision max calls/week must be a number between 1 and 50000.")
+                    return
+                try:
+                    nightly_hour = int(float(nightly_hour_var.get()))
+                except Exception:
+                    messagebox.showerror("Invalid nightly hour", "Nightly run hour must be a number between 0 and 23.")
+                    return
+                try:
+                    nightly_lookback = int(float(nightly_lookback_var.get()))
+                except Exception:
+                    messagebox.showerror("Invalid lookback", "Lookback days must be a number between 1 and 30.")
+                    return
+                try:
+                    nightly_max_events = int(float(nightly_max_events_var.get()))
+                except Exception:
+                    messagebox.showerror("Invalid max events", "Nightly max events must be a number between 200 and 50000.")
+                    return
+                try:
+                    nightly_max_suggestions = int(float(nightly_max_suggestions_var.get()))
+                except Exception:
+                    messagebox.showerror("Invalid max suggestions", "Nightly max suggestions must be a number between 3 and 20.")
+                    return
+                try:
+                    position_review_interval_s = float(position_review_interval_var.get())
+                except Exception:
+                    messagebox.showerror("Invalid position review interval", "Position review interval must be a number between 30 and 604800.")
+                    return
+                try:
+                    position_review_timeout_s = float(position_review_timeout_var.get())
+                except Exception:
+                    messagebox.showerror("Invalid position review timeout", "Position review timeout must be a number between 1 and 30.")
+                    return
+                try:
+                    position_review_max_positions = int(float(position_review_max_positions_var.get()))
+                except Exception:
+                    messagebox.showerror("Invalid max positions", "Max reviewed positions must be a number between 8 and 200.")
+                    return
+                try:
+                    capital_planner_interval_s = float(capital_planner_interval_var.get())
+                except Exception:
+                    messagebox.showerror("Invalid planner interval", "Planner interval must be a number between 30 and 604800.")
+                    return
+                try:
+                    capital_planner_timeout_s = float(capital_planner_timeout_var.get())
+                except Exception:
+                    messagebox.showerror("Invalid planner timeout", "Planner timeout must be a number between 1 and 30.")
+                    return
+                try:
+                    capital_planner_max_candidates = int(float(capital_planner_max_candidates_var.get()))
+                except Exception:
+                    messagebox.showerror("Invalid planner candidates", "Planner max candidates/market must be a number between 1 and 8.")
+                    return
+                try:
+                    root_cause_interval_s = float(root_cause_interval_var.get())
+                except Exception:
+                    messagebox.showerror("Invalid root-cause interval", "Root-cause interval must be a number between 30 and 604800.")
+                    return
+                try:
+                    explanations_interval_s = float(explanations_interval_var.get())
+                except Exception:
+                    messagebox.showerror("Invalid explanations interval", "Explanations interval must be a number between 120 and 604800.")
+                    return
+                try:
+                    root_cause_timeout_s = float(root_cause_timeout_var.get())
+                except Exception:
+                    messagebox.showerror("Invalid root-cause timeout", "Root-cause timeout must be a number between 1 and 30.")
+                    return
+                try:
+                    root_cause_max_incidents = int(float(root_cause_max_incidents_var.get()))
+                except Exception:
+                    messagebox.showerror("Invalid max incidents", "Root-cause max incidents must be a number between 50 and 2000.")
+                    return
+                try:
+                    explanations_timeout_s = float(explanations_timeout_var.get())
+                except Exception:
+                    messagebox.showerror("Invalid explanations timeout", "Explanations timeout must be a number between 1 and 30.")
+                    return
+                try:
+                    explanations_max_items = int(float(explanations_max_items_var.get()))
+                except Exception:
+                    messagebox.showerror("Invalid explanations max items", "Explanations max items must be a number between 4 and 64.")
+                    return
+                try:
+                    strategy_optimizer_interval_s = float(strategy_optimizer_interval_var.get())
+                except Exception:
+                    messagebox.showerror("Invalid optimizer interval", "Optimizer interval must be a number between 30 and 604800.")
+                    return
+                try:
+                    strategy_optimizer_timeout_s = float(strategy_optimizer_timeout_var.get())
+                except Exception:
+                    messagebox.showerror("Invalid optimizer timeout", "Optimizer timeout must be a number between 1 and 30.")
+                    return
+                try:
+                    market_context_interval_s = float(market_context_interval_var.get())
+                except Exception:
+                    messagebox.showerror("Invalid context interval", "Context interval must be a number between 30 and 604800.")
+                    return
+                try:
+                    postmortem_interval_s = float(postmortem_interval_var.get())
+                except Exception:
+                    messagebox.showerror("Invalid postmortem interval", "Postmortem interval must be a number between 300 and 604800.")
+                    return
+                try:
+                    market_context_timeout_s = float(market_context_timeout_var.get())
+                except Exception:
+                    messagebox.showerror("Invalid context timeout", "Context timeout must be a number between 1 and 30.")
+                    return
+                try:
+                    market_context_max_items = int(float(market_context_max_items_var.get()))
+                except Exception:
+                    messagebox.showerror("Invalid context max items", "Context max items must be a number between 6 and 120.")
+                    return
+                try:
+                    postmortem_timeout_s = float(postmortem_timeout_var.get())
+                except Exception:
+                    messagebox.showerror("Invalid postmortem timeout", "Postmortem timeout must be a number between 1 and 60.")
+                    return
+                try:
+                    postmortem_max_events = int(float(postmortem_max_events_var.get()))
+                except Exception:
+                    messagebox.showerror("Invalid postmortem max events", "Postmortem max events must be a number between 200 and 50000.")
+                    return
+                timeout_s = max(1.0, min(30.0, float(timeout_s)))
+                max_candidates = max(1, min(8, int(max_candidates)))
+                decision_min_interval_s = max(0.0, min(604800.0, float(decision_min_interval_s)))
+                decision_max_calls_day = max(1, min(5000, int(decision_max_calls_day)))
+                decision_max_calls_week = max(1, min(50000, int(decision_max_calls_week)))
+                nightly_timeout_s = max(1.0, min(60.0, float(nightly_timeout_s)))
+                nightly_hour = max(0, min(23, int(nightly_hour)))
+                nightly_lookback = max(1, min(30, int(nightly_lookback)))
+                nightly_max_events = max(200, min(50000, int(nightly_max_events)))
+                nightly_max_suggestions = max(3, min(20, int(nightly_max_suggestions)))
+                position_review_interval_s = max(30.0, min(604800.0, float(position_review_interval_s)))
+                position_review_timeout_s = max(1.0, min(30.0, float(position_review_timeout_s)))
+                position_review_max_positions = max(8, min(200, int(position_review_max_positions)))
+                capital_planner_interval_s = max(30.0, min(604800.0, float(capital_planner_interval_s)))
+                capital_planner_timeout_s = max(1.0, min(30.0, float(capital_planner_timeout_s)))
+                capital_planner_max_candidates = max(1, min(8, int(capital_planner_max_candidates)))
+                root_cause_interval_s = max(30.0, min(604800.0, float(root_cause_interval_s)))
+                root_cause_timeout_s = max(1.0, min(30.0, float(root_cause_timeout_s)))
+                root_cause_max_incidents = max(50, min(2000, int(root_cause_max_incidents)))
+                explanations_interval_s = max(120.0, min(604800.0, float(explanations_interval_s)))
+                explanations_timeout_s = max(1.0, min(30.0, float(explanations_timeout_s)))
+                explanations_max_items = max(4, min(64, int(explanations_max_items)))
+                strategy_optimizer_interval_s = max(30.0, min(604800.0, float(strategy_optimizer_interval_s)))
+                strategy_optimizer_timeout_s = max(1.0, min(30.0, float(strategy_optimizer_timeout_s)))
+                market_context_interval_s = max(30.0, min(604800.0, float(market_context_interval_s)))
+                market_context_timeout_s = max(1.0, min(30.0, float(market_context_timeout_s)))
+                market_context_max_items = max(6, min(120, int(market_context_max_items)))
+                postmortem_interval_s = max(300.0, min(604800.0, float(postmortem_interval_s)))
+                postmortem_timeout_s = max(1.0, min(60.0, float(postmortem_timeout_s)))
+                postmortem_max_events = max(200, min(50000, int(postmortem_max_events)))
+
+                if key_txt and len(key_txt) < 20:
+                    if not messagebox.askyesno(
+                        "Key looks short",
+                        "This key looks shorter than expected. Save anyway?",
+                    ):
+                        return
+                resolved_key = key_txt or str(get_openai_api_key(self.settings, base_dir=self.project_dir) or "").strip()
+                if (
+                    bool(ai_enabled_var.get())
+                    or bool(nightly_enabled_var.get())
+                    or bool(position_review_enabled_var.get())
+                    or bool(capital_planner_enabled_var.get())
+                    or bool(root_cause_enabled_var.get())
+                    or bool(explanations_enabled_var.get())
+                    or bool(strategy_optimizer_enabled_var.get())
+                    or bool(market_context_enabled_var.get())
+                    or bool(postmortem_enabled_var.get())
+                ) and (not resolved_key):
+                    messagebox.showerror(
+                        "Missing key",
+                        "OpenAI decision/review/planner/root-cause/explanations/optimizer/context/postmortem is enabled, but no API key is configured.\n\nAdd a key or disable OpenAI features.",
+                    )
+                    return
+                if key_txt:
+                    try:
+                        _write_secret_file(openai_credential_path(self.project_dir), key_txt)
+                    except Exception as exc:
+                        messagebox.showerror(
+                            "Save failed",
+                            f"Could not write OpenAI key file.\n\n{type(exc).__name__}: {exc}",
+                        )
+                        return
+                    _set_env_cred("OPENAI_API_KEY", key_txt)
+                    _set_env_cred("POWERTRADER_OPENAI_API_KEY", key_txt)
+
+                managed_auto_tuning = bool(managed_auto_tuning_var.get())
+                self.settings["openai_api_key"] = ""
+                self.settings["openai_decision_enabled"] = bool(ai_enabled_var.get())
+                self.settings["openai_decision_live_enabled"] = bool(ai_live_enabled_var.get())
+                self.settings["openai_decision_paper_enabled"] = bool(ai_paper_enabled_var.get())
+                self.settings["openai_decision_require_local_pass_first"] = bool(ai_require_local_var.get())
+                self.settings["openai_managed_auto_tuning_enabled"] = bool(managed_auto_tuning)
+                self.settings["openai_model"] = model_txt or str(DEFAULT_SETTINGS.get("openai_model", "gpt-5.4-mini"))
+                self.settings["openai_timeout_s"] = float(timeout_s)
+                self.settings["openai_decision_max_candidates_per_market"] = int(max_candidates)
+                self.settings["openai_decision_min_interval_s"] = float(decision_min_interval_s)
+                self.settings["openai_decision_max_calls_per_day"] = int(decision_max_calls_day)
+                self.settings["openai_decision_max_calls_per_week"] = int(decision_max_calls_week)
+                self.settings["openai_responses_endpoint"] = endpoint_txt
+                self.settings["openai_nightly_review_enabled"] = bool(nightly_enabled_var.get())
+                self.settings["openai_nightly_review_hour_local"] = int(nightly_hour)
+                self.settings["openai_nightly_review_lookback_days"] = int(nightly_lookback)
+                self.settings["openai_nightly_review_model"] = nightly_model_txt or str(model_txt or DEFAULT_SETTINGS.get("openai_nightly_review_model", "gpt-5.4-mini"))
+                self.settings["openai_nightly_review_timeout_s"] = float(nightly_timeout_s)
+                self.settings["openai_nightly_review_max_events"] = int(nightly_max_events)
+                self.settings["openai_nightly_review_max_suggestions"] = int(nightly_max_suggestions)
+                self.settings["openai_nightly_review_write_report_enabled"] = bool(nightly_write_report_var.get())
+                self.settings["openai_nightly_review_apply_tuning_enabled"] = bool(nightly_apply_tuning_var.get() or managed_auto_tuning)
+                self.settings["openai_position_review_enabled"] = bool(position_review_enabled_var.get())
+                self.settings["openai_position_review_live_enabled"] = bool(position_review_live_var.get())
+                self.settings["openai_position_review_paper_enabled"] = bool(position_review_paper_var.get())
+                self.settings["openai_position_review_auto_act_enabled"] = bool(position_review_auto_act_var.get())
+                self.settings["openai_position_review_interval_s"] = float(position_review_interval_s)
+                self.settings["openai_position_review_model"] = str(position_review_model_var.get() or "").strip() or str(model_txt or DEFAULT_SETTINGS.get("openai_position_review_model", "gpt-5.4-mini"))
+                self.settings["openai_position_review_timeout_s"] = float(position_review_timeout_s)
+                self.settings["openai_position_review_max_positions"] = int(position_review_max_positions)
+                self.settings["openai_capital_planner_enabled"] = bool(capital_planner_enabled_var.get())
+                self.settings["openai_capital_planner_live_enabled"] = bool(capital_planner_live_var.get())
+                self.settings["openai_capital_planner_paper_enabled"] = bool(capital_planner_paper_var.get())
+                self.settings["openai_capital_planner_interval_s"] = float(capital_planner_interval_s)
+                self.settings["openai_capital_planner_model"] = str(capital_planner_model_var.get() or "").strip() or str(model_txt or DEFAULT_SETTINGS.get("openai_capital_planner_model", "gpt-5.4-mini"))
+                self.settings["openai_capital_planner_timeout_s"] = float(capital_planner_timeout_s)
+                self.settings["openai_capital_planner_max_candidates_per_market"] = int(capital_planner_max_candidates)
+                self.settings["openai_root_cause_enabled"] = bool(root_cause_enabled_var.get())
+                self.settings["openai_root_cause_live_enabled"] = bool(root_cause_live_var.get())
+                self.settings["openai_root_cause_interval_s"] = float(root_cause_interval_s)
+                self.settings["openai_root_cause_model"] = str(root_cause_model_var.get() or "").strip() or str(model_txt or DEFAULT_SETTINGS.get("openai_root_cause_model", "gpt-5.4-mini"))
+                self.settings["openai_root_cause_timeout_s"] = float(root_cause_timeout_s)
+                self.settings["openai_root_cause_max_incidents"] = int(root_cause_max_incidents)
+                self.settings["openai_explanations_enabled"] = bool(explanations_enabled_var.get())
+                self.settings["openai_explanations_live_enabled"] = bool(explanations_live_var.get())
+                self.settings["openai_explanations_interval_s"] = float(explanations_interval_s)
+                self.settings["openai_explanations_model"] = str(explanations_model_var.get() or "").strip() or str(model_txt or DEFAULT_SETTINGS.get("openai_explanations_model", "gpt-5.4-mini"))
+                self.settings["openai_explanations_timeout_s"] = float(explanations_timeout_s)
+                self.settings["openai_explanations_max_items"] = int(explanations_max_items)
+                self.settings["openai_strategy_optimizer_enabled"] = bool(strategy_optimizer_enabled_var.get())
+                self.settings["openai_strategy_optimizer_live_enabled"] = bool(strategy_optimizer_live_var.get())
+                self.settings["openai_strategy_optimizer_auto_apply_enabled"] = bool(strategy_optimizer_auto_apply_var.get() or managed_auto_tuning)
+                self.settings["openai_strategy_optimizer_interval_s"] = float(strategy_optimizer_interval_s)
+                self.settings["openai_strategy_optimizer_model"] = str(strategy_optimizer_model_var.get() or "").strip() or str(model_txt or DEFAULT_SETTINGS.get("openai_strategy_optimizer_model", "gpt-5.4-mini"))
+                self.settings["openai_strategy_optimizer_timeout_s"] = float(strategy_optimizer_timeout_s)
+                self.settings["openai_market_context_enabled"] = bool(market_context_enabled_var.get())
+                self.settings["openai_market_context_live_enabled"] = bool(market_context_live_var.get())
+                self.settings["openai_market_context_interval_s"] = float(market_context_interval_s)
+                self.settings["openai_market_context_model"] = str(market_context_model_var.get() or "").strip() or str(model_txt or DEFAULT_SETTINGS.get("openai_market_context_model", "gpt-5.4-mini"))
+                self.settings["openai_market_context_timeout_s"] = float(market_context_timeout_s)
+                self.settings["openai_market_context_max_items"] = int(market_context_max_items)
+                self.settings["openai_postmortem_enabled"] = bool(postmortem_enabled_var.get())
+                self.settings["openai_postmortem_interval_s"] = float(postmortem_interval_s)
+                self.settings["openai_postmortem_model"] = str(postmortem_model_var.get() or "").strip() or str(model_txt or DEFAULT_SETTINGS.get("openai_postmortem_model", "gpt-5.4-mini"))
+                self.settings["openai_postmortem_timeout_s"] = float(postmortem_timeout_s)
+                self.settings["openai_postmortem_max_events"] = int(postmortem_max_events)
+                self.settings["openai_postmortem_write_report_enabled"] = bool(postmortem_write_report_var.get())
+                self.settings["openai_postmortem_auto_apply_tuning_enabled"] = bool(postmortem_auto_apply_var.get() or managed_auto_tuning)
+                self._save_settings()
+                _refresh_openai_status()
+                dlg.destroy()
+
+            def _clear_openai() -> None:
+                if not messagebox.askyesno(
+                    "Remove key?",
+                    "Remove saved OpenAI API key from local key files for this project?",
+                ):
+                    return
+                for path in (
+                    openai_credential_path(self.project_dir),
+                    os.path.join(self.project_dir, "openai_api_key.txt"),
+                ):
+                    try:
+                        if os.path.isfile(path):
+                            os.remove(path)
+                    except Exception:
+                        pass
+                _set_env_cred("OPENAI_API_KEY", "")
+                _set_env_cred("POWERTRADER_OPENAI_API_KEY", "")
+                self.settings["openai_api_key"] = ""
+                self._save_settings()
+                _refresh_openai_status()
+                dlg.destroy()
+
+            ttk.Button(btns, text="Save", command=_save_openai).pack(side="left")
+            ttk.Button(btns, text="Remove Key", command=_clear_openai).pack(side="left", padx=(8, 0))
+            ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="left", padx=(8, 0))
+            dlg.after(0, _update_openai_scrollbars)
+
         _refresh_alpaca_status()
         _refresh_oanda_status()
+        _refresh_openai_status()
 
         r = 0
         ttk.Label(
@@ -22109,6 +23097,15 @@ class PowerTraderHub(tk.Tk):
             wraplength=760,
         ).grid(row=r, column=0, columnspan=3, sticky="w", pady=(0, 8))
         r += 1
+        add_status_action_row(
+            r,
+            "OpenAI API key:",
+            openai_status_var,
+            "Open Settings",
+            _open_openai_key_editor,
+            parent=frm,
+            tooltip="Global OpenAI key + decision/nightly/position-review/capital-planner/root-cause/explanations/strategy-optimizer settings for AI portfolio support across crypto, stocks, and forex.",
+        ); r += 1
 
         jump_row = ttk.Frame(frm)
         jump_row.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(0, 8))
@@ -23130,6 +24127,9 @@ class PowerTraderHub(tk.Tk):
                 if "credential" in key or "robinhood" in key:
                     win.after(120, _open_robinhood_api_wizard)
                 return
+            if key in {"openai", "openai_credentials", "ai_credentials", "openai_api_key"}:
+                win.after(120, _open_openai_key_editor)
+                return
 
         win.after(80, _apply_focus_target)
 
@@ -23483,9 +24483,9 @@ class PowerTraderHub(tk.Tk):
                 self.settings["oanda_practice_mode"] = False
                 self.settings["paper_only_unless_checklist_green"] = bool(paper_only_guard_var.get())
                 try:
-                    self.settings["key_rotation_warn_days"] = max(7, int(float((key_rotation_warn_days_var.get() or "").strip() or 90)))
+                    self.settings["key_rotation_warn_days"] = max(0, int(float((key_rotation_warn_days_var.get() or "").strip() or 0)))
                 except Exception:
-                    self.settings["key_rotation_warn_days"] = int(DEFAULT_SETTINGS.get("key_rotation_warn_days", 90))
+                    self.settings["key_rotation_warn_days"] = int(DEFAULT_SETTINGS.get("key_rotation_warn_days", 0))
                 self.settings["forex_universe_pairs"] = str(forex_pairs_var.get() or "").strip()
                 try:
                     self.settings["forex_scan_max_pairs"] = max(4, int(float((forex_scan_max_pairs_var.get() or "").strip() or 16)))

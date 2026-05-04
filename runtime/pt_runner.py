@@ -5,6 +5,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Dict, Optional, TextIO
 
@@ -30,6 +31,14 @@ from app.opportunity_allocator import summarize_allocator_snapshot
 from app.json_codec import load as json_load
 from app.json_codec import loads as json_loads
 from app.notification_center import build_notification_center_payload
+from app.openai_capital_planner import run_openai_capital_planner
+from app.openai_explanations import run_openai_explanations
+from app.openai_market_context import run_openai_market_context
+from app.openai_postmortem_analysis import run_openai_postmortem_analysis
+from app.openai_position_review import run_openai_position_review
+from app.openai_root_cause_analysis import run_openai_root_cause_analysis
+from app.openai_strategy_optimizer import run_openai_strategy_optimizer
+from app.openai_trade_review import run_openai_nightly_trade_review
 from app.path_utils import read_settings_file, resolve_runtime_paths, resolve_settings_path
 from app.runtime_insights import (
     build_broker_latency_histogram,
@@ -62,6 +71,23 @@ INCIDENTS_PATH = os.path.join(HUB_DATA_DIR, "incidents.jsonl")
 RUNTIME_EVENTS_PATH = os.path.join(HUB_DATA_DIR, "runtime_events.jsonl")
 RUNTIME_STATE_PATH = os.path.join(HUB_DATA_DIR, "runtime_state.json")
 NOTIFICATION_CENTER_PATH = os.path.join(HUB_DATA_DIR, "notification_center.json")
+OPENAI_DIR = os.path.join(HUB_DATA_DIR, "openai")
+OPENAI_NIGHTLY_REVIEW_REPORT_PATH = os.path.join(OPENAI_DIR, "nightly_trade_review.json")
+OPENAI_NIGHTLY_REVIEW_STATUS_PATH = os.path.join(OPENAI_DIR, "nightly_trade_review_status.json")
+OPENAI_POSITION_REVIEW_REPORT_PATH = os.path.join(OPENAI_DIR, "position_review.json")
+OPENAI_POSITION_REVIEW_STATUS_PATH = os.path.join(OPENAI_DIR, "position_review_status.json")
+OPENAI_CAPITAL_PLANNER_REPORT_PATH = os.path.join(OPENAI_DIR, "capital_planner.json")
+OPENAI_CAPITAL_PLANNER_STATUS_PATH = os.path.join(OPENAI_DIR, "capital_planner_status.json")
+OPENAI_ROOT_CAUSE_REPORT_PATH = os.path.join(OPENAI_DIR, "root_cause_analysis.json")
+OPENAI_ROOT_CAUSE_STATUS_PATH = os.path.join(OPENAI_DIR, "root_cause_analysis_status.json")
+OPENAI_EXPLANATIONS_REPORT_PATH = os.path.join(OPENAI_DIR, "explanations.json")
+OPENAI_EXPLANATIONS_STATUS_PATH = os.path.join(OPENAI_DIR, "explanations_status.json")
+OPENAI_STRATEGY_OPTIMIZER_REPORT_PATH = os.path.join(OPENAI_DIR, "strategy_optimizer.json")
+OPENAI_STRATEGY_OPTIMIZER_STATUS_PATH = os.path.join(OPENAI_DIR, "strategy_optimizer_status.json")
+OPENAI_MARKET_CONTEXT_REPORT_PATH = os.path.join(OPENAI_DIR, "market_context.json")
+OPENAI_MARKET_CONTEXT_STATUS_PATH = os.path.join(OPENAI_DIR, "market_context_status.json")
+OPENAI_POSTMORTEM_REPORT_PATH = os.path.join(OPENAI_DIR, "postmortem_analysis.json")
+OPENAI_POSTMORTEM_STATUS_PATH = os.path.join(OPENAI_DIR, "postmortem_analysis_status.json")
 MARKET_REGIMES_PATH = os.path.join(HUB_DATA_DIR, "market_regimes.json")
 WALKFORWARD_REPORT_PATH = os.path.join(HUB_DATA_DIR, "walkforward_report.json")
 CONFIDENCE_CALIBRATION_PATH = os.path.join(HUB_DATA_DIR, "confidence_calibration.json")
@@ -80,6 +106,24 @@ LOG_RETENTION_AGE_DAYS = 14.0
 LOG_RETENTION_MAX_TOTAL_BYTES = 200 * 1024 * 1024
 LOG_RETENTION_INTERVAL_S = 600.0
 WATCHDOG_INTERVAL_S = 15.0
+OPENAI_EXPLANATIONS_MIN_INTERVAL_S = 120.0
+OPENAI_POSTMORTEM_MIN_INTERVAL_S = 3600.0
+OPENAI_ERROR_BACKOFF_BASE_S = 180.0
+OPENAI_RATE_LIMIT_BACKOFF_BASE_S = 600.0
+OPENAI_ERROR_BACKOFF_MAX_S = 7200.0
+OPENAI_INCIDENT_REPEAT_COOLDOWN_S = 900.0
+OPENAI_INCIDENT_REPEAT_COOLDOWN_RATE_LIMIT_S = 1800.0
+OPENAI_GLOBAL_MIN_GAP_S = 8.0
+OPENAI_SCHEDULE_MAX_INTERVAL_S = 604800.0
+OPENAI_SERVICE_STAGGER_S: Dict[str, float] = {
+    "position_review": 3.0,
+    "capital_planner": 7.0,
+    "root_cause": 11.0,
+    "strategy_optimizer": 17.0,
+    "explanations": 23.0,
+    "market_context": 29.0,
+    "postmortem": 37.0,
+}
 MARKETS_STALE_MULT = 4.0
 AUTOPILOT_STALE_MULT = 6.0
 MARKET_LOOP_RESTART_COOLDOWN_S = 180.0
@@ -189,6 +233,13 @@ def _safe_read_json(path: str) -> Dict[str, Any]:
         return {}
 
 
+def _f(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
 def _intraday_drawdown_pct(history_path: str, lookback_hours: int = 24) -> float:
     now = time.time()
     cutoff = now - (max(1, int(lookback_hours)) * 3600.0)
@@ -286,6 +337,43 @@ def _summarize_broker_backoff_events(rows: list[Dict[str, Any]], now_ts_value: f
     }
 
 
+def _openai_status_is_error(status_value: Any) -> bool:
+    status = str(status_value or "").strip().lower()
+    return status in {
+        "http_error",
+        "request_error",
+        "timeout",
+        "invalid_json",
+        "empty_response",
+        "malformed_response",
+        "schema_validation_failed",
+        "runner_exception",
+    }
+
+
+def _openai_backoff_interval_s(
+    *,
+    base_interval_s: float,
+    status_value: Any,
+    error_value: Any,
+    failure_count: int,
+    retry_after_s: float = 0.0,
+) -> float:
+    base = float(max(1.0, base_interval_s))
+    if not _openai_status_is_error(status_value):
+        return base
+    status = str(status_value or "").strip().lower()
+    err = str(error_value or "")
+    is_rate_limited = (status == "http_error" and "429" in err) or ("rate limit" in err.lower())
+    burst_base = OPENAI_RATE_LIMIT_BACKOFF_BASE_S if is_rate_limited else OPENAI_ERROR_BACKOFF_BASE_S
+    fail_n = max(1, int(failure_count))
+    burst = float(burst_base) * float(2 ** min(6, max(0, fail_n - 1)))
+    if float(retry_after_s) > 0.0:
+        burst = max(burst, float(retry_after_s))
+    out = max(base, burst)
+    return float(min(out, OPENAI_ERROR_BACKOFF_MAX_S))
+
+
 def _stop_flag_payload(path: str) -> Dict[str, Any]:
     if not os.path.exists(path):
         return {"active": False, "ts": 0, "age_s": 0, "reason": "", "details": {}}
@@ -376,9 +464,12 @@ def _run_startup_checks(scripts: Dict[str, str], settings: Dict[str, Any], stale
     except Exception:
         warnings.append("key_permission_check_failed")
     try:
-        max_age_days = int(float(settings.get("key_rotation_warn_days", 90) or 90))
-        key_rot = list(key_rotation_reminder_issues(BASE_DIR, max_age_days=max_age_days))
-        warnings.extend(key_rot)
+        max_age_days = int(float(settings.get("key_rotation_warn_days", 0) or 0))
+        key_rot: list[str] = []
+        # Endpoint-managed mode: when warn_days <= 0, disable local age-based reminders.
+        if max_age_days > 0:
+            key_rot = list(key_rotation_reminder_issues(BASE_DIR, max_age_days=max_age_days))
+            warnings.extend(key_rot)
         _atomic_write_json(
             KEY_ROTATION_STATUS_PATH,
             {
@@ -702,6 +793,69 @@ class Runner:
         self._sleep_guard_last_start_at = 0.0
         self._sleep_guard_warned_unavailable = False
         self._sleep_guard_warned_disabled = False
+        self._nightly_review_lock = threading.Lock()
+        self._nightly_review_thread: Optional[threading.Thread] = None
+        self._nightly_review_running = False
+        self._nightly_review_last_tick_at = 0.0
+        self._nightly_review_last_refresh_at = 0.0
+        self._nightly_review_cached_status: Dict[str, Any] = {}
+        self._position_review_lock = threading.Lock()
+        self._position_review_thread: Optional[threading.Thread] = None
+        self._position_review_running = False
+        self._position_review_last_tick_at = 0.0
+        self._position_review_last_refresh_at = 0.0
+        self._position_review_last_launch_ts = 0.0
+        self._position_review_cached_status: Dict[str, Any] = {}
+        self._capital_planner_lock = threading.Lock()
+        self._capital_planner_thread: Optional[threading.Thread] = None
+        self._capital_planner_running = False
+        self._capital_planner_last_tick_at = 0.0
+        self._capital_planner_last_refresh_at = 0.0
+        self._capital_planner_last_launch_ts = 0.0
+        self._capital_planner_cached_status: Dict[str, Any] = {}
+        self._root_cause_lock = threading.Lock()
+        self._root_cause_thread: Optional[threading.Thread] = None
+        self._root_cause_running = False
+        self._root_cause_last_tick_at = 0.0
+        self._root_cause_last_refresh_at = 0.0
+        self._root_cause_last_launch_ts = 0.0
+        self._root_cause_cached_status: Dict[str, Any] = {}
+        self._strategy_optimizer_lock = threading.Lock()
+        self._strategy_optimizer_thread: Optional[threading.Thread] = None
+        self._strategy_optimizer_running = False
+        self._strategy_optimizer_last_tick_at = 0.0
+        self._strategy_optimizer_last_refresh_at = 0.0
+        self._strategy_optimizer_last_launch_ts = 0.0
+        self._strategy_optimizer_cached_status: Dict[str, Any] = {}
+        self._explanations_lock = threading.Lock()
+        self._explanations_thread: Optional[threading.Thread] = None
+        self._explanations_running = False
+        self._explanations_last_tick_at = 0.0
+        self._explanations_last_refresh_at = 0.0
+        self._explanations_last_launch_ts = 0.0
+        self._explanations_cached_status: Dict[str, Any] = {}
+        self._market_context_lock = threading.Lock()
+        self._market_context_thread: Optional[threading.Thread] = None
+        self._market_context_running = False
+        self._market_context_last_tick_at = 0.0
+        self._market_context_last_refresh_at = 0.0
+        self._market_context_last_launch_ts = 0.0
+        self._market_context_cached_status: Dict[str, Any] = {}
+        self._postmortem_lock = threading.Lock()
+        self._postmortem_thread: Optional[threading.Thread] = None
+        self._postmortem_running = False
+        self._postmortem_last_tick_at = 0.0
+        self._postmortem_last_refresh_at = 0.0
+        self._postmortem_last_launch_ts = 0.0
+        self._postmortem_cached_status: Dict[str, Any] = {}
+        self._openai_backoff_state: Dict[str, Dict[str, Any]] = {}
+        self._openai_incident_state: Dict[str, Dict[str, Any]] = {}
+        self._openai_last_global_launch_ts = 0.0
+        self._openai_last_global_launch_service = ""
+        try:
+            os.makedirs(OPENAI_DIR, exist_ok=True)
+        except Exception:
+            pass
 
     def __del__(self) -> None:
         # Best-effort cleanup for tests and short-lived invocations that do not call run().
@@ -709,6 +863,1765 @@ class Runner:
             self._stop_sleep_guard()
         except Exception:
             pass
+
+    def _set_disabled_cached_status(
+        self,
+        *,
+        cache_attr: str,
+        refresh_attr: str,
+        running: bool,
+        summary: str,
+        now: float,
+    ) -> Dict[str, Any]:
+        """
+        Keep disabled OpenAI services in a cheap in-memory state so we avoid
+        repeated status/report file polling when the feature is off.
+        """
+        try:
+            cur_now = float(now)
+        except Exception:
+            cur_now = float(time.time())
+        cur = getattr(self, cache_attr, {})
+        row = dict(cur) if isinstance(cur, dict) else {}
+        needs_reset = (
+            (not row)
+            or bool(row.get("enabled", True))
+            or str(row.get("status", "") or "").strip().lower() != "disabled"
+            or (cur_now - float(getattr(self, refresh_attr, 0.0) or 0.0)) >= 120.0
+        )
+        if needs_reset:
+            row = {
+                "enabled": False,
+                "active": False,
+                "running": bool(running),
+                "status": "disabled",
+                "summary": str(summary or "Disabled.")[:220],
+                "error": "",
+                "last_attempt_ts": int(max(0.0, _f(row.get("last_attempt_ts", 0), 0.0))),
+                "last_completed_ts": int(max(0.0, _f(row.get("last_completed_ts", 0), 0.0))),
+                "date_local": str(row.get("date_local", "") or ""),
+            }
+            setattr(self, cache_attr, dict(row))
+            setattr(self, refresh_attr, float(cur_now))
+        return dict(row)
+
+    def _openai_effective_interval_s(
+        self,
+        *,
+        service: str,
+        cached: Dict[str, Any],
+        base_interval_s: float,
+        last_launch_ts: float,
+        now: float,
+    ) -> float:
+        base = float(max(1.0, _f(base_interval_s, 1.0)))
+        status = str(cached.get("status", "") or "").strip().lower()
+        error = str(cached.get("error", "") or "")
+        last_attempt_ts = int(max(0.0, _f(cached.get("last_attempt_ts", 0), 0.0)))
+        last_completed_ts = int(max(0.0, _f(cached.get("last_completed_ts", 0), 0.0)))
+        last_ref = max(last_attempt_ts, last_completed_ts, int(max(0.0, _f(last_launch_ts, 0.0))))
+        stagger_s = float(max(0.0, _f(OPENAI_SERVICE_STAGGER_S.get(service, 0.0), 0.0)))
+
+        if not _openai_status_is_error(status):
+            if service in self._openai_backoff_state:
+                self._openai_backoff_state.pop(service, None)
+            return float(base + stagger_s)
+
+        if last_ref <= 0:
+            return float(base + stagger_s)
+
+        st = dict(self._openai_backoff_state.get(service, {}))
+        fail_ref = int(max(0.0, _f(st.get("failure_ref", 0), 0.0)))
+        fail_count = int(max(0.0, _f(st.get("failures", 0), 0.0)))
+        if fail_ref != int(last_ref):
+            fail_count = max(1, fail_count + 1)
+            retry_after_s = parse_retry_after_value(error, max_wait_s=OPENAI_ERROR_BACKOFF_MAX_S)
+            computed = _openai_backoff_interval_s(
+                base_interval_s=base,
+                status_value=status,
+                error_value=error,
+                failure_count=fail_count,
+                retry_after_s=retry_after_s,
+            )
+            st = {
+                "failure_ref": int(last_ref),
+                "failures": int(fail_count),
+                "interval_s": float(computed),
+                "status": str(status),
+                "error": str(error)[:180],
+                "updated_ts": int(max(0.0, _f(now, time.time()))),
+            }
+            self._openai_backoff_state[service] = dict(st)
+            if fail_count <= 3 or ("429" in error):
+                _runner_log(
+                    f"{service}: OpenAI backoff active ({status or 'error'}), "
+                    f"interval={round(float(computed), 1)}s failures={fail_count}"
+                )
+        else:
+            computed = float(max(base, _f(st.get("interval_s", base), base)))
+            st["interval_s"] = float(computed)
+            self._openai_backoff_state[service] = dict(st)
+
+        return float(max(base, computed) + stagger_s)
+
+    def _append_openai_status_incident(
+        self,
+        *,
+        event: str,
+        status: str,
+        message: str,
+        error: str = "",
+    ) -> None:
+        evt = str(event or "").strip() or "openai_status"
+        st = str(status or "").strip().lower() or "unknown"
+        err = str(error or "")
+        now_ts_val = float(time.time())
+        prev = self._openai_incident_state.get(evt, {})
+        prev_status = str(prev.get("status", "") or "").strip().lower()
+        prev_ts = float(_f(prev.get("ts", 0.0), 0.0))
+        is_rate = (st == "http_error" and "429" in err) or ("rate limit" in err.lower())
+        cooldown_s = OPENAI_INCIDENT_REPEAT_COOLDOWN_RATE_LIMIT_S if is_rate else OPENAI_INCIDENT_REPEAT_COOLDOWN_S
+        if prev_status == st and (now_ts_val - prev_ts) < float(cooldown_s):
+            return
+        self._openai_incident_state[evt] = {"ts": now_ts_val, "status": st}
+        _append_incident(
+            "warning",
+            evt,
+            str(message or "")[:220],
+            {"status": st, "error": err[:180], "component": "runner"},
+        )
+
+    def _openai_global_launch_gap_s(self, settings: Dict[str, Any]) -> float:
+        cfg = settings if isinstance(settings, dict) else {}
+        return float(min(60.0, max(1.0, _f(cfg.get("openai_global_min_gap_s", OPENAI_GLOBAL_MIN_GAP_S), OPENAI_GLOBAL_MIN_GAP_S))))
+
+    def _openai_can_launch_service(self, *, service: str, now: float, settings: Dict[str, Any]) -> bool:
+        _ = str(service or "").strip().lower()  # service name reserved for diagnostics usage
+        gap_s = self._openai_global_launch_gap_s(settings)
+        last_launch = float(max(0.0, _f(self._openai_last_global_launch_ts, 0.0)))
+        if last_launch <= 0.0:
+            return True
+        return (float(now) - last_launch) >= float(gap_s)
+
+    def _openai_mark_service_launch(self, *, service: str, now: float) -> None:
+        self._openai_last_global_launch_ts = float(max(0.0, _f(now, time.time())))
+        self._openai_last_global_launch_service = str(service or "").strip().lower()
+
+    def _refresh_nightly_review_cache(self, now: float, force: bool = False) -> Dict[str, Any]:
+        try:
+            cur_now = float(now)
+        except Exception:
+            cur_now = float(time.time())
+        if (not force) and (cur_now - float(self._nightly_review_last_refresh_at or 0.0)) < 5.0:
+            return dict(self._nightly_review_cached_status)
+        status = _safe_read_json(OPENAI_NIGHTLY_REVIEW_STATUS_PATH)
+        report = _safe_read_json(OPENAI_NIGHTLY_REVIEW_REPORT_PATH)
+        merged: Dict[str, Any] = {}
+        if isinstance(status, dict):
+            merged.update(status)
+        if isinstance(report, dict):
+            if (not str(merged.get("summary", "") or "").strip()) and str(report.get("summary", "") or "").strip():
+                merged["summary"] = str(report.get("summary", "") or "").strip()
+            if (not str(merged.get("overall_assessment", "") or "").strip()) and str(report.get("overall_assessment", "") or "").strip():
+                merged["overall_assessment"] = str(report.get("overall_assessment", "") or "").strip()
+            if not isinstance(merged.get("next_day_guidance", []), list):
+                merged["next_day_guidance"] = list(report.get("next_day_guidance", []) or []) if isinstance(report.get("next_day_guidance", []), list) else []
+            if not isinstance(merged.get("market_reviews", []), list):
+                merged["market_reviews"] = list(report.get("market_reviews", []) or []) if isinstance(report.get("market_reviews", []), list) else []
+            if int(merged.get("tuning_suggestions_count", 0) or 0) <= 0:
+                sugg = report.get("tuning_suggestions", []) if isinstance(report.get("tuning_suggestions", []), list) else []
+                merged["tuning_suggestions_count"] = int(len([row for row in sugg if isinstance(row, dict)]))
+        merged["running"] = bool(self._nightly_review_running)
+        self._nightly_review_cached_status = dict(merged)
+        self._nightly_review_last_refresh_at = float(cur_now)
+        return dict(merged)
+
+    def _nightly_review_runtime_payload(self, settings: Dict[str, Any], now: float) -> Dict[str, Any]:
+        cfg = settings if isinstance(settings, dict) else {}
+        enabled = bool(cfg.get("openai_nightly_review_enabled", False))
+        if not enabled:
+            row = self._set_disabled_cached_status(
+                cache_attr="_nightly_review_cached_status",
+                refresh_attr="_nightly_review_last_refresh_at",
+                running=bool(self._nightly_review_running),
+                summary="AI nightly review disabled.",
+                now=now,
+            )
+        else:
+            row = self._refresh_nightly_review_cache(now)
+        status = str(row.get("status", "disabled" if not enabled else "idle") or ("disabled" if not enabled else "idle")).strip().lower()
+        summary = str(row.get("summary", "") or "").strip()
+        overall = str(row.get("overall_assessment", "") or "").strip().lower()
+        next_day = row.get("next_day_guidance", []) if isinstance(row.get("next_day_guidance", []), list) else []
+        market_reviews = row.get("market_reviews", []) if isinstance(row.get("market_reviews", []), list) else []
+        applied_tuning = row.get("applied_tuning", []) if isinstance(row.get("applied_tuning", []), list) else []
+        return {
+            "enabled": bool(enabled),
+            "running": bool(self._nightly_review_running),
+            "status": status[:48],
+            "summary": summary[:260],
+            "overall_assessment": overall if overall in {"healthy", "caution", "unhealthy"} else "",
+            "last_attempt_date_local": str(row.get("last_attempt_date_local", "") or ""),
+            "completed_date_local": str(row.get("completed_date_local", "") or ""),
+            "lookback_days": int(max(0, _f(row.get("lookback_days", cfg.get("openai_nightly_review_lookback_days", 7)), 0.0))),
+            "max_events": int(max(0, _f(row.get("max_events", cfg.get("openai_nightly_review_max_events", 5000)), 0.0))),
+            "model": str(row.get("model", cfg.get("openai_nightly_review_model", cfg.get("openai_model", "gpt-5.4-mini"))) or ""),
+            "latency_ms": int(max(0, _f(row.get("latency_ms", 0), 0.0))),
+            "report_path": str(row.get("report_path", OPENAI_NIGHTLY_REVIEW_REPORT_PATH) or OPENAI_NIGHTLY_REVIEW_REPORT_PATH),
+            "report_written": bool(row.get("report_written", False)),
+            "tuning_suggestions_count": int(max(0, _f(row.get("tuning_suggestions_count", 0), 0.0))),
+            "applied_tuning_count": int(max(0, _f(row.get("applied_tuning_count", 0), 0.0))),
+            "persisted_verified_count": int(max(0, _f(row.get("persisted_verified_count", 0), 0.0))),
+            "applied_tuning": [
+                {
+                    "setting_key": str(item.get("setting_key", "") or "").strip(),
+                    "old_value": item.get("old_value"),
+                    "new_value": item.get("new_value"),
+                    "confidence": round(max(0.0, _f(item.get("confidence", 0.0), 0.0)), 6),
+                    "reason": str(item.get("reason", "") or "").strip()[:180],
+                }
+                for item in applied_tuning[:12]
+                if isinstance(item, dict) and str(item.get("setting_key", "") or "").strip()
+            ],
+            "risk_flags_count": int(max(0, _f(row.get("risk_flags_count", 0), 0.0))),
+            "next_day_guidance": [str(x or "")[:180] for x in next_day[:5] if str(x or "").strip()],
+            "market_reviews": [
+                {
+                    "market": str(item.get("market", "") or "").strip().lower(),
+                    "assessment": str(item.get("assessment", "") or "").strip().lower(),
+                }
+                for item in market_reviews[:3]
+                if isinstance(item, dict)
+            ],
+            "error": str(row.get("error", "") or "")[:180],
+        }
+
+    def _start_nightly_review_async(self, settings: Dict[str, Any], now: float) -> None:
+        with self._nightly_review_lock:
+            if self._nightly_review_running:
+                return
+            cfg = dict(settings if isinstance(settings, dict) else {})
+            self._nightly_review_running = True
+
+        def _worker() -> None:
+            try:
+                _runner_log("nightly review: starting asynchronous OpenAI trade review")
+                result = run_openai_nightly_trade_review(
+                    settings=cfg,
+                    base_dir=BASE_DIR,
+                    hub_dir=HUB_DATA_DIR,
+                    now_ts_value=int(max(0.0, float(now))),
+                )
+                status = str(result.get("status", "") or "").strip().lower()
+                if status == "ok":
+                    _runner_log("nightly review: completed successfully")
+                else:
+                    _runner_log(f"nightly review: completed with status={status or 'unknown'}")
+                    self._append_openai_status_incident(
+                        event="openai_nightly_review_status",
+                        status=status,
+                        message=f"Nightly AI trade review completed with status={status or 'unknown'}",
+                        error=str(result.get("error", "") or ""),
+                    )
+            except Exception as exc:
+                msg = f"nightly review failed: {type(exc).__name__}: {exc}"
+                _runner_log(msg)
+                _append_incident(
+                    "warning",
+                    "openai_nightly_review_error",
+                    msg,
+                    {"component": "runner"},
+                )
+                fallback = {
+                    "ts": int(time.time()),
+                    "enabled": bool(cfg.get("openai_nightly_review_enabled", False)),
+                    "running": False,
+                    "status": "runner_exception",
+                    "summary": "Nightly AI trade review failed; trading continues with local logic.",
+                    "error": str(exc)[:180],
+                    "last_attempt_date_local": time.strftime("%Y-%m-%d", time.localtime(time.time())),
+                    "completed_date_local": time.strftime("%Y-%m-%d", time.localtime(time.time())),
+                    "report_path": OPENAI_NIGHTLY_REVIEW_REPORT_PATH,
+                    "report_written": False,
+                }
+                try:
+                    _atomic_write_json(OPENAI_NIGHTLY_REVIEW_STATUS_PATH, fallback)
+                except Exception:
+                    pass
+            finally:
+                with self._nightly_review_lock:
+                    self._nightly_review_running = False
+                    self._nightly_review_thread = None
+                self._refresh_nightly_review_cache(time.time(), force=True)
+
+        th = threading.Thread(target=_worker, name="pt-nightly-review", daemon=True)
+        self._nightly_review_thread = th
+        th.start()
+
+    def _nightly_review_tick(self, now: float, settings: Dict[str, Any]) -> None:
+        try:
+            now_f = float(now)
+        except Exception:
+            now_f = float(time.time())
+        if (now_f - float(self._nightly_review_last_tick_at or 0.0)) < 15.0:
+            return
+        self._nightly_review_last_tick_at = float(now_f)
+        with self._nightly_review_lock:
+            if self._nightly_review_thread is not None and (not self._nightly_review_thread.is_alive()):
+                self._nightly_review_thread = None
+                self._nightly_review_running = False
+        cfg = settings if isinstance(settings, dict) else {}
+        if not bool(cfg.get("openai_nightly_review_enabled", False)):
+            self._set_disabled_cached_status(
+                cache_attr="_nightly_review_cached_status",
+                refresh_attr="_nightly_review_last_refresh_at",
+                running=bool(self._nightly_review_running),
+                summary="AI nightly review disabled.",
+                now=now_f,
+            )
+            return
+        if self._nightly_review_running:
+            return
+        cached = self._refresh_nightly_review_cache(now_f)
+        try:
+            run_hour = int(max(0, min(23, int(_f(cfg.get("openai_nightly_review_hour_local", 2), 2.0)))))
+        except Exception:
+            run_hour = 2
+        lt = time.localtime(now_f)
+        today = time.strftime("%Y-%m-%d", lt)
+        if int(getattr(lt, "tm_hour", 0)) < int(run_hour):
+            return
+        last_attempt = str(cached.get("last_attempt_date_local", cached.get("completed_date_local", "")) or "").strip()
+        if last_attempt == today:
+            return
+        self._start_nightly_review_async(cfg, now_f)
+
+    def _refresh_position_review_cache(self, now: float, force: bool = False) -> Dict[str, Any]:
+        try:
+            cur_now = float(now)
+        except Exception:
+            cur_now = float(time.time())
+        if (not force) and (cur_now - float(self._position_review_last_refresh_at or 0.0)) < 3.0:
+            return dict(self._position_review_cached_status)
+        status = _safe_read_json(OPENAI_POSITION_REVIEW_STATUS_PATH)
+        report = _safe_read_json(OPENAI_POSITION_REVIEW_REPORT_PATH)
+        merged: Dict[str, Any] = {}
+        if isinstance(status, dict):
+            merged.update(status)
+        if isinstance(report, dict):
+            if (not str(merged.get("summary", "") or "").strip()) and str(report.get("summary", "") or "").strip():
+                merged["summary"] = str(report.get("summary", "") or "").strip()
+            if not isinstance(merged.get("portfolio_risks", []), list):
+                merged["portfolio_risks"] = list(report.get("portfolio_risks", []) or []) if isinstance(report.get("portfolio_risks", []), list) else []
+            if int(merged.get("actions_count", 0) or 0) <= 0:
+                rows = report.get("position_actions", []) if isinstance(report.get("position_actions", []), list) else []
+                merged["actions_count"] = int(len([row for row in rows if isinstance(row, dict)]))
+            if not isinstance(merged.get("by_market", {}), dict):
+                merged["by_market"] = dict(report.get("by_market", {}) or {}) if isinstance(report.get("by_market", {}), dict) else {}
+        merged["running"] = bool(self._position_review_running)
+        self._position_review_cached_status = dict(merged)
+        self._position_review_last_refresh_at = float(cur_now)
+        return dict(merged)
+
+    def _position_review_runtime_payload(self, settings: Dict[str, Any], now: float) -> Dict[str, Any]:
+        cfg = settings if isinstance(settings, dict) else {}
+        enabled = bool(cfg.get("openai_position_review_enabled", False))
+        if not enabled:
+            row = self._set_disabled_cached_status(
+                cache_attr="_position_review_cached_status",
+                refresh_attr="_position_review_last_refresh_at",
+                running=bool(self._position_review_running),
+                summary="AI position review disabled.",
+                now=now,
+            )
+        else:
+            row = self._refresh_position_review_cache(now)
+        status = str(row.get("status", "disabled" if not enabled else "idle") or ("disabled" if not enabled else "idle")).strip().lower()
+        summary = str(row.get("summary", "") or "").strip()
+        by_market = row.get("by_market", {}) if isinstance(row.get("by_market", {}), dict) else {}
+        actions = row.get("position_actions", []) if isinstance(row.get("position_actions", []), list) else []
+        return {
+            "enabled": bool(enabled),
+            "running": bool(self._position_review_running),
+            "status": status[:48],
+            "summary": summary[:260],
+            "last_attempt_ts": int(max(0.0, _f(row.get("last_attempt_ts", 0), 0.0))),
+            "last_completed_ts": int(max(0.0, _f(row.get("last_completed_ts", 0), 0.0))),
+            "date_local": str(row.get("date_local", "") or ""),
+            "model": str(row.get("model", cfg.get("openai_position_review_model", cfg.get("openai_model", "gpt-5.4-mini"))) or ""),
+            "interval_s": float(max(0.0, _f(cfg.get("openai_position_review_interval_s", 300.0), 300.0))),
+            "timeout_s": float(max(0.0, _f(row.get("timeout_s", cfg.get("openai_position_review_timeout_s", 8.0)), 8.0))),
+            "max_positions": int(max(0.0, _f(row.get("max_positions", cfg.get("openai_position_review_max_positions", 48)), 0.0))),
+            "auto_act_enabled": bool(row.get("auto_act_enabled", cfg.get("openai_position_review_auto_act_enabled", False))),
+            "actions_count": int(max(0.0, _f(row.get("actions_count", 0), 0.0))),
+            "blocked_count": int(max(0.0, _f(row.get("blocked_count", 0), 0.0))),
+            "latency_ms": int(max(0.0, _f(row.get("latency_ms", 0), 0.0))),
+            "portfolio_risks": [str(x or "")[:120] for x in list(row.get("portfolio_risks", []) or [])[:8] if str(x or "").strip()],
+            "position_actions": [
+                {
+                    "market": str(item.get("market", "") or "").strip().lower(),
+                    "symbol": str(item.get("symbol", "") or "").strip().upper(),
+                    "action": str(item.get("action", "") or "").strip().lower(),
+                    "effective_action": str(item.get("effective_action", item.get("action", "")) or "").strip().lower(),
+                    "confidence": round(max(0.0, _f(item.get("confidence", 0.0), 0.0)), 6),
+                    "reason": str(item.get("reason", "") or "").strip()[:180],
+                }
+                for item in actions[:18]
+                if isinstance(item, dict)
+            ],
+            "by_market": dict(by_market),
+            "error": str(row.get("error", "") or "")[:180],
+        }
+
+    def _start_position_review_async(self, settings: Dict[str, Any], now: float) -> None:
+        with self._position_review_lock:
+            if self._position_review_running:
+                return
+            cfg = dict(settings if isinstance(settings, dict) else {})
+            self._position_review_running = True
+            self._position_review_last_launch_ts = float(now)
+
+        def _worker() -> None:
+            try:
+                _runner_log("position review: starting asynchronous OpenAI position review")
+                result = run_openai_position_review(
+                    settings=cfg,
+                    base_dir=BASE_DIR,
+                    hub_dir=HUB_DATA_DIR,
+                    now_ts_value=int(max(0.0, float(now))),
+                )
+                status = str(result.get("status", "") or "").strip().lower()
+                if status == "ok":
+                    _runner_log("position review: completed successfully")
+                else:
+                    _runner_log(f"position review: completed with status={status or 'unknown'}")
+                    self._append_openai_status_incident(
+                        event="openai_position_review_status",
+                        status=status,
+                        message=f"OpenAI position review completed with status={status or 'unknown'}",
+                        error=str(result.get("error", "") or ""),
+                    )
+            except Exception as exc:
+                msg = f"position review failed: {type(exc).__name__}: {exc}"
+                _runner_log(msg)
+                _append_incident(
+                    "warning",
+                    "openai_position_review_error",
+                    msg,
+                    {"component": "runner"},
+                )
+                fallback = {
+                    "ts": int(time.time()),
+                    "enabled": bool(cfg.get("openai_position_review_enabled", False)),
+                    "running": False,
+                    "status": "runner_exception",
+                    "summary": "AI position review failed; local logic remains active.",
+                    "error": str(exc)[:180],
+                    "last_attempt_ts": int(time.time()),
+                    "last_completed_ts": int(time.time()),
+                    "date_local": time.strftime("%Y-%m-%d", time.localtime(time.time())),
+                    "report_path": OPENAI_POSITION_REVIEW_REPORT_PATH,
+                    "report_written": False,
+                }
+                try:
+                    _atomic_write_json(OPENAI_POSITION_REVIEW_STATUS_PATH, fallback)
+                except Exception:
+                    pass
+            finally:
+                with self._position_review_lock:
+                    self._position_review_running = False
+                    self._position_review_thread = None
+                self._refresh_position_review_cache(time.time(), force=True)
+
+        th = threading.Thread(target=_worker, name="pt-position-review", daemon=True)
+        self._position_review_thread = th
+        th.start()
+
+    def _position_review_tick(self, now: float, settings: Dict[str, Any]) -> None:
+        try:
+            now_f = float(now)
+        except Exception:
+            now_f = float(time.time())
+        if (now_f - float(self._position_review_last_tick_at or 0.0)) < 10.0:
+            return
+        self._position_review_last_tick_at = float(now_f)
+        with self._position_review_lock:
+            if self._position_review_thread is not None and (not self._position_review_thread.is_alive()):
+                self._position_review_thread = None
+                self._position_review_running = False
+        cfg = settings if isinstance(settings, dict) else {}
+        if not bool(cfg.get("openai_position_review_enabled", False)):
+            self._set_disabled_cached_status(
+                cache_attr="_position_review_cached_status",
+                refresh_attr="_position_review_last_refresh_at",
+                running=bool(self._position_review_running),
+                summary="AI position review disabled.",
+                now=now_f,
+            )
+            return
+        if self._position_review_running:
+            return
+        cached = self._refresh_position_review_cache(now_f)
+        try:
+            interval_s = float(
+                max(
+                    30.0,
+                    min(OPENAI_SCHEDULE_MAX_INTERVAL_S, float(cfg.get("openai_position_review_interval_s", 300.0) or 300.0)),
+                )
+            )
+        except Exception:
+            interval_s = 300.0
+        interval_s = self._openai_effective_interval_s(
+            service="position_review",
+            cached=cached,
+            base_interval_s=interval_s,
+            last_launch_ts=self._position_review_last_launch_ts,
+            now=now_f,
+        )
+        last_attempt_ts = int(max(0.0, _f(cached.get("last_attempt_ts", 0), 0.0)))
+        last_completed_ts = int(max(0.0, _f(cached.get("last_completed_ts", 0), 0.0)))
+        last_ref = max(last_attempt_ts, last_completed_ts, int(max(0.0, self._position_review_last_launch_ts)))
+        if last_ref > 0 and (now_f - float(last_ref)) < float(interval_s):
+            return
+        if not self._openai_can_launch_service(service="position_review", now=now_f, settings=cfg):
+            return
+        self._openai_mark_service_launch(service="position_review", now=now_f)
+        self._start_position_review_async(cfg, now_f)
+
+    def _refresh_capital_planner_cache(self, now: float, force: bool = False) -> Dict[str, Any]:
+        try:
+            cur_now = float(now)
+        except Exception:
+            cur_now = float(time.time())
+        if (not force) and (cur_now - float(self._capital_planner_last_refresh_at or 0.0)) < 3.0:
+            return dict(self._capital_planner_cached_status)
+        status = _safe_read_json(OPENAI_CAPITAL_PLANNER_STATUS_PATH)
+        report = _safe_read_json(OPENAI_CAPITAL_PLANNER_REPORT_PATH)
+        merged: Dict[str, Any] = {}
+        if isinstance(status, dict):
+            merged.update(status)
+        if isinstance(report, dict):
+            if (not str(merged.get("summary", "") or "").strip()) and str(report.get("summary", "") or "").strip():
+                merged["summary"] = str(report.get("summary", "") or "").strip()
+            if not isinstance(merged.get("portfolio_plan", {}), dict):
+                merged["portfolio_plan"] = dict(report.get("portfolio_plan", {}) or {}) if isinstance(report.get("portfolio_plan", {}), dict) else {}
+            if not isinstance(merged.get("market_actions", []), list):
+                merged["market_actions"] = list(report.get("market_actions", []) or []) if isinstance(report.get("market_actions", []), list) else []
+            if not isinstance(merged.get("global_risks", []), list):
+                merged["global_risks"] = list(report.get("global_risks", []) or []) if isinstance(report.get("global_risks", []), list) else []
+        merged["running"] = bool(self._capital_planner_running)
+        self._capital_planner_cached_status = dict(merged)
+        self._capital_planner_last_refresh_at = float(cur_now)
+        return dict(merged)
+
+    def _capital_planner_runtime_payload(self, settings: Dict[str, Any], now: float) -> Dict[str, Any]:
+        cfg = settings if isinstance(settings, dict) else {}
+        enabled = bool(cfg.get("openai_capital_planner_enabled", False))
+        if not enabled:
+            row = self._set_disabled_cached_status(
+                cache_attr="_capital_planner_cached_status",
+                refresh_attr="_capital_planner_last_refresh_at",
+                running=bool(self._capital_planner_running),
+                summary="AI capital planner disabled.",
+                now=now,
+            )
+        else:
+            row = self._refresh_capital_planner_cache(now)
+        status = str(row.get("status", "disabled" if not enabled else "idle") or ("disabled" if not enabled else "idle")).strip().lower()
+        summary = str(row.get("summary", "") or "").strip()
+        portfolio_plan = row.get("portfolio_plan", {}) if isinstance(row.get("portfolio_plan", {}), dict) else {}
+        market_actions = row.get("market_actions", []) if isinstance(row.get("market_actions", []), list) else []
+        risks = row.get("global_risks", []) if isinstance(row.get("global_risks", []), list) else []
+        by_market = row.get("market_actions_by_market", {}) if isinstance(row.get("market_actions_by_market", {}), dict) else {}
+        if not by_market:
+            by_market = {
+                str(item.get("market", "") or "").strip().lower(): dict(item)
+                for item in market_actions
+                if isinstance(item, dict) and str(item.get("market", "") or "").strip()
+            }
+        return {
+            "enabled": bool(enabled),
+            "running": bool(self._capital_planner_running),
+            "status": status[:48],
+            "summary": summary[:260],
+            "last_attempt_ts": int(max(0.0, _f(row.get("last_attempt_ts", 0), 0.0))),
+            "last_completed_ts": int(max(0.0, _f(row.get("last_completed_ts", 0), 0.0))),
+            "date_local": str(row.get("date_local", "") or ""),
+            "model": str(row.get("model", cfg.get("openai_capital_planner_model", cfg.get("openai_model", "gpt-5.4-mini"))) or ""),
+            "interval_s": float(max(0.0, _f(cfg.get("openai_capital_planner_interval_s", 180.0), 180.0))),
+            "timeout_s": float(max(0.0, _f(row.get("timeout_s", cfg.get("openai_capital_planner_timeout_s", 6.0)), 6.0))),
+            "max_candidates_per_market": int(max(0.0, _f(row.get("max_candidates_per_market", cfg.get("openai_capital_planner_max_candidates_per_market", 3)), 0.0))),
+            "latency_ms": int(max(0.0, _f(row.get("latency_ms", 0), 0.0))),
+            "portfolio_plan": dict(portfolio_plan),
+            "preferred_market_order": [
+                str(x or "").strip().lower()
+                for x in list(portfolio_plan.get("preferred_market_order", []) or [])[:6]
+                if str(x or "").strip()
+            ],
+            "reserve_capital_pct": round(float(max(0.0, _f(portfolio_plan.get("reserve_capital_pct", 0.0), 0.0))), 6),
+            "capital_constrained": bool(portfolio_plan.get("capital_constrained", False)),
+            "market_actions": [dict(item) for item in market_actions[:12] if isinstance(item, dict)],
+            "market_actions_by_market": dict(by_market),
+            "global_risks": [str(x or "")[:120] for x in risks[:8] if str(x or "").strip()],
+            "error": str(row.get("error", "") or "")[:180],
+        }
+
+    def _start_capital_planner_async(self, settings: Dict[str, Any], now: float) -> None:
+        with self._capital_planner_lock:
+            if self._capital_planner_running:
+                return
+            cfg = dict(settings if isinstance(settings, dict) else {})
+            self._capital_planner_running = True
+            self._capital_planner_last_launch_ts = float(now)
+
+        def _worker() -> None:
+            try:
+                _runner_log("capital planner: starting asynchronous OpenAI capital planner")
+                result = run_openai_capital_planner(
+                    settings=cfg,
+                    base_dir=BASE_DIR,
+                    hub_dir=HUB_DATA_DIR,
+                    now_ts_value=int(max(0.0, float(now))),
+                )
+                status = str(result.get("status", "") or "").strip().lower()
+                if status == "ok":
+                    _runner_log("capital planner: completed successfully")
+                else:
+                    _runner_log(f"capital planner: completed with status={status or 'unknown'}")
+                    self._append_openai_status_incident(
+                        event="openai_capital_planner_status",
+                        status=status,
+                        message=f"OpenAI capital planner completed with status={status or 'unknown'}",
+                        error=str(result.get("error", "") or ""),
+                    )
+            except Exception as exc:
+                msg = f"capital planner failed: {type(exc).__name__}: {exc}"
+                _runner_log(msg)
+                _append_incident(
+                    "warning",
+                    "openai_capital_planner_error",
+                    msg,
+                    {"component": "runner"},
+                )
+                fallback = {
+                    "ts": int(time.time()),
+                    "enabled": bool(cfg.get("openai_capital_planner_enabled", False)),
+                    "running": False,
+                    "status": "runner_exception",
+                    "summary": "AI capital planner failed; local allocator remains active.",
+                    "error": str(exc)[:180],
+                    "last_attempt_ts": int(time.time()),
+                    "last_completed_ts": int(time.time()),
+                    "date_local": time.strftime("%Y-%m-%d", time.localtime(time.time())),
+                    "report_path": OPENAI_CAPITAL_PLANNER_REPORT_PATH,
+                    "report_written": False,
+                }
+                try:
+                    _atomic_write_json(OPENAI_CAPITAL_PLANNER_STATUS_PATH, fallback)
+                except Exception:
+                    pass
+            finally:
+                with self._capital_planner_lock:
+                    self._capital_planner_running = False
+                    self._capital_planner_thread = None
+                self._refresh_capital_planner_cache(time.time(), force=True)
+
+        th = threading.Thread(target=_worker, name="pt-capital-planner", daemon=True)
+        self._capital_planner_thread = th
+        th.start()
+
+    def _capital_planner_tick(self, now: float, settings: Dict[str, Any]) -> None:
+        try:
+            now_f = float(now)
+        except Exception:
+            now_f = float(time.time())
+        if (now_f - float(self._capital_planner_last_tick_at or 0.0)) < 10.0:
+            return
+        self._capital_planner_last_tick_at = float(now_f)
+        with self._capital_planner_lock:
+            if self._capital_planner_thread is not None and (not self._capital_planner_thread.is_alive()):
+                self._capital_planner_thread = None
+                self._capital_planner_running = False
+        cfg = settings if isinstance(settings, dict) else {}
+        if not bool(cfg.get("openai_capital_planner_enabled", False)):
+            self._set_disabled_cached_status(
+                cache_attr="_capital_planner_cached_status",
+                refresh_attr="_capital_planner_last_refresh_at",
+                running=bool(self._capital_planner_running),
+                summary="AI capital planner disabled.",
+                now=now_f,
+            )
+            return
+        if self._capital_planner_running:
+            return
+        cached = self._refresh_capital_planner_cache(now_f)
+        try:
+            interval_s = float(
+                max(
+                    30.0,
+                    min(OPENAI_SCHEDULE_MAX_INTERVAL_S, float(cfg.get("openai_capital_planner_interval_s", 180.0) or 180.0)),
+                )
+            )
+        except Exception:
+            interval_s = 180.0
+        interval_s = self._openai_effective_interval_s(
+            service="capital_planner",
+            cached=cached,
+            base_interval_s=interval_s,
+            last_launch_ts=self._capital_planner_last_launch_ts,
+            now=now_f,
+        )
+        last_attempt_ts = int(max(0.0, _f(cached.get("last_attempt_ts", 0), 0.0)))
+        last_completed_ts = int(max(0.0, _f(cached.get("last_completed_ts", 0), 0.0)))
+        last_ref = max(last_attempt_ts, last_completed_ts, int(max(0.0, self._capital_planner_last_launch_ts)))
+        if last_ref > 0 and (now_f - float(last_ref)) < float(interval_s):
+            return
+        if not self._openai_can_launch_service(service="capital_planner", now=now_f, settings=cfg):
+            return
+        self._openai_mark_service_launch(service="capital_planner", now=now_f)
+        self._start_capital_planner_async(cfg, now_f)
+
+    def _refresh_root_cause_cache(self, now: float, force: bool = False) -> Dict[str, Any]:
+        try:
+            cur_now = float(now)
+        except Exception:
+            cur_now = float(time.time())
+        if (not force) and (cur_now - float(self._root_cause_last_refresh_at or 0.0)) < 3.0:
+            return dict(self._root_cause_cached_status)
+        status = _safe_read_json(OPENAI_ROOT_CAUSE_STATUS_PATH)
+        report = _safe_read_json(OPENAI_ROOT_CAUSE_REPORT_PATH)
+        merged: Dict[str, Any] = {}
+        if isinstance(status, dict):
+            merged.update(status)
+        if isinstance(report, dict):
+            if (not str(merged.get("summary", "") or "").strip()) and str(report.get("summary", "") or "").strip():
+                merged["summary"] = str(report.get("summary", "") or "").strip()
+            if (not str(merged.get("overall_assessment", "") or "").strip()) and str(report.get("overall_assessment", "") or "").strip():
+                merged["overall_assessment"] = str(report.get("overall_assessment", "") or "").strip()
+            if not isinstance(merged.get("market_diagnoses", []), list):
+                merged["market_diagnoses"] = list(report.get("market_diagnoses", []) or []) if isinstance(report.get("market_diagnoses", []), list) else []
+            if not isinstance(merged.get("throttle_recommendations", []), list):
+                merged["throttle_recommendations"] = list(report.get("throttle_recommendations", []) or []) if isinstance(report.get("throttle_recommendations", []), list) else []
+            if not isinstance(merged.get("global_risks", []), list):
+                merged["global_risks"] = list(report.get("global_risks", []) or []) if isinstance(report.get("global_risks", []), list) else []
+        merged["running"] = bool(self._root_cause_running)
+        self._root_cause_cached_status = dict(merged)
+        self._root_cause_last_refresh_at = float(cur_now)
+        return dict(merged)
+
+    def _root_cause_runtime_payload(self, settings: Dict[str, Any], now: float) -> Dict[str, Any]:
+        cfg = settings if isinstance(settings, dict) else {}
+        enabled = bool(cfg.get("openai_root_cause_enabled", False))
+        if not enabled:
+            row = self._set_disabled_cached_status(
+                cache_attr="_root_cause_cached_status",
+                refresh_attr="_root_cause_last_refresh_at",
+                running=bool(self._root_cause_running),
+                summary="AI root-cause analysis disabled.",
+                now=now,
+            )
+        else:
+            row = self._refresh_root_cause_cache(now)
+        status = str(row.get("status", "disabled" if not enabled else "idle") or ("disabled" if not enabled else "idle")).strip().lower()
+        summary = str(row.get("summary", "") or "").strip()
+        market_rows = row.get("market_diagnoses", []) if isinstance(row.get("market_diagnoses", []), list) else []
+        throttle_rows = row.get("throttle_recommendations", []) if isinstance(row.get("throttle_recommendations", []), list) else []
+        risks = row.get("global_risks", []) if isinstance(row.get("global_risks", []), list) else []
+        return {
+            "enabled": bool(enabled),
+            "running": bool(self._root_cause_running),
+            "status": status[:48],
+            "summary": summary[:260],
+            "overall_assessment": str(row.get("overall_assessment", "") or "").strip().lower(),
+            "last_attempt_ts": int(max(0.0, _f(row.get("last_attempt_ts", 0), 0.0))),
+            "last_completed_ts": int(max(0.0, _f(row.get("last_completed_ts", 0), 0.0))),
+            "date_local": str(row.get("date_local", "") or ""),
+            "model": str(row.get("model", cfg.get("openai_root_cause_model", cfg.get("openai_model", "gpt-5.4-mini"))) or ""),
+            "interval_s": float(max(0.0, _f(cfg.get("openai_root_cause_interval_s", 240.0), 240.0))),
+            "timeout_s": float(max(0.0, _f(row.get("timeout_s", cfg.get("openai_root_cause_timeout_s", 8.0)), 8.0))),
+            "max_incidents": int(max(0.0, _f(row.get("max_incidents", cfg.get("openai_root_cause_max_incidents", 300)), 0.0))),
+            "latency_ms": int(max(0.0, _f(row.get("latency_ms", 0), 0.0))),
+            "market_diagnoses": [dict(item) for item in market_rows[:12] if isinstance(item, dict)],
+            "throttle_recommendations": [dict(item) for item in throttle_rows[:12] if isinstance(item, dict)],
+            "global_risks": [str(x or "")[:120] for x in risks[:12] if str(x or "").strip()],
+            "error": str(row.get("error", "") or "")[:180],
+        }
+
+    def _start_root_cause_async(self, settings: Dict[str, Any], now: float) -> None:
+        with self._root_cause_lock:
+            if self._root_cause_running:
+                return
+            cfg = dict(settings if isinstance(settings, dict) else {})
+            self._root_cause_running = True
+            self._root_cause_last_launch_ts = float(now)
+
+        def _worker() -> None:
+            try:
+                _runner_log("root-cause: starting asynchronous OpenAI root-cause analysis")
+                result = run_openai_root_cause_analysis(
+                    settings=cfg,
+                    base_dir=BASE_DIR,
+                    hub_dir=HUB_DATA_DIR,
+                    now_ts_value=int(max(0.0, float(now))),
+                )
+                status = str(result.get("status", "") or "").strip().lower()
+                if status == "ok":
+                    _runner_log("root-cause: completed successfully")
+                else:
+                    _runner_log(f"root-cause: completed with status={status or 'unknown'}")
+                    self._append_openai_status_incident(
+                        event="openai_root_cause_status",
+                        status=status,
+                        message=f"OpenAI root-cause analysis completed with status={status or 'unknown'}",
+                        error=str(result.get("error", "") or ""),
+                    )
+            except Exception as exc:
+                msg = f"root-cause failed: {type(exc).__name__}: {exc}"
+                _runner_log(msg)
+                _append_incident(
+                    "warning",
+                    "openai_root_cause_error",
+                    msg,
+                    {"component": "runner"},
+                )
+                fallback = {
+                    "ts": int(time.time()),
+                    "enabled": bool(cfg.get("openai_root_cause_enabled", False)),
+                    "running": False,
+                    "status": "runner_exception",
+                    "summary": "AI root-cause analysis failed; local diagnostics remain active.",
+                    "error": str(exc)[:180],
+                    "last_attempt_ts": int(time.time()),
+                    "last_completed_ts": int(time.time()),
+                    "date_local": time.strftime("%Y-%m-%d", time.localtime(time.time())),
+                    "report_path": OPENAI_ROOT_CAUSE_REPORT_PATH,
+                    "report_written": False,
+                }
+                try:
+                    _atomic_write_json(OPENAI_ROOT_CAUSE_STATUS_PATH, fallback)
+                except Exception:
+                    pass
+            finally:
+                with self._root_cause_lock:
+                    self._root_cause_running = False
+                    self._root_cause_thread = None
+                self._refresh_root_cause_cache(time.time(), force=True)
+
+        th = threading.Thread(target=_worker, name="pt-root-cause", daemon=True)
+        self._root_cause_thread = th
+        th.start()
+
+    def _root_cause_tick(self, now: float, settings: Dict[str, Any]) -> None:
+        try:
+            now_f = float(now)
+        except Exception:
+            now_f = float(time.time())
+        if (now_f - float(self._root_cause_last_tick_at or 0.0)) < 10.0:
+            return
+        self._root_cause_last_tick_at = float(now_f)
+        with self._root_cause_lock:
+            if self._root_cause_thread is not None and (not self._root_cause_thread.is_alive()):
+                self._root_cause_thread = None
+                self._root_cause_running = False
+        cfg = settings if isinstance(settings, dict) else {}
+        if not bool(cfg.get("openai_root_cause_enabled", False)):
+            self._set_disabled_cached_status(
+                cache_attr="_root_cause_cached_status",
+                refresh_attr="_root_cause_last_refresh_at",
+                running=bool(self._root_cause_running),
+                summary="AI root-cause analysis disabled.",
+                now=now_f,
+            )
+            return
+        if self._root_cause_running:
+            return
+        cached = self._refresh_root_cause_cache(now_f)
+        try:
+            interval_s = float(
+                max(
+                    30.0,
+                    min(OPENAI_SCHEDULE_MAX_INTERVAL_S, float(cfg.get("openai_root_cause_interval_s", 240.0) or 240.0)),
+                )
+            )
+        except Exception:
+            interval_s = 240.0
+        interval_s = self._openai_effective_interval_s(
+            service="root_cause",
+            cached=cached,
+            base_interval_s=interval_s,
+            last_launch_ts=self._root_cause_last_launch_ts,
+            now=now_f,
+        )
+        last_attempt_ts = int(max(0.0, _f(cached.get("last_attempt_ts", 0), 0.0)))
+        last_completed_ts = int(max(0.0, _f(cached.get("last_completed_ts", 0), 0.0)))
+        last_ref = max(last_attempt_ts, last_completed_ts, int(max(0.0, self._root_cause_last_launch_ts)))
+        if last_ref > 0 and (now_f - float(last_ref)) < float(interval_s):
+            return
+        if not self._openai_can_launch_service(service="root_cause", now=now_f, settings=cfg):
+            return
+        self._openai_mark_service_launch(service="root_cause", now=now_f)
+        self._start_root_cause_async(cfg, now_f)
+
+    def _refresh_strategy_optimizer_cache(self, now: float, force: bool = False) -> Dict[str, Any]:
+        try:
+            cur_now = float(now)
+        except Exception:
+            cur_now = float(time.time())
+        if (not force) and (cur_now - float(self._strategy_optimizer_last_refresh_at or 0.0)) < 3.0:
+            return dict(self._strategy_optimizer_cached_status)
+        status = _safe_read_json(OPENAI_STRATEGY_OPTIMIZER_STATUS_PATH)
+        report = _safe_read_json(OPENAI_STRATEGY_OPTIMIZER_REPORT_PATH)
+        merged: Dict[str, Any] = {}
+        if isinstance(status, dict):
+            merged.update(status)
+        if isinstance(report, dict):
+            if (not str(merged.get("summary", "") or "").strip()) and str(report.get("summary", "") or "").strip():
+                merged["summary"] = str(report.get("summary", "") or "").strip()
+            if not isinstance(merged.get("preset_assessment", {}), dict):
+                merged["preset_assessment"] = (
+                    dict(report.get("preset_assessment", {}) or {})
+                    if isinstance(report.get("preset_assessment", {}), dict)
+                    else {}
+                )
+            if not isinstance(merged.get("strategy_suggestions", []), list):
+                merged["strategy_suggestions"] = (
+                    list(report.get("strategy_suggestions", []) or [])
+                    if isinstance(report.get("strategy_suggestions", []), list)
+                    else []
+                )
+            if int(merged.get("strategy_suggestions_count", 0) or 0) <= 0:
+                rows = report.get("strategy_suggestions", []) if isinstance(report.get("strategy_suggestions", []), list) else []
+                merged["strategy_suggestions_count"] = int(len([row for row in rows if isinstance(row, dict)]))
+            if not isinstance(merged.get("risk_flags", []), list):
+                merged["risk_flags"] = list(report.get("risk_flags", []) or []) if isinstance(report.get("risk_flags", []), list) else []
+        merged["running"] = bool(self._strategy_optimizer_running)
+        self._strategy_optimizer_cached_status = dict(merged)
+        self._strategy_optimizer_last_refresh_at = float(cur_now)
+        return dict(merged)
+
+    def _strategy_optimizer_runtime_payload(self, settings: Dict[str, Any], now: float) -> Dict[str, Any]:
+        cfg = settings if isinstance(settings, dict) else {}
+        enabled = bool(cfg.get("openai_strategy_optimizer_enabled", False))
+        if not enabled:
+            row = self._set_disabled_cached_status(
+                cache_attr="_strategy_optimizer_cached_status",
+                refresh_attr="_strategy_optimizer_last_refresh_at",
+                running=bool(self._strategy_optimizer_running),
+                summary="AI strategy optimizer disabled.",
+                now=now,
+            )
+        else:
+            row = self._refresh_strategy_optimizer_cache(now)
+        status = str(row.get("status", "disabled" if not enabled else "idle") or ("disabled" if not enabled else "idle")).strip().lower()
+        summary = str(row.get("summary", "") or "").strip()
+        assessment = row.get("preset_assessment", {}) if isinstance(row.get("preset_assessment", {}), dict) else {}
+        suggestions = row.get("strategy_suggestions", []) if isinstance(row.get("strategy_suggestions", []), list) else []
+        applied_tuning = row.get("applied_tuning", []) if isinstance(row.get("applied_tuning", []), list) else []
+        risk_flags = row.get("risk_flags", []) if isinstance(row.get("risk_flags", []), list) else []
+        return {
+            "enabled": bool(enabled),
+            "running": bool(self._strategy_optimizer_running),
+            "status": status[:48],
+            "summary": summary[:260],
+            "last_attempt_ts": int(max(0.0, _f(row.get("last_attempt_ts", 0), 0.0))),
+            "last_completed_ts": int(max(0.0, _f(row.get("last_completed_ts", 0), 0.0))),
+            "date_local": str(row.get("date_local", "") or ""),
+            "model": str(row.get("model", cfg.get("openai_strategy_optimizer_model", cfg.get("openai_model", "gpt-5.4-mini"))) or ""),
+            "interval_s": float(max(0.0, _f(cfg.get("openai_strategy_optimizer_interval_s", 3600.0), 3600.0))),
+            "timeout_s": float(max(0.0, _f(row.get("timeout_s", cfg.get("openai_strategy_optimizer_timeout_s", 8.0)), 8.0))),
+            "auto_apply_enabled": bool(row.get("auto_apply_enabled", cfg.get("openai_strategy_optimizer_auto_apply_enabled", False))),
+            "advisory_only": bool(row.get("advisory_only", True)),
+            "latency_ms": int(max(0.0, _f(row.get("latency_ms", 0), 0.0))),
+            "preset_assessment": dict(assessment),
+            "strategy_suggestions_count": int(max(0.0, _f(row.get("strategy_suggestions_count", 0), 0.0))),
+            "validated_suggestions_count": int(max(0.0, _f(row.get("validated_suggestions_count", 0), 0.0))),
+            "applied_tuning_count": int(max(0.0, _f(row.get("applied_tuning_count", 0), 0.0))),
+            "persisted_verified_count": int(max(0.0, _f(row.get("persisted_verified_count", 0), 0.0))),
+            "applied_tuning": [
+                {
+                    "setting_key": str(item.get("setting_key", "") or "").strip(),
+                    "old_value": item.get("old_value"),
+                    "new_value": item.get("new_value"),
+                    "confidence": round(max(0.0, _f(item.get("confidence", 0.0), 0.0)), 6),
+                    "reason": str(item.get("reason", "") or "").strip()[:180],
+                }
+                for item in applied_tuning[:12]
+                if isinstance(item, dict) and str(item.get("setting_key", "") or "").strip()
+            ],
+            "strategy_suggestions": [
+                {
+                    "setting_key": str(item.get("setting_key", "") or "").strip(),
+                    "suggested_value": item.get("suggested_value"),
+                    "confidence": round(max(0.0, _f(item.get("confidence", 0.0), 0.0)), 6),
+                    "reason": str(item.get("reason", "") or "").strip()[:180],
+                }
+                for item in suggestions[:18]
+                if isinstance(item, dict)
+            ],
+            "risk_flags": [str(x or "")[:120] for x in risk_flags[:12] if str(x or "").strip()],
+            "error": str(row.get("error", "") or "")[:180],
+        }
+
+    def _start_strategy_optimizer_async(self, settings: Dict[str, Any], now: float) -> None:
+        with self._strategy_optimizer_lock:
+            if self._strategy_optimizer_running:
+                return
+            cfg = dict(settings if isinstance(settings, dict) else {})
+            self._strategy_optimizer_running = True
+            self._strategy_optimizer_last_launch_ts = float(now)
+
+        def _worker() -> None:
+            try:
+                _runner_log("strategy optimizer: starting asynchronous OpenAI strategy optimizer")
+                result = run_openai_strategy_optimizer(
+                    settings=cfg,
+                    base_dir=BASE_DIR,
+                    hub_dir=HUB_DATA_DIR,
+                    now_ts_value=int(max(0.0, float(now))),
+                )
+                status = str(result.get("status", "") or "").strip().lower()
+                if status == "ok":
+                    _runner_log("strategy optimizer: completed successfully")
+                elif status in {"disabled", "live_disabled", "missing_api_key", "idle", "not_requested"}:
+                    _runner_log(f"strategy optimizer: status={status or 'unknown'}")
+                else:
+                    _runner_log(f"strategy optimizer: completed with status={status or 'unknown'}")
+                    self._append_openai_status_incident(
+                        event="openai_strategy_optimizer_status",
+                        status=status,
+                        message=f"OpenAI strategy optimizer completed with status={status or 'unknown'}",
+                        error=str(result.get("error", "") or ""),
+                    )
+            except Exception as exc:
+                msg = f"strategy optimizer failed: {type(exc).__name__}: {exc}"
+                _runner_log(msg)
+                _append_incident(
+                    "warning",
+                    "openai_strategy_optimizer_error",
+                    msg,
+                    {"component": "runner"},
+                )
+                fallback = {
+                    "ts": int(time.time()),
+                    "enabled": bool(cfg.get("openai_strategy_optimizer_enabled", False)),
+                    "running": False,
+                    "status": "runner_exception",
+                    "summary": "AI strategy optimizer failed; local strategy remains unchanged.",
+                    "error": str(exc)[:180],
+                    "last_attempt_ts": int(time.time()),
+                    "last_completed_ts": int(time.time()),
+                    "date_local": time.strftime("%Y-%m-%d", time.localtime(time.time())),
+                    "report_path": OPENAI_STRATEGY_OPTIMIZER_REPORT_PATH,
+                    "report_written": False,
+                }
+                try:
+                    _atomic_write_json(OPENAI_STRATEGY_OPTIMIZER_STATUS_PATH, fallback)
+                except Exception:
+                    pass
+            finally:
+                with self._strategy_optimizer_lock:
+                    self._strategy_optimizer_running = False
+                    self._strategy_optimizer_thread = None
+                self._refresh_strategy_optimizer_cache(time.time(), force=True)
+
+        th = threading.Thread(target=_worker, name="pt-strategy-optimizer", daemon=True)
+        self._strategy_optimizer_thread = th
+        th.start()
+
+    def _strategy_optimizer_tick(self, now: float, settings: Dict[str, Any]) -> None:
+        try:
+            now_f = float(now)
+        except Exception:
+            now_f = float(time.time())
+        if (now_f - float(self._strategy_optimizer_last_tick_at or 0.0)) < 10.0:
+            return
+        self._strategy_optimizer_last_tick_at = float(now_f)
+        with self._strategy_optimizer_lock:
+            if self._strategy_optimizer_thread is not None and (not self._strategy_optimizer_thread.is_alive()):
+                self._strategy_optimizer_thread = None
+                self._strategy_optimizer_running = False
+        cfg = settings if isinstance(settings, dict) else {}
+        if not bool(cfg.get("openai_strategy_optimizer_enabled", False)):
+            self._set_disabled_cached_status(
+                cache_attr="_strategy_optimizer_cached_status",
+                refresh_attr="_strategy_optimizer_last_refresh_at",
+                running=bool(self._strategy_optimizer_running),
+                summary="AI strategy optimizer disabled.",
+                now=now_f,
+            )
+            return
+        if self._strategy_optimizer_running:
+            return
+        cached = self._refresh_strategy_optimizer_cache(now_f)
+        try:
+            interval_s = float(
+                max(
+                    30.0,
+                    min(
+                        OPENAI_SCHEDULE_MAX_INTERVAL_S,
+                        float(cfg.get("openai_strategy_optimizer_interval_s", 3600.0) or 3600.0),
+                    ),
+                )
+            )
+        except Exception:
+            interval_s = 3600.0
+        interval_s = self._openai_effective_interval_s(
+            service="strategy_optimizer",
+            cached=cached,
+            base_interval_s=interval_s,
+            last_launch_ts=self._strategy_optimizer_last_launch_ts,
+            now=now_f,
+        )
+        last_attempt_ts = int(max(0.0, _f(cached.get("last_attempt_ts", 0), 0.0)))
+        last_completed_ts = int(max(0.0, _f(cached.get("last_completed_ts", 0), 0.0)))
+        last_ref = max(last_attempt_ts, last_completed_ts, int(max(0.0, self._strategy_optimizer_last_launch_ts)))
+        if last_ref > 0 and (now_f - float(last_ref)) < float(interval_s):
+            return
+        if not self._openai_can_launch_service(service="strategy_optimizer", now=now_f, settings=cfg):
+            return
+        self._openai_mark_service_launch(service="strategy_optimizer", now=now_f)
+        self._start_strategy_optimizer_async(cfg, now_f)
+
+    def _refresh_explanations_cache(self, now: float, force: bool = False) -> Dict[str, Any]:
+        try:
+            cur_now = float(now)
+        except Exception:
+            cur_now = float(time.time())
+        if (not force) and (cur_now - float(self._explanations_last_refresh_at or 0.0)) < 3.0:
+            return dict(self._explanations_cached_status)
+        status = _safe_read_json(OPENAI_EXPLANATIONS_STATUS_PATH)
+        report = _safe_read_json(OPENAI_EXPLANATIONS_REPORT_PATH)
+        merged: Dict[str, Any] = {}
+        if isinstance(status, dict):
+            merged.update(status)
+        if isinstance(report, dict):
+            if (not str(merged.get("summary", "") or "").strip()) and str(report.get("summary", "") or "").strip():
+                merged["summary"] = str(report.get("summary", "") or "").strip()
+            if not isinstance(merged.get("items", []), list):
+                merged["items"] = list(report.get("items", []) or []) if isinstance(report.get("items", []), list) else []
+            if int(merged.get("items_count", 0) or 0) <= 0:
+                merged["items_count"] = int(
+                    len([row for row in list(report.get("items", []) or []) if isinstance(row, dict)])
+                )
+        merged["running"] = bool(self._explanations_running)
+        self._explanations_cached_status = dict(merged)
+        self._explanations_last_refresh_at = float(cur_now)
+        return dict(merged)
+
+    def _explanations_runtime_payload(self, settings: Dict[str, Any], now: float) -> Dict[str, Any]:
+        cfg = settings if isinstance(settings, dict) else {}
+        enabled = bool(cfg.get("openai_explanations_enabled", False))
+        if not enabled:
+            row = self._set_disabled_cached_status(
+                cache_attr="_explanations_cached_status",
+                refresh_attr="_explanations_last_refresh_at",
+                running=bool(self._explanations_running),
+                summary="AI explanations disabled.",
+                now=now,
+            )
+        else:
+            row = self._refresh_explanations_cache(now)
+        status = str(
+            row.get("status", "disabled" if not enabled else "idle") or ("disabled" if not enabled else "idle")
+        ).strip().lower()
+        summary = str(row.get("summary", "") or "").strip()
+        items = row.get("items", []) if isinstance(row.get("items", []), list) else []
+        return {
+            "enabled": bool(enabled),
+            "running": bool(self._explanations_running),
+            "status": status[:48],
+            "summary": summary[:260],
+            "last_attempt_ts": int(max(0.0, _f(row.get("last_attempt_ts", 0), 0.0))),
+            "last_completed_ts": int(max(0.0, _f(row.get("last_completed_ts", 0), 0.0))),
+            "date_local": str(row.get("date_local", "") or ""),
+            "model": str(
+                row.get(
+                    "model",
+                    cfg.get("openai_explanations_model", cfg.get("openai_model", "gpt-5.4-mini")),
+                )
+                or ""
+            ),
+            "timeout_s": float(
+                max(0.0, _f(row.get("timeout_s", cfg.get("openai_explanations_timeout_s", 6.0)), 6.0))
+            ),
+            "max_items": int(max(0.0, _f(row.get("max_items", cfg.get("openai_explanations_max_items", 18)), 0.0))),
+            "items_count": int(max(0.0, _f(row.get("items_count", 0), 0.0))),
+            "latency_ms": int(max(0.0, _f(row.get("latency_ms", 0), 0.0))),
+            "items": [dict(item) for item in items[:18] if isinstance(item, dict)],
+            "error": str(row.get("error", "") or "")[:180],
+        }
+
+    def _start_explanations_async(self, settings: Dict[str, Any], now: float) -> None:
+        with self._explanations_lock:
+            if self._explanations_running:
+                return
+            cfg = dict(settings if isinstance(settings, dict) else {})
+            self._explanations_running = True
+            self._explanations_last_launch_ts = float(now)
+
+        def _worker() -> None:
+            try:
+                _runner_log("explanations: starting asynchronous OpenAI explanation generation")
+                result = run_openai_explanations(
+                    settings=cfg,
+                    base_dir=BASE_DIR,
+                    hub_dir=HUB_DATA_DIR,
+                    now_ts_value=int(max(0.0, float(now))),
+                )
+                status = str(result.get("status", "") or "").strip().lower()
+                if status == "ok":
+                    _runner_log("explanations: completed successfully")
+                elif status in {"no_candidates", "disabled", "live_disabled", "idle", "not_requested"}:
+                    _runner_log(f"explanations: status={status or 'unknown'}")
+                else:
+                    _runner_log(f"explanations: completed with status={status or 'unknown'}")
+                    self._append_openai_status_incident(
+                        event="openai_explanations_status",
+                        status=status,
+                        message=f"OpenAI explanations completed with status={status or 'unknown'}",
+                        error=str(result.get("error", "") or ""),
+                    )
+            except Exception as exc:
+                msg = f"explanations failed: {type(exc).__name__}: {exc}"
+                _runner_log(msg)
+                _append_incident(
+                    "warning",
+                    "openai_explanations_error",
+                    msg,
+                    {"component": "runner"},
+                )
+                fallback = {
+                    "ts": int(time.time()),
+                    "enabled": bool(cfg.get("openai_explanations_enabled", False)),
+                    "running": False,
+                    "status": "runner_exception",
+                    "summary": "AI explanations failed; local text remains active.",
+                    "error": str(exc)[:180],
+                    "last_attempt_ts": int(time.time()),
+                    "last_completed_ts": int(time.time()),
+                    "date_local": time.strftime("%Y-%m-%d", time.localtime(time.time())),
+                    "report_path": OPENAI_EXPLANATIONS_REPORT_PATH,
+                    "report_written": False,
+                }
+                try:
+                    _atomic_write_json(OPENAI_EXPLANATIONS_STATUS_PATH, fallback)
+                except Exception:
+                    pass
+            finally:
+                with self._explanations_lock:
+                    self._explanations_running = False
+                    self._explanations_thread = None
+                self._refresh_explanations_cache(time.time(), force=True)
+
+        th = threading.Thread(target=_worker, name="pt-explanations", daemon=True)
+        self._explanations_thread = th
+        th.start()
+
+    def _explanations_tick(self, now: float, settings: Dict[str, Any]) -> None:
+        try:
+            now_f = float(now)
+        except Exception:
+            now_f = float(time.time())
+        if (now_f - float(self._explanations_last_tick_at or 0.0)) < 10.0:
+            return
+        self._explanations_last_tick_at = float(now_f)
+        with self._explanations_lock:
+            if self._explanations_thread is not None and (not self._explanations_thread.is_alive()):
+                self._explanations_thread = None
+                self._explanations_running = False
+        cfg = settings if isinstance(settings, dict) else {}
+        if not bool(cfg.get("openai_explanations_enabled", False)):
+            self._set_disabled_cached_status(
+                cache_attr="_explanations_cached_status",
+                refresh_attr="_explanations_last_refresh_at",
+                running=bool(self._explanations_running),
+                summary="AI explanations disabled.",
+                now=now_f,
+            )
+            return
+        if self._explanations_running:
+            return
+        cached = self._refresh_explanations_cache(now_f)
+        try:
+            cfg_interval = float(cfg.get("openai_explanations_interval_s", OPENAI_EXPLANATIONS_MIN_INTERVAL_S) or OPENAI_EXPLANATIONS_MIN_INTERVAL_S)
+        except Exception:
+            cfg_interval = float(OPENAI_EXPLANATIONS_MIN_INTERVAL_S)
+        min_interval_s = float(
+            max(
+                OPENAI_EXPLANATIONS_MIN_INTERVAL_S,
+                min(OPENAI_SCHEDULE_MAX_INTERVAL_S, cfg_interval),
+            )
+        )
+        min_interval_s = self._openai_effective_interval_s(
+            service="explanations",
+            cached=cached,
+            base_interval_s=min_interval_s,
+            last_launch_ts=self._explanations_last_launch_ts,
+            now=now_f,
+        )
+        last_attempt_ts = int(max(0.0, _f(cached.get("last_attempt_ts", 0), 0.0)))
+        last_completed_ts = int(max(0.0, _f(cached.get("last_completed_ts", 0), 0.0)))
+        last_ref = max(last_attempt_ts, last_completed_ts, int(max(0.0, self._explanations_last_launch_ts)))
+        if last_ref > 0 and (now_f - float(last_ref)) < min_interval_s:
+            return
+        if not self._openai_can_launch_service(service="explanations", now=now_f, settings=cfg):
+            return
+        self._openai_mark_service_launch(service="explanations", now=now_f)
+        self._start_explanations_async(cfg, now_f)
+
+    def _refresh_market_context_cache(self, now: float, force: bool = False) -> Dict[str, Any]:
+        try:
+            cur_now = float(now)
+        except Exception:
+            cur_now = float(time.time())
+        if (not force) and (cur_now - float(self._market_context_last_refresh_at or 0.0)) < 3.0:
+            return dict(self._market_context_cached_status)
+        status = _safe_read_json(OPENAI_MARKET_CONTEXT_STATUS_PATH)
+        report = _safe_read_json(OPENAI_MARKET_CONTEXT_REPORT_PATH)
+        merged: Dict[str, Any] = {}
+        if isinstance(status, dict):
+            merged.update(status)
+        if isinstance(report, dict):
+            if (not str(merged.get("summary", "") or "").strip()) and str(report.get("summary", "") or "").strip():
+                merged["summary"] = str(report.get("summary", "") or "").strip()
+            if not isinstance(merged.get("market_context_scores", []), list):
+                merged["market_context_scores"] = (
+                    list(report.get("market_context_scores", []) or [])
+                    if isinstance(report.get("market_context_scores", []), list)
+                    else []
+                )
+            if not isinstance(merged.get("symbol_context_scores", []), list):
+                merged["symbol_context_scores"] = (
+                    list(report.get("symbol_context_scores", []) or [])
+                    if isinstance(report.get("symbol_context_scores", []), list)
+                    else []
+                )
+            if not isinstance(merged.get("by_market", {}), dict):
+                merged["by_market"] = (
+                    dict(report.get("by_market", {}) or {})
+                    if isinstance(report.get("by_market", {}), dict)
+                    else {}
+                )
+            if not isinstance(merged.get("by_symbol", {}), dict):
+                merged["by_symbol"] = (
+                    dict(report.get("by_symbol", {}) or {})
+                    if isinstance(report.get("by_symbol", {}), dict)
+                    else {}
+                )
+        merged["running"] = bool(self._market_context_running)
+        self._market_context_cached_status = dict(merged)
+        self._market_context_last_refresh_at = float(cur_now)
+        return dict(merged)
+
+    def _market_context_runtime_payload(self, settings: Dict[str, Any], now: float) -> Dict[str, Any]:
+        cfg = settings if isinstance(settings, dict) else {}
+        enabled = bool(cfg.get("openai_market_context_enabled", False))
+        if not enabled:
+            row = self._set_disabled_cached_status(
+                cache_attr="_market_context_cached_status",
+                refresh_attr="_market_context_last_refresh_at",
+                running=bool(self._market_context_running),
+                summary="AI market context scoring disabled.",
+                now=now,
+            )
+        else:
+            row = self._refresh_market_context_cache(now)
+        status = str(
+            row.get("status", "disabled" if not enabled else "idle") or ("disabled" if not enabled else "idle")
+        ).strip().lower()
+        summary = str(row.get("summary", "") or "").strip()
+        by_market = row.get("by_market", {}) if isinstance(row.get("by_market", {}), dict) else {}
+        if not by_market:
+            market_rows = row.get("market_context_scores", []) if isinstance(row.get("market_context_scores", []), list) else []
+            by_market = {
+                str(item.get("market", "") or "").strip().lower(): dict(item)
+                for item in market_rows
+                if isinstance(item, dict) and str(item.get("market", "") or "").strip()
+            }
+        symbol_rows = row.get("symbol_context_scores", []) if isinstance(row.get("symbol_context_scores", []), list) else []
+        return {
+            "enabled": bool(enabled),
+            "running": bool(self._market_context_running),
+            "status": status[:48],
+            "summary": summary[:260],
+            "last_attempt_ts": int(max(0.0, _f(row.get("last_attempt_ts", 0), 0.0))),
+            "last_completed_ts": int(max(0.0, _f(row.get("last_completed_ts", 0), 0.0))),
+            "date_local": str(row.get("date_local", "") or ""),
+            "model": str(
+                row.get(
+                    "model",
+                    cfg.get("openai_market_context_model", cfg.get("openai_model", "gpt-5.4-mini")),
+                )
+                or ""
+            ),
+            "interval_s": float(max(0.0, _f(cfg.get("openai_market_context_interval_s", 300.0), 300.0))),
+            "timeout_s": float(
+                max(0.0, _f(row.get("timeout_s", cfg.get("openai_market_context_timeout_s", 6.0)), 6.0))
+            ),
+            "max_items": int(max(0.0, _f(row.get("max_items", cfg.get("openai_market_context_max_items", 24)), 0.0))),
+            "latency_ms": int(max(0.0, _f(row.get("latency_ms", 0), 0.0))),
+            "market_context_scores": [dict(item) for item in list(row.get("market_context_scores", []) or [])[:12] if isinstance(item, dict)],
+            "symbol_context_scores": [dict(item) for item in symbol_rows[:48] if isinstance(item, dict)],
+            "by_market": dict(by_market),
+            "error": str(row.get("error", "") or "")[:180],
+        }
+
+    def _start_market_context_async(self, settings: Dict[str, Any], now: float) -> None:
+        with self._market_context_lock:
+            if self._market_context_running:
+                return
+            cfg = dict(settings if isinstance(settings, dict) else {})
+            self._market_context_running = True
+            self._market_context_last_launch_ts = float(now)
+
+        def _worker() -> None:
+            try:
+                _runner_log("market-context: starting asynchronous OpenAI market context scoring")
+                result = run_openai_market_context(
+                    settings=cfg,
+                    base_dir=BASE_DIR,
+                    hub_dir=HUB_DATA_DIR,
+                    now_ts_value=int(max(0.0, float(now))),
+                )
+                status = str(result.get("status", "") or "").strip().lower()
+                if status == "ok":
+                    _runner_log("market-context: completed successfully")
+                elif status in {"disabled", "live_disabled", "missing_api_key", "idle", "not_requested"}:
+                    _runner_log(f"market-context: status={status or 'unknown'}")
+                else:
+                    _runner_log(f"market-context: completed with status={status or 'unknown'}")
+                    self._append_openai_status_incident(
+                        event="openai_market_context_status",
+                        status=status,
+                        message=f"OpenAI market context completed with status={status or 'unknown'}",
+                        error=str(result.get("error", "") or ""),
+                    )
+            except Exception as exc:
+                msg = f"market-context failed: {type(exc).__name__}: {exc}"
+                _runner_log(msg)
+                _append_incident(
+                    "warning",
+                    "openai_market_context_error",
+                    msg,
+                    {"component": "runner"},
+                )
+                fallback = {
+                    "ts": int(time.time()),
+                    "enabled": bool(cfg.get("openai_market_context_enabled", False)),
+                    "running": False,
+                    "status": "runner_exception",
+                    "summary": "AI market context failed; local ranking remains active.",
+                    "error": str(exc)[:180],
+                    "last_attempt_ts": int(time.time()),
+                    "last_completed_ts": int(time.time()),
+                    "date_local": time.strftime("%Y-%m-%d", time.localtime(time.time())),
+                    "report_path": OPENAI_MARKET_CONTEXT_REPORT_PATH,
+                    "report_written": False,
+                }
+                try:
+                    _atomic_write_json(OPENAI_MARKET_CONTEXT_STATUS_PATH, fallback)
+                except Exception:
+                    pass
+            finally:
+                with self._market_context_lock:
+                    self._market_context_running = False
+                    self._market_context_thread = None
+                self._refresh_market_context_cache(time.time(), force=True)
+
+        th = threading.Thread(target=_worker, name="pt-market-context", daemon=True)
+        self._market_context_thread = th
+        th.start()
+
+    def _market_context_tick(self, now: float, settings: Dict[str, Any]) -> None:
+        try:
+            now_f = float(now)
+        except Exception:
+            now_f = float(time.time())
+        if (now_f - float(self._market_context_last_tick_at or 0.0)) < 10.0:
+            return
+        self._market_context_last_tick_at = float(now_f)
+        with self._market_context_lock:
+            if self._market_context_thread is not None and (not self._market_context_thread.is_alive()):
+                self._market_context_thread = None
+                self._market_context_running = False
+        cfg = settings if isinstance(settings, dict) else {}
+        if not bool(cfg.get("openai_market_context_enabled", False)):
+            self._set_disabled_cached_status(
+                cache_attr="_market_context_cached_status",
+                refresh_attr="_market_context_last_refresh_at",
+                running=bool(self._market_context_running),
+                summary="AI market context scoring disabled.",
+                now=now_f,
+            )
+            return
+        if self._market_context_running:
+            return
+        cached = self._refresh_market_context_cache(now_f)
+        try:
+            interval_s = float(
+                max(
+                    30.0,
+                    min(OPENAI_SCHEDULE_MAX_INTERVAL_S, float(cfg.get("openai_market_context_interval_s", 300.0) or 300.0)),
+                )
+            )
+        except Exception:
+            interval_s = 300.0
+        interval_s = self._openai_effective_interval_s(
+            service="market_context",
+            cached=cached,
+            base_interval_s=interval_s,
+            last_launch_ts=self._market_context_last_launch_ts,
+            now=now_f,
+        )
+        last_attempt_ts = int(max(0.0, _f(cached.get("last_attempt_ts", 0), 0.0)))
+        last_completed_ts = int(max(0.0, _f(cached.get("last_completed_ts", 0), 0.0)))
+        last_ref = max(last_attempt_ts, last_completed_ts, int(max(0.0, self._market_context_last_launch_ts)))
+        if last_ref > 0 and (now_f - float(last_ref)) < float(interval_s):
+            return
+        if not self._openai_can_launch_service(service="market_context", now=now_f, settings=cfg):
+            return
+        self._openai_mark_service_launch(service="market_context", now=now_f)
+        self._start_market_context_async(cfg, now_f)
+
+    def _refresh_postmortem_cache(self, now: float, force: bool = False) -> Dict[str, Any]:
+        try:
+            cur_now = float(now)
+        except Exception:
+            cur_now = float(time.time())
+        if (not force) and (cur_now - float(self._postmortem_last_refresh_at or 0.0)) < 3.0:
+            return dict(self._postmortem_cached_status)
+        status = _safe_read_json(OPENAI_POSTMORTEM_STATUS_PATH)
+        report = _safe_read_json(OPENAI_POSTMORTEM_REPORT_PATH)
+        merged: Dict[str, Any] = {}
+        if isinstance(status, dict):
+            merged.update(status)
+        if isinstance(report, dict):
+            if (not str(merged.get("summary", "") or "").strip()) and str(report.get("summary", "") or "").strip():
+                merged["summary"] = str(report.get("summary", "") or "").strip()
+            if not isinstance(merged.get("main_drags", []), list):
+                merged["main_drags"] = list(report.get("main_drags", []) or []) if isinstance(report.get("main_drags", []), list) else []
+            if not isinstance(merged.get("main_strengths", []), list):
+                merged["main_strengths"] = list(report.get("main_strengths", []) or []) if isinstance(report.get("main_strengths", []), list) else []
+            if not isinstance(merged.get("skip_recommendations", []), list):
+                merged["skip_recommendations"] = (
+                    list(report.get("skip_recommendations", []) or [])
+                    if isinstance(report.get("skip_recommendations", []), list)
+                    else []
+                )
+            if not isinstance(merged.get("exit_improvement_recommendations", []), list):
+                merged["exit_improvement_recommendations"] = (
+                    list(report.get("exit_improvement_recommendations", []) or [])
+                    if isinstance(report.get("exit_improvement_recommendations", []), list)
+                    else []
+                )
+            if not isinstance(merged.get("capital_reallocation_recommendations", []), list):
+                merged["capital_reallocation_recommendations"] = (
+                    list(report.get("capital_reallocation_recommendations", []) or [])
+                    if isinstance(report.get("capital_reallocation_recommendations", []), list)
+                    else []
+                )
+            if not isinstance(merged.get("tuning_suggestions", []), list):
+                merged["tuning_suggestions"] = (
+                    list(report.get("tuning_suggestions", []) or [])
+                    if isinstance(report.get("tuning_suggestions", []), list)
+                    else []
+                )
+            if int(merged.get("tuning_suggestions_count", 0) or 0) <= 0:
+                merged["tuning_suggestions_count"] = int(
+                    len([row for row in list(report.get("tuning_suggestions", []) or []) if isinstance(row, dict)])
+                )
+        merged["running"] = bool(self._postmortem_running)
+        self._postmortem_cached_status = dict(merged)
+        self._postmortem_last_refresh_at = float(cur_now)
+        return dict(merged)
+
+    def _postmortem_runtime_payload(self, settings: Dict[str, Any], now: float) -> Dict[str, Any]:
+        cfg = settings if isinstance(settings, dict) else {}
+        enabled = bool(cfg.get("openai_postmortem_enabled", False))
+        if not enabled:
+            row = self._set_disabled_cached_status(
+                cache_attr="_postmortem_cached_status",
+                refresh_attr="_postmortem_last_refresh_at",
+                running=bool(self._postmortem_running),
+                summary="AI postmortem analysis disabled.",
+                now=now,
+            )
+        else:
+            row = self._refresh_postmortem_cache(now)
+        status = str(
+            row.get("status", "disabled" if not enabled else "idle") or ("disabled" if not enabled else "idle")
+        ).strip().lower()
+        summary = str(row.get("summary", "") or "").strip()
+        applied_tuning = row.get("applied_tuning", []) if isinstance(row.get("applied_tuning", []), list) else []
+        return {
+            "enabled": bool(enabled),
+            "running": bool(self._postmortem_running),
+            "status": status[:48],
+            "summary": summary[:260],
+            "last_attempt_ts": int(max(0.0, _f(row.get("last_attempt_ts", 0), 0.0))),
+            "last_completed_ts": int(max(0.0, _f(row.get("last_completed_ts", 0), 0.0))),
+            "date_local": str(row.get("date_local", "") or ""),
+            "model": str(
+                row.get(
+                    "model",
+                    cfg.get("openai_postmortem_model", cfg.get("openai_model", "gpt-5.4-mini")),
+                )
+                or ""
+            ),
+            "timeout_s": float(max(0.0, _f(row.get("timeout_s", cfg.get("openai_postmortem_timeout_s", 12.0)), 12.0))),
+            "max_events": int(max(0.0, _f(row.get("max_events", cfg.get("openai_postmortem_max_events", 5000)), 0.0))),
+            "write_report_enabled": bool(row.get("write_report_enabled", cfg.get("openai_postmortem_write_report_enabled", True))),
+            "auto_apply_enabled": bool(row.get("auto_apply_enabled", cfg.get("openai_postmortem_auto_apply_tuning_enabled", False))),
+            "report_written": bool(row.get("report_written", False)),
+            "tuning_suggestions_count": int(max(0.0, _f(row.get("tuning_suggestions_count", 0), 0.0))),
+            "validated_suggestions_count": int(max(0.0, _f(row.get("validated_suggestions_count", 0), 0.0))),
+            "applied_tuning_count": int(max(0.0, _f(row.get("applied_tuning_count", 0), 0.0))),
+            "persisted_verified_count": int(max(0.0, _f(row.get("persisted_verified_count", 0), 0.0))),
+            "applied_tuning": [
+                {
+                    "setting_key": str(item.get("setting_key", "") or "").strip(),
+                    "old_value": item.get("old_value"),
+                    "new_value": item.get("new_value"),
+                    "confidence": round(max(0.0, _f(item.get("confidence", 0.0), 0.0)), 6),
+                    "reason": str(item.get("reason", "") or "").strip()[:180],
+                }
+                for item in applied_tuning[:12]
+                if isinstance(item, dict) and str(item.get("setting_key", "") or "").strip()
+            ],
+            "latency_ms": int(max(0.0, _f(row.get("latency_ms", 0), 0.0))),
+            "main_drags": [str(x or "")[:140] for x in list(row.get("main_drags", []) or [])[:12] if str(x or "").strip()],
+            "main_strengths": [str(x or "")[:140] for x in list(row.get("main_strengths", []) or [])[:12] if str(x or "").strip()],
+            "skip_recommendations": [str(x or "")[:140] for x in list(row.get("skip_recommendations", []) or [])[:12] if str(x or "").strip()],
+            "exit_improvement_recommendations": [
+                str(x or "")[:160]
+                for x in list(row.get("exit_improvement_recommendations", []) or [])[:12]
+                if str(x or "").strip()
+            ],
+            "capital_reallocation_recommendations": [
+                str(x or "")[:160]
+                for x in list(row.get("capital_reallocation_recommendations", []) or [])[:12]
+                if str(x or "").strip()
+            ],
+            "tuning_suggestions": [dict(item) for item in list(row.get("tuning_suggestions", []) or [])[:16] if isinstance(item, dict)],
+            "error": str(row.get("error", "") or "")[:180],
+        }
+
+    def _start_postmortem_async(self, settings: Dict[str, Any], now: float) -> None:
+        with self._postmortem_lock:
+            if self._postmortem_running:
+                return
+            cfg = dict(settings if isinstance(settings, dict) else {})
+            self._postmortem_running = True
+            self._postmortem_last_launch_ts = float(now)
+
+        def _worker() -> None:
+            try:
+                _runner_log("postmortem: starting asynchronous OpenAI postmortem analysis")
+                result = run_openai_postmortem_analysis(
+                    settings=cfg,
+                    base_dir=BASE_DIR,
+                    hub_dir=HUB_DATA_DIR,
+                    now_ts_value=int(max(0.0, float(now))),
+                )
+                status = str(result.get("status", "") or "").strip().lower()
+                if status == "ok":
+                    _runner_log("postmortem: completed successfully")
+                elif status in {"disabled", "missing_api_key", "idle", "not_requested"}:
+                    _runner_log(f"postmortem: status={status or 'unknown'}")
+                else:
+                    _runner_log(f"postmortem: completed with status={status or 'unknown'}")
+                    self._append_openai_status_incident(
+                        event="openai_postmortem_status",
+                        status=status,
+                        message=f"OpenAI postmortem completed with status={status or 'unknown'}",
+                        error=str(result.get("error", "") or ""),
+                    )
+            except Exception as exc:
+                msg = f"postmortem failed: {type(exc).__name__}: {exc}"
+                _runner_log(msg)
+                _append_incident(
+                    "warning",
+                    "openai_postmortem_error",
+                    msg,
+                    {"component": "runner"},
+                )
+                fallback = {
+                    "ts": int(time.time()),
+                    "enabled": bool(cfg.get("openai_postmortem_enabled", False)),
+                    "running": False,
+                    "status": "runner_exception",
+                    "summary": "AI postmortem failed; local analytics remain active.",
+                    "error": str(exc)[:180],
+                    "last_attempt_ts": int(time.time()),
+                    "last_completed_ts": int(time.time()),
+                    "date_local": time.strftime("%Y-%m-%d", time.localtime(time.time())),
+                    "report_path": OPENAI_POSTMORTEM_REPORT_PATH,
+                    "report_written": False,
+                }
+                try:
+                    _atomic_write_json(OPENAI_POSTMORTEM_STATUS_PATH, fallback)
+                except Exception:
+                    pass
+            finally:
+                with self._postmortem_lock:
+                    self._postmortem_running = False
+                    self._postmortem_thread = None
+                self._refresh_postmortem_cache(time.time(), force=True)
+
+        th = threading.Thread(target=_worker, name="pt-postmortem", daemon=True)
+        self._postmortem_thread = th
+        th.start()
+
+    def _postmortem_tick(self, now: float, settings: Dict[str, Any]) -> None:
+        try:
+            now_f = float(now)
+        except Exception:
+            now_f = float(time.time())
+        if (now_f - float(self._postmortem_last_tick_at or 0.0)) < 15.0:
+            return
+        self._postmortem_last_tick_at = float(now_f)
+        with self._postmortem_lock:
+            if self._postmortem_thread is not None and (not self._postmortem_thread.is_alive()):
+                self._postmortem_thread = None
+                self._postmortem_running = False
+        cfg = settings if isinstance(settings, dict) else {}
+        if not bool(cfg.get("openai_postmortem_enabled", False)):
+            self._set_disabled_cached_status(
+                cache_attr="_postmortem_cached_status",
+                refresh_attr="_postmortem_last_refresh_at",
+                running=bool(self._postmortem_running),
+                summary="AI postmortem analysis disabled.",
+                now=now_f,
+            )
+            return
+        if self._postmortem_running:
+            return
+        cached = self._refresh_postmortem_cache(now_f)
+        min_interval_s = float(
+            max(
+                300.0,
+                min(
+                    OPENAI_SCHEDULE_MAX_INTERVAL_S,
+                    _f(cfg.get("openai_postmortem_interval_s", OPENAI_POSTMORTEM_MIN_INTERVAL_S), OPENAI_POSTMORTEM_MIN_INTERVAL_S),
+                ),
+            )
+        )
+        min_interval_s = self._openai_effective_interval_s(
+            service="postmortem",
+            cached=cached,
+            base_interval_s=min_interval_s,
+            last_launch_ts=self._postmortem_last_launch_ts,
+            now=now_f,
+        )
+        last_attempt_ts = int(max(0.0, _f(cached.get("last_attempt_ts", 0), 0.0)))
+        last_completed_ts = int(max(0.0, _f(cached.get("last_completed_ts", 0), 0.0)))
+        last_ref = max(last_attempt_ts, last_completed_ts, int(max(0.0, self._postmortem_last_launch_ts)))
+        if last_ref > 0 and (now_f - float(last_ref)) < min_interval_s:
+            return
+        if not self._openai_can_launch_service(service="postmortem", now=now_f, settings=cfg):
+            return
+        self._openai_mark_service_launch(service="postmortem", now=now_f)
+        self._start_postmortem_async(cfg, now_f)
 
     def write_heartbeat(self) -> None:
         payload = {
@@ -837,7 +2750,7 @@ class Runner:
         market_loop = _safe_read_json(MARKET_LOOP_STATUS_PATH)
         key_rotation = _safe_read_json(KEY_ROTATION_STATUS_PATH)
         if not isinstance(key_rotation, dict) or (not key_rotation):
-            key_rotation = {"ts": now_ts(), "warn_days": int(settings.get("key_rotation_warn_days", 90) or 90), "due": [], "due_count": 0}
+            key_rotation = {"ts": now_ts(), "warn_days": int(settings.get("key_rotation_warn_days", 0) or 0), "due": [], "due_count": 0}
             try:
                 _atomic_write_json(KEY_ROTATION_STATUS_PATH, key_rotation)
             except Exception:
@@ -898,6 +2811,22 @@ class Runner:
             stale_after_s=max(60, int(float(settings.get("runtime_alert_history_stale_s", 900) or 900))),
         )
         feature_flags = build_feature_flag_snapshot(settings)
+        self._nightly_review_tick(time.time(), settings)
+        nightly_review = self._nightly_review_runtime_payload(settings, time.time())
+        self._position_review_tick(time.time(), settings)
+        position_review = self._position_review_runtime_payload(settings, time.time())
+        self._capital_planner_tick(time.time(), settings)
+        capital_planner = self._capital_planner_runtime_payload(settings, time.time())
+        self._root_cause_tick(time.time(), settings)
+        root_cause = self._root_cause_runtime_payload(settings, time.time())
+        self._strategy_optimizer_tick(time.time(), settings)
+        strategy_optimizer = self._strategy_optimizer_runtime_payload(settings, time.time())
+        self._explanations_tick(time.time(), settings)
+        explanations = self._explanations_runtime_payload(settings, time.time())
+        self._market_context_tick(time.time(), settings)
+        market_context = self._market_context_runtime_payload(settings, time.time())
+        self._postmortem_tick(time.time(), settings)
+        postmortem = self._postmortem_runtime_payload(settings, time.time())
 
         def _broker_state(name: str, payload: Dict[str, Any], quota_row: Dict[str, Any]) -> Dict[str, Any]:
             st = str(payload.get("state", "") or "").upper().strip()
@@ -1043,6 +2972,9 @@ class Runner:
                 "ts": int(walkforward.get("ts", 0) or 0),
             },
             "confidence_calibration": {
+                "crypto": dict(confidence_calibration.get("crypto", {}) or {})
+                if isinstance(confidence_calibration.get("crypto", {}), dict)
+                else {},
                 "stocks": dict(confidence_calibration.get("stocks", {}) or {})
                 if isinstance(confidence_calibration.get("stocks", {}), dict)
                 else {},
@@ -1074,11 +3006,30 @@ class Runner:
             "equity_curve_anomaly": equity_anomaly,
             "stale_history": stale_history,
             "feature_flags": feature_flags,
+            "openai_nightly_review": nightly_review,
+            "openai_position_review": position_review,
+            "openai_capital_planner": capital_planner,
+            "openai_root_cause_analysis": root_cause,
+            "openai_strategy_optimizer": strategy_optimizer,
+            "openai_explanations": explanations,
+            "openai_market_context": market_context,
+            "openai_postmortem_analysis": postmortem,
             "automation_policy": {
                 "ts": int(time.time()),
                 "crypto": dict(automation_policy.get("crypto", {}) or {}) if isinstance(automation_policy.get("crypto", {}), dict) else {},
                 "stocks": dict(automation_policy.get("stocks", {}) or {}) if isinstance(automation_policy.get("stocks", {}), dict) else {},
                 "forex": dict(automation_policy.get("forex", {}) or {}) if isinstance(automation_policy.get("forex", {}), dict) else {},
+            },
+            "trader_position_review": {
+                "crypto": dict((position_review.get("by_market", {}) if isinstance(position_review.get("by_market", {}), dict) else {}).get("crypto", {}) or {})
+                if isinstance((position_review.get("by_market", {}) if isinstance(position_review.get("by_market", {}), dict) else {}).get("crypto", {}), dict)
+                else {},
+                "stocks": dict((position_review.get("by_market", {}) if isinstance(position_review.get("by_market", {}), dict) else {}).get("stocks", {}) or {})
+                if isinstance((position_review.get("by_market", {}) if isinstance(position_review.get("by_market", {}), dict) else {}).get("stocks", {}), dict)
+                else {},
+                "forex": dict((position_review.get("by_market", {}) if isinstance(position_review.get("by_market", {}), dict) else {}).get("forex", {}) or {})
+                if isinstance((position_review.get("by_market", {}) if isinstance(position_review.get("by_market", {}), dict) else {}).get("forex", {}), dict)
+                else {},
             },
             "cross_market_opportunity": (
                 dict(cross_market_opportunity)

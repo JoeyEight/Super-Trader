@@ -40,9 +40,10 @@ def _f(value: Any, default: float = 0.0) -> float:
 
 
 def _symbol_of(row: Dict[str, Any], market: str) -> str:
-    if str(market or "").strip().lower() == "stocks":
+    mk = str(market or "").strip().lower()
+    if mk in {"stocks", "crypto"}:
         return str(row.get("symbol", "") or "").strip().upper()
-    return str(row.get("pair", row.get("instrument", "")) or "").strip().upper()
+    return str(row.get("pair", row.get("instrument", row.get("symbol", ""))) or "").strip().upper()
 
 
 def _score_of(row: Dict[str, Any]) -> float:
@@ -189,6 +190,9 @@ def _extract_scored_rows(thinker: Dict[str, Any], rank_rows: List[Dict[str, Any]
     scores = thinker.get("all_scores", []) if isinstance(thinker.get("all_scores", []), list) else []
     if scores:
         return [row for row in scores if isinstance(row, dict)]
+    ranked = thinker.get("ranked", []) if isinstance(thinker.get("ranked", []), list) else []
+    if ranked:
+        return [row for row in ranked if isinstance(row, dict)]
     if rank_rows:
         latest = rank_rows[-1]
         top = latest.get("top", []) if isinstance(latest.get("top", []), list) else []
@@ -199,12 +203,16 @@ def _extract_scored_rows(thinker: Dict[str, Any], rank_rows: List[Dict[str, Any]
 def replay_target_entries_for_market(settings: Dict[str, Any] | None, market: str) -> int:
     cfg = settings if isinstance(settings, dict) else {}
     m = str(market or "").strip().lower()
-    raw = (
-        cfg.get("replay_target_entries_stocks", 3)
-        if m == "stocks"
-        else cfg.get("replay_target_entries_forex", 4)
-    )
-    return max(1, min(20, int(_f(raw, 3 if m == "stocks" else 4))))
+    if m == "stocks":
+        raw = cfg.get("replay_target_entries_stocks", 3)
+        fallback = 3
+    elif m == "forex":
+        raw = cfg.get("replay_target_entries_forex", 4)
+        fallback = 4
+    else:
+        raw = cfg.get("replay_target_entries_crypto", 5)
+        fallback = 5
+    return max(1, min(20, int(_f(raw, fallback))))
 
 
 def recommend_threshold_from_scores(
@@ -237,17 +245,32 @@ def build_market_rejection_replay(
     max_scan_rows: int = 240,
 ) -> Dict[str, Any]:
     m = str(market or "").strip().lower()
-    if m not in {"stocks", "forex"}:
+    if m not in {"stocks", "forex", "crypto"}:
         return {"market": m, "state": "ERROR", "msg": "unsupported market"}
 
     cfg = settings if isinstance(settings, dict) else {}
-    mdir = os.path.join(hub_dir, m)
-    thinker_name = "stock_thinker_status.json" if m == "stocks" else "forex_thinker_status.json"
-    thinker = _safe_read_json(os.path.join(mdir, thinker_name))
-    rank_rows = _safe_read_jsonl(os.path.join(mdir, "scanner_rankings.jsonl"), max_lines=max_scan_rows)
+    if m == "crypto":
+        thinker = _safe_read_json(os.path.join(hub_dir, "crypto_dynamic_status.json"))
+        rank_rows = _safe_read_jsonl(os.path.join(hub_dir, "crypto", "scanner_rankings.jsonl"), max_lines=max_scan_rows)
+    else:
+        mdir = os.path.join(hub_dir, m)
+        thinker_name = "stock_thinker_status.json" if m == "stocks" else "forex_thinker_status.json"
+        thinker = _safe_read_json(os.path.join(mdir, thinker_name))
+        rank_rows = _safe_read_jsonl(os.path.join(mdir, "scanner_rankings.jsonl"), max_lines=max_scan_rows)
     scored_rows = _extract_scored_rows(thinker, rank_rows)
 
-    current_threshold = _f(cfg.get("stock_score_threshold", 0.2), 0.2) if m == "stocks" else _f(cfg.get("forex_score_threshold", 0.2), 0.2)
+    if m == "stocks":
+        current_threshold = _f(cfg.get("stock_score_threshold", 0.2), 0.2)
+    elif m == "forex":
+        current_threshold = _f(cfg.get("forex_score_threshold", 0.2), 0.2)
+    else:
+        current_threshold = _f(
+            cfg.get(
+                "crypto_dynamic_min_projected_edge_pct",
+                cfg.get("crypto_allocator_signal_floor", 0.15),
+            ),
+            0.15,
+        )
     target_entries = replay_target_entries_for_market(cfg, m)
     replay = recommend_threshold_from_scores(
         scored_rows,
@@ -302,6 +325,7 @@ def build_market_rejection_replay(
 def build_rejection_replay_report(hub_dir: str, settings: Dict[str, Any] | None = None) -> Dict[str, Any]:
     return {
         "ts": int(time.time()),
+        "crypto": build_market_rejection_replay(hub_dir, "crypto", settings=settings),
         "stocks": build_market_rejection_replay(hub_dir, "stocks", settings=settings),
         "forex": build_market_rejection_replay(hub_dir, "forex", settings=settings),
     }

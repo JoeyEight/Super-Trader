@@ -155,6 +155,7 @@ def bootstrap_runtime_artifacts(hub_dir: str, force: bool = False, now_ts: int |
             "confidence_calibration.json",
             {
                 "ts": int(ts_now),
+                "crypto": {"market": "crypto", "state": "READY", "samples": 0, "curve": [], "recommendation": {}},
                 "stocks": {"market": "stocks", "state": "READY", "samples": 0, "curve": [], "recommendation": {}},
                 "forex": {"market": "forex", "state": "READY", "samples": 0, "curve": [], "recommendation": {}},
             },
@@ -176,6 +177,7 @@ def bootstrap_runtime_artifacts(hub_dir: str, force: bool = False, now_ts: int |
             "rejection_replay.json",
             {
                 "ts": int(ts_now),
+                "crypto": {"market": "crypto", "state": "NO_DATA", "msg": "Run scanner to generate replay report.", "scenarios": [], "recommendation": {}},
                 "stocks": {"market": "stocks", "state": "NO_DATA", "msg": "Run scanner to generate replay report.", "scenarios": [], "recommendation": {}},
                 "forex": {"market": "forex", "state": "NO_DATA", "msg": "Run scanner to generate replay report.", "scenarios": [], "recommendation": {}},
             },
@@ -185,6 +187,13 @@ def bootstrap_runtime_artifacts(hub_dir: str, force: bool = False, now_ts: int |
             {
                 "ts": int(ts_now),
                 "stocks": {"market": "stocks", "state": "NO_DATA", "msg": "Run scanner to generate replay report.", "scenarios": [], "recommendation": {}},
+            },
+        ),
+        (
+            "rejection_replay_crypto.json",
+            {
+                "ts": int(ts_now),
+                "crypto": {"market": "crypto", "state": "NO_DATA", "msg": "Run scanner to generate replay report.", "scenarios": [], "recommendation": {}},
             },
         ),
         (

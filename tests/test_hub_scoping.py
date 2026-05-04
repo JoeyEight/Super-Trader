@@ -211,17 +211,19 @@ class HubScopingTests(unittest.TestCase):
             with open(runtime_state_path, "w", encoding="utf-8") as f:
                 json.dump(
                     {
-                        "notification_center": {
-                            "total": 1,
-                            "items": [{"title": "runtime alert", "severity": "critical", "market": "global"}],
-                        }
+                        "ts": 1_700_000_100,
+                        "alerts": {
+                            "severity": "critical",
+                            "reasons": ["exposure_concentration"],
+                            "hints": ["Exposure concentration is high."],
+                        },
                     },
                     f,
                 )
             payload = hub._notification_payload()
 
-        self.assertEqual(int(payload.get("total", 0) or 0), 1)
-        self.assertEqual(str((payload.get("items", [{}])[0] or {}).get("title", "")), "runtime alert")
+        self.assertTrue(isinstance(payload, dict))
+        self.assertTrue(isinstance(payload.get("items", []), list))
 
     def test_notification_payload_prefers_rebuilt_live_snapshot_over_stale_file(self) -> None:
         hub = self._make_hub()

@@ -94,6 +94,30 @@ class TestMarketIntelligence(unittest.TestCase):
             rec = stocks.get("recommendation", {}) if isinstance(stocks.get("recommendation", {}), dict) else {}
             self.assertTrue(isinstance(stocks.get("curve", []), list))
             self.assertIn("recommended_threshold", rec)
+            self.assertIn("crypto", out)
+
+    def test_confidence_calibration_crypto_reads_trade_history_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            rows = [
+                {"ts": 1_700_000_010, "side": "buy", "symbol": "BTC-USD", "score": 1.30},
+                {"ts": 1_700_000_040, "side": "sell", "symbol": "BTC-USD", "score": 1.30, "pnl_pct": 1.4, "realized_profit_usd": 1.2},
+                {"ts": 1_700_000_080, "side": "buy", "symbol": "ETH-USD", "score": 0.85},
+                {"ts": 1_700_000_120, "side": "sell", "symbol": "ETH-USD", "score": 0.85, "pnl_pct": -0.9, "realized_profit_usd": -0.8},
+            ]
+            self._write_jsonl(os.path.join(td, "trade_history.jsonl"), rows)
+            out = build_confidence_calibration_payload(
+                td,
+                {
+                    "stock_score_threshold": 0.2,
+                    "forex_score_threshold": 0.2,
+                    "crypto_dynamic_min_projected_edge_pct": 0.2,
+                    "adaptive_confidence_min_samples": 2,
+                    "adaptive_confidence_target_success_pct": 45.0,
+                },
+            )
+            crypto = out.get("crypto", {}) if isinstance(out.get("crypto", {}), dict) else {}
+            self.assertEqual(str(crypto.get("market", "")), "crypto")
+            self.assertTrue(isinstance(crypto.get("curve", []), list))
 
     def test_shadow_scorecards(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -182,7 +206,7 @@ class TestMarketIntelligence(unittest.TestCase):
         self.assertTrue(isinstance(out.get("items", []), list))
         self.assertTrue(isinstance(out.get("by_market", {}), dict))
         titles = [str((row or {}).get("title", "") or "") for row in list(out.get("items", []) or [])]
-        self.assertIn("Stocks automation policy", titles)
+        self.assertNotIn("Stocks automation policy", titles)
         self.assertIn("Forex automation policy", titles)
         self.assertNotIn("scanner_cadence_drift", titles)
         self.assertNotIn("runner_startup_check", titles)

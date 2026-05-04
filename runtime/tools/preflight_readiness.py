@@ -355,9 +355,13 @@ def build_preflight_report(project_dir: str, now_ts: int | None = None) -> Dict[
     perm_issues = key_file_permission_issues(base_dir)
     for item in perm_issues:
         issues.append(_issue("warning", "key_permissions", "Key file permissions are weaker than recommended.", {"detail": item}))
-    rotation_issues = key_rotation_reminder_issues(base_dir, max_age_days=int(settings.get("key_rotation_warn_days", 90) or 90))
-    for item in rotation_issues[:10]:
-        issues.append(_issue("warning", "key_rotation_due", "A key file is past rotation reminder age.", {"detail": item}))
+    rotation_days = int(settings.get("key_rotation_warn_days", 0) or 0)
+    rotation_issues: List[str] = []
+    # Endpoint-managed mode: warn_days <= 0 disables local age-based rotation reminders.
+    if rotation_days > 0:
+        rotation_issues = key_rotation_reminder_issues(base_dir, max_age_days=rotation_days)
+        for item in rotation_issues[:10]:
+            issues.append(_issue("warning", "key_rotation_due", "A key file is past rotation reminder age.", {"detail": item}))
 
     critical_count = sum(1 for it in issues if str(it.get("level", "")).lower() == "critical")
     warning_count = sum(1 for it in issues if str(it.get("level", "")).lower() == "warning")

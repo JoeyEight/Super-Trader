@@ -48,6 +48,12 @@ Runtime packages currently used by the app code:
 - `matplotlib`, `psutil`, `Pillow` (desktop icon/app packaging path)
 - `python-dotenv`, `pandas` (used by `sources/*` helpers)
 - `orjson` (fast JSON decode/encode), `watchdog` (event-driven file change signals), `prometheus-client` (optional metrics hooks)
+- OpenAI advisory services use `requests` with the Responses API (no separate `openai` SDK dependency is required in this repo)
+- Test/dev helpers: `pytest`, `pytest-xdist`, `py-spy`, `uv`
+
+`requirements.txt` is split into:
+- Core runtime dependencies (needed to run hub + markets)
+- Test/diagnostics/tooling dependencies (for smoke tests and profiling)
 
 ## Run
 ### Hub UI
@@ -133,6 +139,15 @@ Optional strict gates:
 python3 runtime/tools/run_quality_suite.py --require-artifacts --require-stability --require-preflight
 ```
 
+## Smoke Test
+Quick end-to-end runtime smoke check:
+```bash
+./venv/bin/python runtime/smoke_test_all.py
+```
+
+Output report:
+- `hub_data/smoke_test_report.json`
+
 ## Key Runtime Files
 ### Core status
 - `hub_data/trader_status.json`
@@ -171,6 +186,26 @@ python3 runtime/tools/run_quality_suite.py --require-artifacts --require-stabili
 - Stocks and forex use the native in-app charts and watchlists; the old TradingView launch path is not part of the active UI flow.
 - Notification Center reflects live runtime state plus recent unresolved incidents; stale resolved incidents are filtered out by the current app code.
 - Forex `event_feed` warnings indicate macro-event feed degradation and do not by themselves disable forex trading; execution gates still apply independently.
+- OpenAI advisory services are optional and fail closed (local logic remains authoritative on errors/timeouts/missing key).
+- For lowest CPU usage, leave OpenAI advisory/review services disabled unless you are actively using them.
+
+## OpenAI (Optional Advisory Layer)
+All OpenAI-powered modules are advisory only. They do not place trades directly and do not bypass local guards.
+
+Configure from the hub Settings -> OpenAI key/editor popup:
+- `openai_decision_enabled` (cross-market decision advisory)
+- `openai_position_review_enabled`
+- `openai_capital_planner_enabled`
+- `openai_root_cause_enabled`
+- `openai_explanations_enabled`
+- `openai_strategy_optimizer_enabled`
+- `openai_market_context_enabled`
+- `openai_postmortem_enabled`
+- `openai_nightly_review_enabled`
+
+Runtime output files:
+- `hub_data/openai/*_status.json`
+- `hub_data/openai/*.json`
 
 ## Credentials
 ### Crypto (Robinhood)

@@ -13,6 +13,7 @@ from app.opportunity_allocator import evaluate_cross_market_allocation
 from app.path_utils import resolve_runtime_paths
 from app.runtime_logging import runtime_event
 from app.scanner_quality import effective_reject_pressure
+from app.settings_utils import normalize_settings_profile
 from app.trade_quality import evaluate_trade_quality
 from brokers.broker_oanda import OandaBrokerClient
 
@@ -68,6 +69,26 @@ def _rollout_at_least(settings: Dict[str, Any], stage: str) -> bool:
 
 def _broker_mode_label(settings: Dict[str, Any]) -> str:
     return "Practice" if bool(settings.get("oanda_practice_mode", True)) else "Live"
+
+
+def _forex_uses_exposure_budget_slots(settings: Dict[str, Any]) -> bool:
+    profile = normalize_settings_profile(settings.get("settings_profile", "balanced"), default="balanced")
+    return str(profile) == "max_growth"
+
+
+def _forex_effective_open_position_hard_cap(
+    settings: Dict[str, Any],
+    configured_cap: int,
+    current_open_positions: int,
+) -> int:
+    base_cap = max(1, int(configured_cap or 1))
+    if not _forex_uses_exposure_budget_slots(settings):
+        return max(base_cap, int(current_open_positions or 0))
+    # Max Growth treats raw position count as a soft guide and lets exposure/margin
+    # controls determine how many small forex tickets can be held safely.
+    scaled = max(base_cap * 3, 3)
+    hard_cap = min(12, max(base_cap, scaled))
+    return max(int(current_open_positions or 0), int(hard_cap))
 
 
 def _trader_state_label(settings: Dict[str, Any], auto_enabled: bool, shadow_only: bool) -> str:
@@ -601,10 +622,12 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     runtime_events_path = os.path.join(hub_dir, "runtime_events.jsonl")
 
     auto_enabled = bool(settings.get("forex_auto_trade_enabled", False))
+    independent_market_mode = bool(settings.get("market_independent_execution_enabled", False))
     trade_units = int(float(settings.get("forex_trade_units", 1000) or 1000))
     loss_size_step_pct = max(0.0, min(0.9, float(settings.get("forex_loss_streak_size_step_pct", 0.15) or 0.15)))
     loss_size_floor_pct = max(0.10, min(1.0, float(settings.get("forex_loss_streak_size_floor_pct", 0.40) or 0.40)))
     max_open_positions = max(1, int(float(settings.get("forex_max_open_positions", 1) or 1)))
+    forex_exposure_slot_mode = _forex_uses_exposure_budget_slots(settings)
     score_threshold = float(settings.get("forex_score_threshold", 0.2) or 0.2)
     guarded_score_mult = max(1.0, float(settings.get("forex_live_guarded_score_mult", 1.15) or 1.15))
     profit_target_pct = float(settings.get("forex_profit_target_pct", 0.25) or 0.25)
@@ -674,6 +697,10 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     trail_state = state.get("trail", {}) or {}
     cooldown_until = state.get("cooldown_until", {}) or {}
     loss_streak = int(float(state.get("loss_streak", 0) or 0))
+    try:
+        loss_streak_updated_at = int(float(state.get("loss_streak_updated_at", 0) or 0))
+    except Exception:
+        loss_streak_updated_at = 0
     last_divergence_ts = int(float(state.get("last_divergence_ts", 0) or 0))
     last_divergence_msg = str(state.get("last_divergence_msg", "") or "")
     open_meta = state.get("open_meta", {}) or {}
@@ -702,6 +729,26 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             streak = 0
         if streak > 0:
             stale_alignment_streaks[inst] = int(streak)
+    for inst, until_ts in list(cooldown_until.items()):
+        if float(until_ts) <= float(now_ts):
+            cooldown_until.pop(str(inst).strip().upper(), None)
+    loss_streak_auto_clear_msg = ""
+    loss_cooldown_s = max(60, int(float(settings.get("forex_loss_cooldown_seconds", 1800) or 1800)))
+    if loss_streak > 0:
+        active_loss_cooldowns = bool(any(float(until_ts) > float(now_ts) for until_ts in cooldown_until.values()))
+        has_pending_orders = bool(any(bool(v) for v in dict(pending).values()))
+        # Prevent deadlock: if we are flat and all cooldowns are over, clear the streak guard automatically.
+        if (not positions) and (not has_pending_orders) and (not active_loss_cooldowns):
+            streak_age_s = (
+                max(0, int(now_ts - int(loss_streak_updated_at)))
+                if int(loss_streak_updated_at) > 0
+                else int(loss_cooldown_s)
+            )
+            loss_streak = 0
+            loss_streak_updated_at = int(now_ts)
+            loss_streak_auto_clear_msg = (
+                f"Loss-streak guard auto-cleared after {int(streak_age_s)}s flat with no active cooldowns."
+            )
     loss_size_scale = max(loss_size_floor_pct, 1.0 - (loss_size_step_pct * float(max(0, loss_streak))))
     trade_units_effective = max(1, int(round(abs(float(trade_units)) * float(loss_size_scale))))
     fallback_active = bool(thinker.get("fallback_cached", False)) if isinstance(thinker, dict) else False
@@ -713,6 +760,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     runtime_state = _safe_read_json(os.path.join(hub_dir, "runtime_state.json"))
     runtime_alerts = runtime_state.get("alerts", {}) if isinstance(runtime_state.get("alerts", {}), dict) else {}
     entry_size_scale = 1.0
+    allocator_size_scale = 1.0
     if fallback_active and (not block_cached_scan):
         entry_size_scale = float(cached_scan_entry_size_mult)
     trade_units_entry = max(1, int(round(float(trade_units_effective) * float(entry_size_scale))))
@@ -785,6 +833,11 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         total_exposure_usd += inst_notional_usd
         if inst_notional_usd > 0.0:
             position_values_usd[str(inst).strip().upper()] = round(float(inst_notional_usd), 6)
+    effective_open_positions_hard_cap = _forex_effective_open_position_hard_cap(
+        settings,
+        configured_cap=max_open_positions,
+        current_open_positions=len(positions),
+    )
     margin_available = _safe_float_from_dict(
         broker_snap if isinstance(broker_snap, dict) else {},
         ["margin_available", "marginAvailable"],
@@ -848,6 +901,13 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         stale_exit_loss_cut_pct = float(settings.get("forex_stale_loss_cut_pct", -0.35) or -0.35)
     except Exception:
         stale_exit_loss_cut_pct = -0.35
+    try:
+        stale_exit_hold_near_flat_pct = max(
+            0.0,
+            float(settings.get("forex_stale_hold_near_flat_pct", 0.10) or 0.10),
+        )
+    except Exception:
+        stale_exit_hold_near_flat_pct = 0.10
     try:
         stale_exit_reverse_score_mult = max(1.0, float(settings.get("forex_stale_reverse_score_mult", 1.25) or 1.25))
     except Exception:
@@ -929,22 +989,34 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 and align_score_abs >= (float(alignment_required_score) * float(stale_exit_reverse_score_mult))
             )
             mild_loss = (float(pnl) < 0.0) and (float(pnl) > float(stale_exit_loss_cut_pct))
-            hold_guard_active = (
-                entry_age_s < int(stale_exit_min_hold_s)
-                and mild_loss
-                and (not hard_reverse)
-            )
+            near_flat_gain = (float(pnl) >= 0.0) and (float(pnl) <= float(stale_exit_hold_near_flat_pct))
+            hold_guard_reason = ""
+            hold_guard_detail = ""
+            hold_guard_active = False
+            if entry_age_s < int(stale_exit_min_hold_s) and (not hard_reverse):
+                if mild_loss:
+                    hold_guard_active = True
+                    hold_guard_reason = "stale_exit_hold_loss_guard"
+                    hold_guard_detail = (
+                        f"Alignment stale but holding {inst} to avoid a churn exit at mild loss "
+                        f"({float(pnl):+.3f}% > {float(stale_exit_loss_cut_pct):+.3f}%) "
+                        f"during the first {int(stale_exit_min_hold_s)}s."
+                    )
+                elif near_flat_gain:
+                    hold_guard_active = True
+                    hold_guard_reason = "stale_exit_hold_churn_guard"
+                    hold_guard_detail = (
+                        f"Alignment stale but holding {inst} to avoid a churn exit at a near-flat gain "
+                        f"({float(pnl):+.3f}% <= +{float(stale_exit_hold_near_flat_pct):.3f}%) "
+                        f"during the first {int(stale_exit_min_hold_s)}s."
+                    )
             if hold_guard_active:
                 stale_exit_events.append(
                     {
                         "instrument": str(inst),
                         "ok": False,
-                        "reason": "stale_exit_hold_loss_guard",
-                        "detail": (
-                            f"Alignment stale but holding {inst} to avoid a churn exit at mild loss "
-                            f"({float(pnl):+.3f}% > {float(stale_exit_loss_cut_pct):+.3f}%) "
-                            f"during the first {int(stale_exit_min_hold_s)}s."
-                        ),
+                        "reason": hold_guard_reason,
+                        "detail": hold_guard_detail,
                         "streak": int(stale_streak),
                         "age_s": int(entry_age_s),
                         "reasons": [str(r) for r in align_reasons[:3]],
@@ -1005,9 +1077,11 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 stale_alignment_streaks.pop(inst, None)
                 if pnl_for_audit < 0:
                     loss_streak += 1
-                    cooldown_until[inst] = float(now_ts + max(60, int(float(settings.get("forex_loss_cooldown_seconds", 1800) or 1800))))
+                    loss_streak_updated_at = int(now_ts)
+                    cooldown_until[inst] = float(now_ts + int(loss_cooldown_s))
                 else:
                     loss_streak = 0
+                    loss_streak_updated_at = int(now_ts)
             else:
                 trail_state[inst] = {"armed": armed, "peak_pct": peak, "last_pnl_pct": pnl, "updated_at": now_ts}
             stale_exit_events.append(
@@ -1056,9 +1130,11 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                     open_meta.pop(inst, None)
                     if pnl_for_audit < 0:
                         loss_streak += 1
-                        cooldown_until[inst] = float(now_ts + max(60, int(float(settings.get("forex_loss_cooldown_seconds", 1800) or 1800))))
+                        loss_streak_updated_at = int(now_ts)
+                        cooldown_until[inst] = float(now_ts + int(loss_cooldown_s))
                     else:
                         loss_streak = 0
+                        loss_streak_updated_at = int(now_ts)
                 else:
                     trail_state[inst] = {"armed": armed, "peak_pct": peak, "last_pnl_pct": pnl, "updated_at": now_ts}
                 continue
@@ -1066,6 +1142,12 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     for tracked_inst in list(stale_alignment_streaks.keys()):
         if str(tracked_inst or "").strip().upper() not in positions:
             stale_alignment_streaks.pop(str(tracked_inst or "").strip().upper(), None)
+    for tracked_inst in list(open_meta.keys()):
+        if str(tracked_inst or "").strip().upper() not in positions:
+            open_meta.pop(str(tracked_inst or "").strip().upper(), None)
+    for tracked_inst in list(trail_state.keys()):
+        if str(tracked_inst or "").strip().upper() not in positions:
+            trail_state.pop(str(tracked_inst or "").strip().upper(), None)
     if stale_exit_count > 0:
         stale_exit_refresh_msg = (
             f"Exited {stale_exit_count} stale forex position(s); waiting one cycle before new entries."
@@ -1086,18 +1168,24 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         required_score = float(alignment_required_score)
         max_slippage_bps = max(0.0, float(settings.get("forex_max_slippage_bps", 6.0) or 6.0))
         global_cap_pct = max(0.0, float(settings.get("market_max_total_exposure_pct", 0.0) or 0.0))
+        if independent_market_mode:
+            global_cap_pct = 0.0
         crypto_exposure_usd = _crypto_holdings_usd(hub_dir)
         stocks_exposure_usd = _market_status_exposure_usd(hub_dir, "stocks")
-        cross_market_exposure_usd = (
-            float(total_exposure_usd)
-            + float(max(0.0, crypto_exposure_usd))
-            + float(max(0.0, stocks_exposure_usd))
-        )
-        cross_market_cap_basis_usd = _portfolio_account_value_usd(
-            hub_dir,
-            current_market="forex",
-            current_account_value_usd=float(nav),
-        )
+        if independent_market_mode:
+            cross_market_exposure_usd = float(total_exposure_usd)
+            cross_market_cap_basis_usd = float(max(0.0, nav))
+        else:
+            cross_market_exposure_usd = (
+                float(total_exposure_usd)
+                + float(max(0.0, crypto_exposure_usd))
+                + float(max(0.0, stocks_exposure_usd))
+            )
+            cross_market_cap_basis_usd = _portfolio_account_value_usd(
+                hub_dir,
+                current_market="forex",
+                current_account_value_usd=float(nav),
+            )
         if signal_age_s > max_signal_age_s:
             entry_msg = f"Signal stale ({signal_age_s}s > {max_signal_age_s}s)"
         elif require_data_quality_ok and (not thinker_data_ok):
@@ -1176,7 +1264,10 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 elif pair in positions:
                     fail = f"Already in position: {pair}"
                 elif len(positions) >= max_open_positions:
-                    fail = f"Max open positions reached ({len(positions)}/{max_open_positions})"
+                    if (not forex_exposure_slot_mode) or (len(positions) >= int(effective_open_positions_hard_cap)):
+                        cap_txt = int(effective_open_positions_hard_cap) if forex_exposure_slot_mode else int(max_open_positions)
+                        mode_txt = "Exposure-budget cap" if forex_exposure_slot_mode else "Max open positions reached"
+                        fail = f"{mode_txt} ({len(positions)}/{cap_txt})"
                 elif live_guarded and sample_count < min_samples_guarded:
                     fail = f"Calibration sample gate for {pair} ({sample_count} < {min_samples_guarded})"
                 elif live_guarded and calib_prob < float(settings.get("forex_min_calib_prob_live_guarded", 0.56) or 0.56):
@@ -1316,7 +1407,25 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                         fail = f"Portfolio allocator: {alloc_reason}"
                         trade_quality_eval = dict(quality_eval) if isinstance(quality_eval, dict) else {}
                     else:
+                        allocator_size_mult = max(
+                            0.25,
+                            min(
+                                1.0,
+                                float(
+                                    (
+                                        allocator_eval.get("size_multiplier", 1.0)
+                                        if isinstance(allocator_eval, dict)
+                                        else 1.0
+                                    )
+                                    or 1.0
+                                ),
+                            ),
+                        )
+                        if abs(float(allocator_size_mult) - 1.0) >= 0.001:
+                            units_abs = max(1, int(round(abs(float(units)) * float(allocator_size_mult))))
+                            units = units_abs if int(units) >= 0 else (-1 * units_abs)
                         selected_opportunity_eval = dict(allocator_eval)
+                        allocator_size_scale = float(allocator_size_mult)
                         opportunity_eval = dict(allocator_eval)
                 if fail:
                     fail_reasons.append(fail)
@@ -1456,11 +1565,26 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     allocator_evaluated = bool(isinstance(opportunity_eval, dict) and opportunity_eval)
     allocator_reasons = opportunity_eval.get("reasons", []) if isinstance(opportunity_eval.get("reasons", []), list) else []
     allocator_top_reason = str((allocator_reasons[0] if allocator_reasons else "") or "").strip()
+    allocator_ai = opportunity_eval.get("openai_decision", {}) if isinstance(opportunity_eval.get("openai_decision", {}), dict) else {}
     trade_confidence_score = float(trade_quality_eval.get("confidence_score", 0.0) or 0.0) if isinstance(trade_quality_eval, dict) else 0.0
     quality_size_scale = float(trade_quality_eval.get("size_multiplier", 1.0) or 1.0) if isinstance(trade_quality_eval, dict) else 1.0
+    try:
+        allocator_size_from_eval = float(opportunity_eval.get("size_multiplier", 1.0) or 1.0)
+    except Exception:
+        allocator_size_from_eval = 1.0
+    allocator_size_from_eval = max(0.25, min(1.0, float(allocator_size_from_eval)))
+    allocator_size_scale = float(allocator_size_from_eval)
+    try:
+        openai_confidence = float(allocator_ai.get("portfolio_confidence", 0.0) or 0.0)
+    except Exception:
+        openai_confidence = 0.0
+    openai_confidence = max(0.0, min(1.0, float(openai_confidence)))
     if auto_enabled:
         cross_market_exposure_effective_usd = float(cross_market_exposure_usd)
         cross_market_cap_basis_effective_usd = float(cross_market_cap_basis_usd)
+    elif independent_market_mode:
+        cross_market_exposure_effective_usd = float(total_exposure_usd)
+        cross_market_cap_basis_effective_usd = float(max(0.0, nav))
     else:
         cross_market_exposure_effective_usd = (
             float(total_exposure_usd)
@@ -1493,7 +1617,10 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "runtime_trust_mode": str(runtime_trust.get("mode", "") or ""),
         "policy_mode": str(policy.get("mode", "") or ""),
         "policy_profile": str(policy.get("profile", "") or ""),
+        "independent_market_mode": bool(independent_market_mode),
         "policy_size_scale": float(round(policy_size_scale, 4)),
+        "loss_streak": int(loss_streak),
+        "max_loss_streak": int(max_loss_streak_setting),
         "trade_quality_evaluated": bool(trade_quality_evaluated),
         "trade_quality_decision": str(
             trade_quality_eval.get("decision", "not_evaluated") if trade_quality_evaluated else "not_evaluated"
@@ -1508,6 +1635,14 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "portfolio_allocator_score": float(round(float(opportunity_eval.get("current_market_score", 0.0) or 0.0), 4)),
         "portfolio_allocator_top_reason": allocator_top_reason,
         "portfolio_allocator_capital_constrained": bool(opportunity_eval.get("capital_constrained", False)) if allocator_evaluated else False,
+        "portfolio_allocator_size_scale": float(round(float(allocator_size_from_eval), 4)) if allocator_evaluated else 1.0,
+        "portfolio_allocator_decision_source": str(opportunity_eval.get("decision_source", "") or "") if allocator_evaluated else "",
+        "openai_decision_active": bool(allocator_ai.get("active", False)),
+        "openai_decision_status": str(allocator_ai.get("status", "") or ""),
+        "openai_decision": str(allocator_ai.get("decision", "") or ""),
+        "openai_decision_best_market": str(allocator_ai.get("best_market", "") or ""),
+        "openai_decision_confidence": float(round(openai_confidence, 4)),
+        "openai_decision_applied": bool(allocator_ai.get("applied", False)),
         "signal_quality_pass": bool(quality_layers.get("signal_quality", False)),
         "execution_quality_pass": bool(quality_layers.get("execution_quality", False)),
         "compliance_permission_pass": bool(quality_layers.get("compliance_permission", False)),
@@ -1520,8 +1655,12 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "stale_exit_min_notional_usd": float(round(float(stale_exit_min_notional_usd), 4)),
         "stale_exit_min_hold_s": int(stale_exit_min_hold_s),
         "stale_exit_loss_cut_pct": float(round(float(stale_exit_loss_cut_pct), 4)),
+        "stale_exit_hold_near_flat_pct": float(round(float(stale_exit_hold_near_flat_pct), 4)),
         "stale_exit_reverse_score_mult": float(round(float(stale_exit_reverse_score_mult), 4)),
         "skip_new_entries_this_cycle": bool(skip_new_entries_this_cycle),
+        "position_cap_mode": ("exposure_budget" if forex_exposure_slot_mode else "count"),
+        "max_open_positions_setting": int(max_open_positions),
+        "max_open_positions_effective_hard": int(effective_open_positions_hard_cap),
         "cross_market_exposure_usd": float(round(cross_market_exposure_effective_usd, 4)),
         "cross_market_cap_basis_usd": float(round(cross_market_cap_basis_effective_usd, 4)),
         "cross_market_exposure_pct": float(round(cross_market_exposure_effective_pct, 4)),
@@ -1531,6 +1670,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "trail": trail_state,
         "cooldown_until": cooldown_until,
         "loss_streak": int(loss_streak),
+        "loss_streak_updated_at": int(loss_streak_updated_at),
         "open_meta": open_meta,
         "pending": pending,
         "stale_alignment_streaks": dict(stale_alignment_streaks),
@@ -1545,6 +1685,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "entry_gate_flags": dict(entry_gate_flags),
         "trade_units_entry": int(trade_units_entry),
         "entry_size_scale": round(float(entry_size_scale), 4),
+        "allocator_size_scale": round(float(allocator_size_scale), 4),
         "risk_cap_size_scale": round(float(risk_cap_size_scale), 4),
         "stale_exit_count": int(stale_exit_count),
         "stale_exit_events": list(stale_exit_events[:24]),
@@ -1566,6 +1707,8 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     msg_parts = [entry_msg]
     if stale_exit_refresh_msg and str(stale_exit_refresh_msg).strip() and (str(stale_exit_refresh_msg) not in msg_parts):
         msg_parts.append(str(stale_exit_refresh_msg))
+    if loss_streak_auto_clear_msg and str(loss_streak_auto_clear_msg).strip() and (str(loss_streak_auto_clear_msg) not in msg_parts):
+        msg_parts.append(str(loss_streak_auto_clear_msg))
     if shadow_only:
         msg_parts.append("rollout shadow_only: real entries suppressed")
     elif not enable_exec_v2:
@@ -1580,6 +1723,8 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         msg_parts.append(f"policy-size x{policy_size_scale:.2f}")
     if trade_quality_eval and abs(float(quality_size_scale) - 1.0) >= 0.01:
         msg_parts.append(f"quality-size x{quality_size_scale:.2f}")
+    if allocator_evaluated and abs(float(allocator_size_scale) - 1.0) >= 0.01:
+        msg_parts.append(f"allocator-size x{allocator_size_scale:.2f}")
     if allocator_evaluated:
         allocator_summary = str(opportunity_eval.get("summary", "") or "").strip()
         if allocator_summary:
@@ -1627,6 +1772,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "trade_units_entry": int(trade_units_entry),
         "loss_size_scale": round(float(loss_size_scale), 4),
         "entry_size_scale": round(float(entry_size_scale), 4),
+        "allocator_size_scale": round(float(allocator_size_scale), 4),
         "risk_cap_size_scale": round(float(risk_cap_size_scale), 4),
         "exposure_usd": round(total_exposure_usd, 4),
         "margin_used_usd": round(total_margin_used_usd, 4),

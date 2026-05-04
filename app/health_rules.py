@@ -297,6 +297,10 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
         reasons.append("shadow_scorecard_blocked")
         hints.append("Shadow scorecard gate is BLOCK for at least one market; keep rollout in shadow mode.")
 
+    # Avoid non-actionable warning banners when we do not have concrete reasons to present.
+    if severity in {"warn", "critical"} and (not reasons):
+        severity = "ok"
+
     quickfix: List[str] = []
     for r in reasons:
         tip = str(_QUICKFIX_MAP.get(r, "") or "").strip()

@@ -28,6 +28,7 @@ class CryptoTradeQualityLivePathTests(unittest.TestCase):
         short_count: int = 0,
         dynamic_score: float = 0.9,
         trading_pairs: list[dict] | None = None,
+        dynamic_status_overrides: dict | None = None,
     ):
         bot = object.__new__(pt_trader.CryptoAPITrading)
         bot.path_map = {}
@@ -98,8 +99,11 @@ class CryptoTradeQualityLivePathTests(unittest.TestCase):
                 f.write(str(int(short_count)))
             with open(os.path.join(td, "runtime_state.json"), "w", encoding="utf-8") as f:
                 json.dump({"alerts": {"severity": runtime_severity}}, f)
+            dynamic_status = {"ranked": [{"symbol": "BTC", "score": float(dynamic_score)}], "rejected": []}
+            if isinstance(dynamic_status_overrides, dict):
+                dynamic_status.update(dict(dynamic_status_overrides))
             with open(os.path.join(td, "crypto_dynamic_status.json"), "w", encoding="utf-8") as f:
-                json.dump({"ranked": [{"symbol": "BTC", "score": float(dynamic_score)}], "rejected": []}, f)
+                json.dump(dynamic_status, f)
 
             orig_refresh = pt_trader._refresh_paths_and_symbols
             orig_base_paths = dict(pt_trader.base_paths)
@@ -222,6 +226,26 @@ class CryptoTradeQualityLivePathTests(unittest.TestCase):
         flags = latest.get("entry_gate_flags", {}) if isinstance(latest.get("entry_gate_flags", {}), dict) else {}
         self.assertEqual(str(flags.get("signal_gate_mode", "")), "blocked")
         self.assertEqual(str(flags.get("policy_profile", "")), "balanced")
+
+    def test_manage_trades_applies_dynamic_adaptive_threshold_floor(self) -> None:
+        pt_trader = _load_pt_trader_module()
+        buy_calls, status_rows = self._build_bot(
+            pt_trader,
+            runtime_severity="ok",
+            profile="max_growth",
+            long_count=0,
+            short_count=0,
+            dynamic_score=1.0,
+            dynamic_status_overrides={
+                "adaptive_threshold": 1.4,
+                "ranked": [{"symbol": "BTC", "score": 1.0, "samples": 0}],
+            },
+        )
+        self.assertEqual(len(buy_calls), 0)
+        self.assertTrue(status_rows)
+        latest = status_rows[-1]
+        flags = latest.get("entry_gate_flags", {}) if isinstance(latest.get("entry_gate_flags", {}), dict) else {}
+        self.assertGreaterEqual(float(flags.get("signal_gate_min_dynamic_score", 0.0) or 0.0), 1.4)
 
     def test_manage_trades_blocks_entries_when_runtime_alerts_are_critical(self) -> None:
         pt_trader = _load_pt_trader_module()

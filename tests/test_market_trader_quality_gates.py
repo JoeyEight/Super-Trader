@@ -65,6 +65,21 @@ class _FakeOandaClient:
         return True, "ok", {}
 
 
+class _OneOpenPositionOandaClient(_FakeOandaClient):
+    def fetch_snapshot(self) -> dict:
+        return {
+            "nav": 100.0,
+            "raw_positions": [
+                {
+                    "instrument": "USD_JPY",
+                    "long": {"units": "10", "averagePrice": "1.0"},
+                    "short": {"units": "0", "averagePrice": "0.0"},
+                    "marginUsed": 0.5,
+                }
+            ],
+        }
+
+
 class TestTraderQualityGates(unittest.TestCase):
     def _write_json(self, path: str, payload: dict) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -318,6 +333,88 @@ class TestTraderQualityGates(unittest.TestCase):
             self.assertGreater(float(gate.get("cross_market_cap_basis_usd", 0.0) or 0.0), 250.0)
             self.assertLess(float(gate.get("cross_market_exposure_pct", 999.0) or 999.0), 40.0)
 
+    def test_forex_independent_market_mode_ignores_cross_market_global_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            fx_dir = os.path.join(td, "forex")
+            stocks_dir = os.path.join(td, "stocks")
+            os.makedirs(fx_dir, exist_ok=True)
+            os.makedirs(stocks_dir, exist_ok=True)
+            self._write_json(
+                os.path.join(fx_dir, "forex_thinker_status.json"),
+                {
+                    "updated_at": 1_700_000_000,
+                    "fallback_cached": False,
+                    "health": {"data_ok": True},
+                    "reject_summary": {"reject_rate_pct": 8.0},
+                    "top_pick": {
+                        "pair": "EUR_USD",
+                        "side": "long",
+                        "score": 0.72,
+                        "eligible_for_entry": True,
+                        "data_quality_ok": True,
+                        "calib_prob": 0.78,
+                        "samples": 18,
+                        "calibration_effective_samples": 18,
+                        "calibration_effective_prob": 0.78,
+                        "bars_count": 60,
+                    },
+                    "leaders": [{
+                        "pair": "EUR_USD",
+                        "side": "long",
+                        "score": 0.72,
+                        "eligible_for_entry": True,
+                        "data_quality_ok": True,
+                        "calib_prob": 0.78,
+                        "samples": 18,
+                        "calibration_effective_samples": 18,
+                        "calibration_effective_prob": 0.78,
+                        "bars_count": 60,
+                    }],
+                    "all_scores": [{
+                        "pair": "EUR_USD",
+                        "side": "long",
+                        "score": 0.72,
+                        "eligible_for_entry": True,
+                        "data_quality_ok": True,
+                        "calib_prob": 0.78,
+                        "samples": 18,
+                        "calibration_effective_samples": 18,
+                        "calibration_effective_prob": 0.78,
+                        "bars_count": 60,
+                    }],
+                },
+            )
+            self._write_json(
+                os.path.join(stocks_dir, "stock_trader_status.json"),
+                {
+                    "exposure_usd": 75_000.0,
+                },
+            )
+            settings = {
+                "oanda_practice_mode": False,
+                "forex_auto_trade_enabled": True,
+                "forex_require_data_quality_ok_for_entries": True,
+                "forex_require_reject_rate_max_pct": 95.0,
+                "forex_block_entries_on_cached_scan": False,
+                "market_rollout_stage": "execution_v2",
+                "forex_max_signal_age_seconds": 600,
+                "forex_max_open_positions": 3,
+                "forex_trade_units": 1000,
+                "forex_session_mode": "all",
+                "market_max_total_exposure_pct": 40.0,
+                "market_independent_execution_enabled": True,
+            }
+            with (
+                patch.object(forex_trader, "get_oanda_creds", return_value=("acct", "token")),
+                patch.object(forex_trader, "OandaBrokerClient", _FakeOandaClient),
+                patch("engines.forex_trader.time.time", return_value=1_700_000_100),
+            ):
+                out = forex_trader.run_step(settings, td)
+            self.assertEqual(str(out.get("state", "")), "READY")
+            self.assertNotIn("global cap", str(out.get("entry_eval_top_reason", "")).lower())
+            gate = out.get("entry_gate_flags", {}) if isinstance(out.get("entry_gate_flags", {}), dict) else {}
+            self.assertTrue(bool(gate.get("independent_market_mode", False)))
+
     def test_stock_global_cap_uses_portfolio_account_basis_when_available(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             stocks_dir = os.path.join(td, "stocks")
@@ -379,6 +476,59 @@ class TestTraderQualityGates(unittest.TestCase):
             gate = out.get("entry_gate_flags", {}) if isinstance(out.get("entry_gate_flags", {}), dict) else {}
             self.assertGreater(float(gate.get("cross_market_cap_basis_usd", 0.0) or 0.0), 250.0)
             self.assertLess(float(gate.get("cross_market_exposure_pct", 999.0) or 999.0), 40.0)
+
+    def test_stock_independent_market_mode_ignores_cross_market_global_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            stocks_dir = os.path.join(td, "stocks")
+            fx_dir = os.path.join(td, "forex")
+            os.makedirs(stocks_dir, exist_ok=True)
+            os.makedirs(fx_dir, exist_ok=True)
+            self._write_json(
+                os.path.join(stocks_dir, "stock_thinker_status.json"),
+                {
+                    "updated_at": 1_700_000_000,
+                    "fallback_cached": False,
+                    "health": {"data_ok": True},
+                    "reject_summary": {"reject_rate_pct": 8.0},
+                    "top_pick": {"symbol": "AAPL", "side": "long", "score": 1.2, "eligible_for_entry": True, "data_quality_ok": True, "bars_count": 60},
+                    "leaders": [{"symbol": "AAPL", "side": "long", "score": 1.2, "eligible_for_entry": True, "data_quality_ok": True, "bars_count": 60}],
+                    "all_scores": [{"symbol": "AAPL", "side": "long", "score": 1.2, "eligible_for_entry": True, "data_quality_ok": True, "bars_count": 60}],
+                },
+            )
+            self._write_json(
+                os.path.join(td, "trader_data.json"),
+                {"account": {"total_account_value": 100.0, "holdings_sell_value": 90.0, "buying_power": 5.0}},
+            )
+            self._write_json(
+                os.path.join(td, "forex", "forex_trader_status.json"),
+                {"exposure_usd": 80_000.0, "account_value_usd": 100.0},
+            )
+            settings = {
+                "alpaca_paper_mode": False,
+                "stock_auto_trade_enabled": True,
+                "stock_require_data_quality_ok_for_entries": True,
+                "stock_require_reject_rate_max_pct": 95.0,
+                "stock_block_entries_on_cached_scan": False,
+                "market_rollout_stage": "execution_v2",
+                "stock_max_signal_age_seconds": 600,
+                "stock_max_open_positions": 3,
+                "stock_trade_notional_usd": 1.0,
+                "market_max_total_exposure_pct": 40.0,
+                "market_independent_execution_enabled": True,
+            }
+            with (
+                patch.object(stock_trader, "get_alpaca_creds", return_value=("key", "secret")),
+                patch.object(stock_trader, "AlpacaBrokerClient", _FakeAlpacaClient),
+                patch.object(_FakeAlpacaClient, "get_account_summary", return_value={"equity": 100.0}),
+                patch.object(stock_trader, "_market_open_now", return_value=True),
+                patch.object(stock_trader, "_near_close_blocked", return_value=False),
+                patch("engines.stock_trader.time.time", return_value=1_700_000_100),
+            ):
+                out = stock_trader.run_step(settings, td)
+            self.assertEqual(str(out.get("state", "")), "READY")
+            self.assertNotIn("global cap", str(out.get("entry_eval_top_reason", "")).lower())
+            gate = out.get("entry_gate_flags", {}) if isinstance(out.get("entry_gate_flags", {}), dict) else {}
+            self.assertTrue(bool(gate.get("independent_market_mode", False)))
 
     def test_stock_ignores_cooldown_dominated_reject_pressure_when_leaders_exist(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1086,6 +1236,86 @@ class TestTraderQualityGates(unittest.TestCase):
             self.assertNotIn("risk cap", str(out.get("entry_eval_top_reason", "")).lower())
             self.assertEqual(float(out.get("risk_cap_size_scale", 0.0) or 0.0), 1.0)
             self.assertIn("units=50", " | ".join([str(x) for x in list(out.get("actions", []) or [])]))
+
+    def test_forex_max_growth_uses_exposure_budget_slots_over_count_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            fx_dir = os.path.join(td, "forex")
+            os.makedirs(fx_dir, exist_ok=True)
+            self._write_json(
+                os.path.join(fx_dir, "forex_thinker_status.json"),
+                {
+                    "updated_at": 1_700_000_000,
+                    "fallback_cached": False,
+                    "health": {"data_ok": True},
+                    "reject_summary": {"reject_rate_pct": 8.0},
+                    "top_pick": {
+                        "pair": "EUR_USD",
+                        "side": "long",
+                        "score": 0.72,
+                        "eligible_for_entry": True,
+                        "data_quality_ok": True,
+                        "calib_prob": 0.78,
+                        "samples": 18,
+                        "calibration_effective_samples": 18,
+                        "calibration_effective_prob": 0.78,
+                        "bars_count": 60,
+                    },
+                    "leaders": [{
+                        "pair": "EUR_USD",
+                        "side": "long",
+                        "score": 0.72,
+                        "eligible_for_entry": True,
+                        "data_quality_ok": True,
+                        "calib_prob": 0.78,
+                        "samples": 18,
+                        "calibration_effective_samples": 18,
+                        "calibration_effective_prob": 0.78,
+                        "bars_count": 60,
+                    }],
+                    "all_scores": [{
+                        "pair": "EUR_USD",
+                        "side": "long",
+                        "score": 0.72,
+                        "eligible_for_entry": True,
+                        "data_quality_ok": True,
+                        "calib_prob": 0.78,
+                        "samples": 18,
+                        "calibration_effective_samples": 18,
+                        "calibration_effective_prob": 0.78,
+                        "bars_count": 60,
+                    }],
+                },
+            )
+            settings = {
+                "oanda_practice_mode": False,
+                "settings_profile": "max_growth",
+                "settings_control_mode": "preset_managed",
+                "forex_auto_trade_enabled": True,
+                "forex_require_data_quality_ok_for_entries": True,
+                "forex_require_reject_rate_max_pct": 95.0,
+                "forex_block_entries_on_cached_scan": False,
+                "market_rollout_stage": "execution_v2",
+                "forex_max_signal_age_seconds": 600,
+                "forex_max_open_positions": 1,
+                "forex_trade_units": 40,
+                "forex_score_threshold": 0.10,
+                "forex_max_total_exposure_pct": 35.0,
+                "market_max_total_exposure_pct": 40.0,
+                "forex_session_mode": "all",
+            }
+            with (
+                patch.object(forex_trader, "get_oanda_creds", return_value=("acct", "token")),
+                patch.object(forex_trader, "OandaBrokerClient", _OneOpenPositionOandaClient),
+                patch("engines.forex_trader.time.time", return_value=1_700_000_100),
+            ):
+                out = forex_trader.run_step(settings, td)
+            self.assertEqual(str(out.get("state", "")), "READY")
+            self.assertIn("entry placed", str(out.get("msg", "")).lower())
+            self.assertNotIn("max open positions reached", str(out.get("entry_eval_top_reason", "")).lower())
+            flags = out.get("entry_gate_flags", {}) if isinstance(out.get("entry_gate_flags", {}), dict) else {}
+            self.assertEqual(str(flags.get("position_cap_mode", "")), "exposure_budget")
+            self.assertEqual(int(flags.get("max_open_positions_setting", 0) or 0), 1)
+            self.assertGreaterEqual(int(flags.get("max_open_positions_effective_hard", 0) or 0), 3)
 
 
 if __name__ == "__main__":

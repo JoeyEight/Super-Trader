@@ -42,6 +42,9 @@ MANUAL_CRYPTO_ORDER_RESULTS_PATH = os.path.join(HUB_DATA_DIR, "crypto_manual_ord
 os.makedirs(MANUAL_CRYPTO_ORDERS_DIR, exist_ok=True)
 RUNTIME_STATE_PATH = os.path.join(HUB_DATA_DIR, "runtime_state.json")
 CRYPTO_DYNAMIC_STATUS_PATH = os.path.join(HUB_DATA_DIR, "crypto_dynamic_status.json")
+CRYPTO_MARKET_DIR = os.path.join(HUB_DATA_DIR, "crypto")
+CRYPTO_EXECUTION_AUDIT_PATH = os.path.join(CRYPTO_MARKET_DIR, "execution_audit.jsonl")
+os.makedirs(CRYPTO_MARKET_DIR, exist_ok=True)
 
 
 
@@ -928,6 +931,17 @@ class CryptoAPITrading:
         top = sorted(counts.items(), key=lambda item: item[1], reverse=True)[0][0]
         return str(top), counts
 
+    def _append_execution_audit(self, row: Dict[str, Any]) -> None:
+        try:
+            payload = dict(row or {})
+            payload.setdefault("ts", int(time.time()))
+            payload.setdefault("date", time.strftime("%Y-%m-%d", time.localtime()))
+            os.makedirs(os.path.dirname(CRYPTO_EXECUTION_AUDIT_PATH), exist_ok=True)
+            with open(CRYPTO_EXECUTION_AUDIT_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        except Exception:
+            pass
+
     @staticmethod
     def _profile_quality_thresholds(profile_key: Any) -> tuple[float, float]:
         pkey = normalize_settings_profile(profile_key, default="balanced")
@@ -945,6 +959,7 @@ class CryptoAPITrading:
         start_level: int,
         *,
         policy_mode: str = "",
+        adaptive_dynamic_threshold: float = 0.0,
     ) -> Dict[str, Any]:
         lvl = max(1, min(int(start_level or 3), 7))
         profile = normalize_settings_profile(profile_key, default="balanced")
@@ -963,6 +978,9 @@ class CryptoAPITrading:
             if mode not in {"restricted", "safe"}:
                 allow_dynamic_fallback = True
                 min_dynamic_score = 1.10 if mode in {"aggressive", "aggressive_rotation"} else 1.35
+        adaptive_floor = max(0.0, float(adaptive_dynamic_threshold or 0.0))
+        if bool(allow_dynamic_fallback) and adaptive_floor > 0.0:
+            min_dynamic_score = max(float(min_dynamic_score), float(adaptive_floor))
         requirement_text = f"need long>={int(min_long_count)} and short<={int(max_short_count)}"
         if bool(allow_dynamic_fallback):
             requirement_text = (
@@ -976,6 +994,7 @@ class CryptoAPITrading:
             "max_short_count": int(max_short_count),
             "allow_dynamic_fallback": bool(allow_dynamic_fallback),
             "min_dynamic_score": float(min_dynamic_score),
+            "adaptive_dynamic_threshold": float(adaptive_floor),
             "requirement_text": str(requirement_text),
         }
 
@@ -989,8 +1008,16 @@ class CryptoAPITrading:
         sell_count: int,
         dynamic_score: float,
         policy_mode: str = "",
+        adaptive_dynamic_threshold: float = 0.0,
+        calibration_prob: float = 0.0,
+        min_calibration_prob: float = 0.0,
     ) -> Dict[str, Any]:
-        rules = cls._crypto_signal_gate_rules(profile_key, start_level, policy_mode=policy_mode)
+        rules = cls._crypto_signal_gate_rules(
+            profile_key,
+            start_level,
+            policy_mode=policy_mode,
+            adaptive_dynamic_threshold=float(adaptive_dynamic_threshold or 0.0),
+        )
         min_long_count = int(rules.get("min_long_count", start_level) or start_level)
         max_short_count = int(rules.get("max_short_count", 0) or 0)
         allow_dynamic_fallback = bool(rules.get("allow_dynamic_fallback", False))
@@ -1001,12 +1028,18 @@ class CryptoAPITrading:
         short_ok = scount <= max_short_count
         long_ok = bcount >= min_long_count
         dynamic_ok = bool(allow_dynamic_fallback and short_ok and dyn >= min_dynamic_score)
-        passed = bool(short_ok and (long_ok or dynamic_ok))
+        calib_prob = float(calibration_prob or 0.0)
+        min_calib = max(0.0, float(min_calibration_prob or 0.0))
+        calib_applied = bool(min_calib > 0.0 and calib_prob > 0.0)
+        calib_ok = bool((not calib_applied) or (calib_prob >= min_calib))
+        passed = bool(short_ok and (long_ok or dynamic_ok) and calib_ok)
         gate_mode = "long_signal" if bool(passed and long_ok) else ("dynamic_score_fallback" if bool(passed and dynamic_ok) else "blocked")
         failure_reason = ""
         if not passed:
             if not short_ok:
                 failure_reason = f"short pressure active (N{scount} > N{max_short_count})"
+            elif not calib_ok:
+                failure_reason = f"calibration confidence too low ({calib_prob:.3f} < {min_calib:.3f})"
             elif allow_dynamic_fallback:
                 failure_reason = (
                     f"insufficient momentum (long=N{bcount}, dynamic={dyn:.3f}, "
@@ -1026,6 +1059,10 @@ class CryptoAPITrading:
             "buy_count": int(bcount),
             "sell_count": int(scount),
             "dynamic_score": float(dyn),
+            "adaptive_dynamic_threshold": float(rules.get("adaptive_dynamic_threshold", 0.0) or 0.0),
+            "calibration_prob": float(calib_prob),
+            "min_calibration_prob": float(min_calib),
+            "calibration_gate_applied": bool(calib_applied),
         }
 
     @classmethod
@@ -1038,6 +1075,9 @@ class CryptoAPITrading:
         sell_count: int,
         dynamic_score: float,
         policy_mode: str = "",
+        adaptive_dynamic_threshold: float = 0.0,
+        calibration_prob: float = 0.0,
+        min_calibration_prob: float = 0.0,
     ) -> Dict[str, Any]:
         signal_eval = cls._evaluate_crypto_signal_gate(
             profile_key=profile_key,
@@ -1046,6 +1086,9 @@ class CryptoAPITrading:
             sell_count=int(sell_count),
             dynamic_score=float(dynamic_score),
             policy_mode=str(policy_mode or ""),
+            adaptive_dynamic_threshold=float(adaptive_dynamic_threshold or 0.0),
+            calibration_prob=float(calibration_prob or 0.0),
+            min_calibration_prob=float(min_calibration_prob or 0.0),
         )
         bcount = int(signal_eval.get("buy_count", buy_count) or buy_count or 0)
         scount = int(signal_eval.get("sell_count", sell_count) or sell_count or 0)
@@ -1119,6 +1162,10 @@ class CryptoAPITrading:
             "buy_count": int(bcount),
             "sell_count": int(scount),
             "dynamic_score": float(dyn),
+            "adaptive_dynamic_threshold": float(signal_eval.get("adaptive_dynamic_threshold", adaptive_dynamic_threshold) or 0.0),
+            "calibration_prob": float(signal_eval.get("calibration_prob", calibration_prob) or 0.0),
+            "min_calibration_prob": float(signal_eval.get("min_calibration_prob", min_calibration_prob) or 0.0),
+            "calibration_gate_applied": bool(signal_eval.get("calibration_gate_applied", False)),
         }
 
     @staticmethod
@@ -1126,14 +1173,17 @@ class CryptoAPITrading:
         dynamic_score: float,
         buy_count: int,
         start_level: int,
+        adaptive_threshold: float = 0.0,
     ) -> tuple[float, float]:
         dyn = float(dynamic_score or 0.0)
         lvl = max(1, min(int(start_level or 3), 7))
         if dyn > 0.0:
-            required = max(0.01, dyn)
+            required = max(0.01, float(adaptive_threshold or 0.0))
+            if required <= 0.01:
+                required = max(0.01, dyn)
             return dyn, required
         proxy = float(max(0, int(buy_count or 0))) / 7.0
-        required = float(lvl) / 7.0
+        required = max(float(lvl) / 7.0, float(adaptive_threshold or 0.0))
         return proxy, required
 
     def _crypto_alignment_snapshot(
@@ -1145,6 +1195,9 @@ class CryptoAPITrading:
         profile_key: Any = "balanced",
         dynamic_score: float = 0.0,
         policy_mode: str = "",
+        adaptive_dynamic_threshold: float = 0.0,
+        calibration_prob: float = 0.0,
+        min_calibration_prob: float = 0.0,
     ) -> Dict[str, Any]:
         coin = str(base_symbol or "").strip().upper()
         if not coin:
@@ -1161,6 +1214,9 @@ class CryptoAPITrading:
             sell_count=int(sell_count),
             dynamic_score=float(dynamic_score or 0.0),
             policy_mode=str(policy_mode or ""),
+            adaptive_dynamic_threshold=float(adaptive_dynamic_threshold or 0.0),
+            calibration_prob=float(calibration_prob or 0.0),
+            min_calibration_prob=float(min_calibration_prob or 0.0),
         )
         if not bool(gate_eval.get("passed", True)):
             failure_reason = str(gate_eval.get("failure_reason", "") or "").strip()
@@ -1174,6 +1230,9 @@ class CryptoAPITrading:
             "buy_count": int(buy_count),
             "sell_count": int(sell_count),
             "dynamic_score": float(dynamic_score or 0.0),
+            "adaptive_dynamic_threshold": float(adaptive_dynamic_threshold or 0.0),
+            "calibration_prob": float(calibration_prob or 0.0),
+            "min_calibration_prob": float(min_calibration_prob or 0.0),
             "signal_gate_mode": str(gate_eval.get("gate_mode", "blocked") or "blocked"),
             "signal_requirement": str(gate_eval.get("requirement_text", "") or ""),
         }
@@ -1428,6 +1487,9 @@ class CryptoAPITrading:
         buying_power_before: Optional[float] = None,
         buying_power_after: Optional[float] = None,
         buying_power_delta: Optional[float] = None,
+        score: Optional[float] = None,
+        required_score: Optional[float] = None,
+        calib_prob: Optional[float] = None,
     ) -> None:
         """
         Minimal local ledger for GUI:
@@ -1576,8 +1638,31 @@ class CryptoAPITrading:
             "buying_power_delta": float(buying_power_delta) if buying_power_delta is not None else None,
             "position_cost_used_usd": float(position_cost_used) if position_cost_used is not None else None,
             "position_cost_after_usd": float(position_cost_after) if position_cost_after is not None else None,
+            "score": float(score) if score is not None else None,
+            "required_score": float(required_score) if required_score is not None else None,
+            "calib_prob": float(calib_prob) if calib_prob is not None else None,
         }
         self._append_jsonl(TRADE_HISTORY_PATH, entry)
+        audit_event = "entry" if side_l == "buy" else ("exit" if side_l == "sell" else "trade")
+        self._append_execution_audit(
+            {
+                "ts": int(ts),
+                "event": audit_event,
+                "ok": True,
+                "symbol": str(symbol or "").strip().upper(),
+                "side": str(side_l),
+                "qty": float(qty or 0.0),
+                "price": float(price) if price is not None else None,
+                "pnl_pct": float(effective_pnl_pct) if effective_pnl_pct is not None else None,
+                "realized_pnl_usd": float(realized) if realized is not None else None,
+                "score": float(score) if score is not None else None,
+                "required_score": float(required_score) if required_score is not None else None,
+                "calib_prob": float(calib_prob) if calib_prob is not None else None,
+                "tag": tag,
+                "order_id": order_id,
+                "payload": dict(entry),
+            }
+        )
 
 
 
@@ -2148,6 +2233,7 @@ class CryptoAPITrading:
         avg_cost_basis: Optional[float] = None,
         pnl_pct: Optional[float] = None,
         tag: Optional[str] = None,
+        audit_meta: Optional[Dict[str, Any]] = None,
     ) -> Any:
         # Fetch the current price of the asset (for sizing only)
         current_buy_prices, current_sell_prices, valid_symbols = self.get_price([symbol])
@@ -2231,6 +2317,13 @@ class CryptoAPITrading:
                             buying_power_before=buying_power_before,
                             buying_power_after=buying_power_after,
                             buying_power_delta=buying_power_delta,
+                            score=float((audit_meta or {}).get("score", 0.0) or 0.0) if isinstance(audit_meta, dict) and ((audit_meta or {}).get("score", None) is not None) else None,
+                            required_score=float((audit_meta or {}).get("required_score", 0.0) or 0.0)
+                            if isinstance(audit_meta, dict) and ((audit_meta or {}).get("required_score", None) is not None)
+                            else None,
+                            calib_prob=float((audit_meta or {}).get("calib_prob", 0.0) or 0.0)
+                            if isinstance(audit_meta, dict) and ((audit_meta or {}).get("calib_prob", None) is not None)
+                            else None,
                         )
 
                         # Clear pending now that it is recorded
@@ -2635,6 +2728,7 @@ class CryptoAPITrading:
         entry_eval_top_reason = ""
         entry_eval_reason_counts: Dict[str, int] = {}
         entry_size_scale = 1.0
+        allocator_size_scale = 1.0
         entry_gate_flags: Dict[str, Any] = {}
         stale_exit_events: List[Dict[str, Any]] = []
         stale_exit_count = 0
@@ -2742,6 +2836,8 @@ class CryptoAPITrading:
         dynamic_updated_ts = int(float(dynamic_status.get("ts", dynamic_status.get("updated_at", 0) or 0) or 0))
         dynamic_rank_rows = dynamic_status.get("ranked", []) if isinstance(dynamic_status.get("ranked", []), list) else []
         dynamic_rank_map: Dict[str, float] = {}
+        dynamic_calib_prob_map: Dict[str, float] = {}
+        dynamic_samples_map: Dict[str, int] = {}
         for row in list(dynamic_rank_rows):
             if not isinstance(row, dict):
                 continue
@@ -2752,6 +2848,48 @@ class CryptoAPITrading:
                 dynamic_rank_map[symbol] = float(row.get("score", 0.0) or 0.0)
             except Exception:
                 dynamic_rank_map[symbol] = 0.0
+            try:
+                dynamic_calib_prob_map[symbol] = float(row.get("calib_prob", 0.0) or 0.0)
+            except Exception:
+                dynamic_calib_prob_map[symbol] = 0.0
+            try:
+                dynamic_samples_map[symbol] = int(float(row.get("samples", row.get("symbol_samples", 0)) or 0))
+            except Exception:
+                dynamic_samples_map[symbol] = 0
+        dynamic_adaptive_threshold = max(
+            0.0,
+            float(
+                dynamic_status.get(
+                    "adaptive_threshold",
+                    dynamic_status.get(
+                        "min_projected_edge_pct",
+                        settings.get("crypto_dynamic_min_projected_edge_pct", settings.get("crypto_allocator_signal_floor", 0.15)),
+                    ),
+                )
+                or 0.0
+            ),
+        )
+        dynamic_calibration_recommended_threshold = max(
+            0.0,
+            float(
+                dynamic_status.get(
+                    "calibration_recommended_threshold",
+                    dynamic_adaptive_threshold,
+                )
+                or dynamic_adaptive_threshold
+            ),
+        )
+        min_crypto_calib_prob = max(
+            0.0,
+            min(
+                1.0,
+                float(settings.get("crypto_min_calib_prob_live_guarded", 0.50) or 0.50),
+            ),
+        )
+        min_crypto_calib_samples = max(
+            0,
+            int(float(settings.get("crypto_min_samples_live_guarded", settings.get("adaptive_confidence_min_samples", 6)) or 6)),
+        )
         reject_rows = dynamic_status.get("rejected", []) if isinstance(dynamic_status.get("rejected", []), list) else []
         ranked_count = len([r for r in dynamic_rank_rows if isinstance(r, dict)])
         rejected_count = len([r for r in reject_rows if isinstance(r, dict)])
@@ -3045,6 +3183,14 @@ class CryptoAPITrading:
                 dynamic_current_set=dynamic_current_set,
                 profile_key=profile_key,
                 dynamic_score=float(dynamic_rank_map.get(str(symbol).upper().strip(), 0.0) or 0.0),
+                policy_mode=str(policy.get("mode", "") or ""),
+                adaptive_dynamic_threshold=float(dynamic_adaptive_threshold),
+                calibration_prob=float(dynamic_calib_prob_map.get(str(symbol).upper().strip(), 0.0) or 0.0),
+                min_calibration_prob=(
+                    float(min_crypto_calib_prob)
+                    if int(dynamic_samples_map.get(str(symbol).upper().strip(), 0) or 0) >= int(min_crypto_calib_samples)
+                    else 0.0
+                ),
             )
             align_reasons = list(align_snapshot.get("reasons", []) or [])
             if bool(align_snapshot.get("aligned", True)):
@@ -3633,6 +3779,9 @@ class CryptoAPITrading:
                 buy_count = int(cand.get("buy_count", 0) or 0)
                 sell_count = int(cand.get("sell_count", 0) or 0)
                 dynamic_score = float(cand.get("dynamic_score", 0.0) or 0.0)
+                calib_prob = float(dynamic_calib_prob_map.get(base_symbol, 0.0) or 0.0)
+                calib_samples = int(dynamic_samples_map.get(base_symbol, 0) or 0)
+                calib_gate_min = float(min_crypto_calib_prob) if calib_samples >= int(min_crypto_calib_samples) else 0.0
                 gate_eval = self._evaluate_crypto_signal_gate(
                     profile_key=profile_key,
                     start_level=int(start_level),
@@ -3640,6 +3789,9 @@ class CryptoAPITrading:
                     sell_count=int(sell_count),
                     dynamic_score=float(dynamic_score),
                     policy_mode=str(policy.get("mode", "") or ""),
+                    adaptive_dynamic_threshold=float(dynamic_adaptive_threshold),
+                    calibration_prob=float(calib_prob),
+                    min_calibration_prob=float(calib_gate_min),
                 )
                 signal_gate_debug = {
                     "symbol": str(base_symbol),
@@ -3650,6 +3802,11 @@ class CryptoAPITrading:
                     "allow_dynamic_fallback": bool(gate_eval.get("allow_dynamic_fallback", False)),
                     "min_dynamic_score": float(gate_eval.get("min_dynamic_score", 0.0) or 0.0),
                     "dynamic_score": round(float(gate_eval.get("dynamic_score", 0.0) or 0.0), 4),
+                    "adaptive_dynamic_threshold": round(float(gate_eval.get("adaptive_dynamic_threshold", dynamic_adaptive_threshold) or dynamic_adaptive_threshold), 4),
+                    "calibration_prob": round(float(calib_prob), 4),
+                    "calibration_samples": int(calib_samples),
+                    "min_calibration_prob": round(float(calib_gate_min), 4),
+                    "calibration_gate_applied": bool(gate_eval.get("calibration_gate_applied", False)),
                 }
                 if not bool(gate_eval.get("passed", False)):
                     fail_reason = str(gate_eval.get("failure_reason", "") or "").strip()
@@ -3670,6 +3827,9 @@ class CryptoAPITrading:
                     sell_count=int(sell_count),
                     dynamic_score=float(dynamic_score),
                     policy_mode=str(policy.get("mode", "") or ""),
+                    adaptive_dynamic_threshold=float(dynamic_adaptive_threshold),
+                    calibration_prob=float(calib_prob),
+                    min_calibration_prob=float(calib_gate_min),
                 )
                 entry_alignment_debug = {
                     "symbol": str(base_symbol),
@@ -3682,6 +3842,10 @@ class CryptoAPITrading:
                     "min_dynamic_long_count": int(entry_align_eval.get("min_dynamic_long_count", 0) or 0),
                     "dynamic_score": round(float(entry_align_eval.get("dynamic_score", 0.0) or 0.0), 4),
                     "passed": bool(entry_align_eval.get("passed", False)),
+                    "adaptive_dynamic_threshold": round(float(entry_align_eval.get("adaptive_dynamic_threshold", dynamic_adaptive_threshold) or dynamic_adaptive_threshold), 4),
+                    "calibration_prob": round(float(entry_align_eval.get("calibration_prob", calib_prob) or calib_prob), 4),
+                    "min_calibration_prob": round(float(entry_align_eval.get("min_calibration_prob", calib_gate_min) or calib_gate_min), 4),
+                    "calibration_gate_applied": bool(entry_align_eval.get("calibration_gate_applied", False)),
                 }
                 if not bool(entry_align_eval.get("passed", False)):
                     align_reason = str(entry_align_eval.get("failure_reason", "") or "").strip()
@@ -3750,6 +3914,7 @@ class CryptoAPITrading:
                     float(dynamic_score),
                     buy_count,
                     start_level,
+                    adaptive_threshold=float(dynamic_adaptive_threshold),
                 )
                 mid_px = (px_buy + px_sell) / 2.0 if (px_buy > 0.0 and px_sell > 0.0) else 0.0
                 spread_bps = 0.0
@@ -3854,6 +4019,12 @@ class CryptoAPITrading:
                     entry_fail_reasons.append(f"Portfolio allocator: {alloc_reason}")
                     continue
                 opportunity_eval = dict(allocator_eval)
+                allocator_size_scale = max(
+                    0.25,
+                    min(1.0, float((allocator_eval.get("size_multiplier", 1.0) if isinstance(allocator_eval, dict) else 1.0) or 1.0)),
+                )
+                if abs(float(allocator_size_scale) - 1.0) >= 0.001:
+                    proposed_notional = max(0.5, float(proposed_notional) * float(allocator_size_scale))
 
                 response = self.place_buy_order(
                     str(uuid.uuid4()),
@@ -3861,11 +4032,16 @@ class CryptoAPITrading:
                     "market",
                     full_symbol,
                     proposed_notional,
+                    audit_meta={
+                        "score": float(signal_score),
+                        "required_score": float(required_score),
+                        "calib_prob": float(calib_prob),
+                    },
                 )
                 if response and "errors" not in response:
                     selected_symbol = base_symbol
                     entry_fail_reasons = []
-                    entry_size_scale = quality_size_mult
+                    entry_size_scale = quality_size_mult * float(allocator_size_scale)
                     trades_made = True
                     self._set_status_note(f"Entry placed for {base_symbol}")
                     self.dca_levels_triggered[base_symbol] = []
@@ -3880,7 +4056,22 @@ class CryptoAPITrading:
                     holdings = self.get_holdings()
                     holding_full_symbols = [f"{h['asset_code']}-USD" for h in holdings.get("results", [])]
                     break
-                entry_fail_reasons.append(f"Order rejected for {base_symbol}")
+                reject_msg = f"Order rejected for {base_symbol}"
+                entry_fail_reasons.append(reject_msg)
+                self._append_execution_audit(
+                    {
+                        "event": "entry_fail",
+                        "ok": False,
+                        "symbol": str(base_symbol),
+                        "side": "buy",
+                        "score": float(signal_score),
+                        "required_score": float(required_score),
+                        "calib_prob": float(calib_prob),
+                        "notional": float(proposed_notional),
+                        "msg": reject_msg,
+                        "payload": response if isinstance(response, dict) else {},
+                    }
+                )
 
             if (not selected_symbol) and (not entry_fail_reasons):
                 entry_fail_reasons.append("No crypto candidates passed policy and quality gates")
@@ -3920,8 +4111,19 @@ class CryptoAPITrading:
         allocator_evaluated = bool(isinstance(opportunity_eval, dict) and opportunity_eval)
         allocator_reasons = opportunity_eval.get("reasons", []) if isinstance(opportunity_eval.get("reasons", []), list) else []
         allocator_top_reason = str((allocator_reasons[0] if allocator_reasons else "") or "").strip()
+        allocator_ai = opportunity_eval.get("openai_decision", {}) if isinstance(opportunity_eval.get("openai_decision", {}), dict) else {}
         trade_confidence_score = float(trade_quality_eval.get("confidence_score", 0.0) or 0.0) if trade_quality_evaluated else 0.0
         quality_size_scale = float(trade_quality_eval.get("size_multiplier", 1.0) or 1.0) if trade_quality_evaluated else 1.0
+        try:
+            allocator_size_from_eval = float(opportunity_eval.get("size_multiplier", 1.0) or 1.0)
+        except Exception:
+            allocator_size_from_eval = 1.0
+        allocator_size_from_eval = max(0.25, min(1.0, float(allocator_size_from_eval)))
+        try:
+            openai_confidence = float(allocator_ai.get("portfolio_confidence", 0.0) or 0.0)
+        except Exception:
+            openai_confidence = 0.0
+        openai_confidence = max(0.0, min(1.0, float(openai_confidence)))
         entry_gate_flags = {
             "data_quality_ok": bool(market_health.get("data_ok", True)),
             "broker_ok": bool(market_health.get("broker_ok", True)),
@@ -3933,6 +4135,10 @@ class CryptoAPITrading:
             else 0,
             "reject_rate_pct": round(float(reject_rate_pct), 4),
             "reject_rate_max_pct": round(float(settings.get("runtime_alert_scan_reject_crit_pct", 85.0) or 85.0), 4),
+            "adaptive_threshold_dynamic": round(float(dynamic_adaptive_threshold), 4),
+            "adaptive_threshold_calibration_recommended": round(float(dynamic_calibration_recommended_threshold), 4),
+            "min_calibration_prob": round(float(min_crypto_calib_prob), 4),
+            "min_calibration_samples": int(min_crypto_calib_samples),
             "max_spread_bps": round(float(effective_crypto_max_spread_bps), 4),
             "runtime_trust_score": round(float(runtime_trust.get("score", 0.0) or 0.0), 4),
             "runtime_trust_mode": str(runtime_trust.get("mode", "") or ""),
@@ -3949,6 +4155,14 @@ class CryptoAPITrading:
             "portfolio_allocator_score": round(float(opportunity_eval.get("current_market_score", 0.0) or 0.0), 4),
             "portfolio_allocator_top_reason": allocator_top_reason,
             "portfolio_allocator_capital_constrained": bool(opportunity_eval.get("capital_constrained", False)) if allocator_evaluated else False,
+            "portfolio_allocator_size_scale": round(float(allocator_size_from_eval), 4) if allocator_evaluated else 1.0,
+            "portfolio_allocator_decision_source": str(opportunity_eval.get("decision_source", "") or "") if allocator_evaluated else "",
+            "openai_decision_active": bool(allocator_ai.get("active", False)),
+            "openai_decision_status": str(allocator_ai.get("status", "") or ""),
+            "openai_decision": str(allocator_ai.get("decision", "") or ""),
+            "openai_decision_best_market": str(allocator_ai.get("best_market", "") or ""),
+            "openai_decision_confidence": round(float(openai_confidence), 4),
+            "openai_decision_applied": bool(allocator_ai.get("applied", False)),
             "signal_quality_pass": bool(quality_layers.get("signal_quality", False)),
             "execution_quality_pass": bool(quality_layers.get("execution_quality", False)),
             "compliance_permission_pass": bool(quality_layers.get("compliance_permission", False)),
@@ -3971,6 +4185,11 @@ class CryptoAPITrading:
             "signal_gate_dynamic_fallback": bool(signal_gate_debug.get("allow_dynamic_fallback", False)),
             "signal_gate_min_dynamic_score": round(float(signal_gate_debug.get("min_dynamic_score", 0.0) or 0.0), 4),
             "signal_gate_dynamic_score": round(float(signal_gate_debug.get("dynamic_score", 0.0) or 0.0), 4),
+            "signal_gate_adaptive_dynamic_threshold": round(float(signal_gate_debug.get("adaptive_dynamic_threshold", 0.0) or 0.0), 4),
+            "signal_gate_calibration_prob": round(float(signal_gate_debug.get("calibration_prob", 0.0) or 0.0), 4),
+            "signal_gate_calibration_samples": int(signal_gate_debug.get("calibration_samples", 0) or 0),
+            "signal_gate_min_calibration_prob": round(float(signal_gate_debug.get("min_calibration_prob", 0.0) or 0.0), 4),
+            "signal_gate_calibration_gate_applied": bool(signal_gate_debug.get("calibration_gate_applied", False)),
             "entry_alignment_symbol": str(entry_alignment_debug.get("symbol", "") or ""),
             "entry_alignment_mode": str(entry_alignment_debug.get("alignment_mode", "") or ""),
             "entry_alignment_requirement": str(entry_alignment_debug.get("requirement", "") or ""),
@@ -3980,6 +4199,10 @@ class CryptoAPITrading:
             "entry_alignment_dynamic_margin": round(float(entry_alignment_debug.get("dynamic_margin", 0.0) or 0.0), 4),
             "entry_alignment_min_dynamic_long_count": int(entry_alignment_debug.get("min_dynamic_long_count", 0) or 0),
             "entry_alignment_dynamic_score": round(float(entry_alignment_debug.get("dynamic_score", 0.0) or 0.0), 4),
+            "entry_alignment_adaptive_dynamic_threshold": round(float(entry_alignment_debug.get("adaptive_dynamic_threshold", 0.0) or 0.0), 4),
+            "entry_alignment_calibration_prob": round(float(entry_alignment_debug.get("calibration_prob", 0.0) or 0.0), 4),
+            "entry_alignment_min_calibration_prob": round(float(entry_alignment_debug.get("min_calibration_prob", 0.0) or 0.0), 4),
+            "entry_alignment_calibration_gate_applied": bool(entry_alignment_debug.get("calibration_gate_applied", False)),
             "entry_alignment_pass": bool(entry_alignment_debug.get("passed", False)),
             "entry_alignment_stale_entry_guard": str(entry_alignment_debug.get("stale_entry_guard", "") or ""),
             "entry_alignment_stale_dynamic_margin": round(float(entry_alignment_debug.get("stale_entry_dynamic_margin", 0.0) or 0.0), 4),
@@ -4023,6 +4246,8 @@ class CryptoAPITrading:
                 "open_positions": int(open_positions_count),
                 "trade_notional_base_usd": round(float(trade_notional_base), 4),
                 "trade_notional_policy_usd": round(float(trade_notional_policy), 4),
+                "adaptive_threshold": round(float(dynamic_adaptive_threshold), 4),
+                "calibration_recommended_threshold": round(float(dynamic_calibration_recommended_threshold), 4),
                 "entry_size_scale": round(float(entry_size_scale), 4),
                 "entry_eval_total": int(len(entry_fail_reasons)),
                 "entry_eval_failed": int(len(entry_fail_reasons) > 0),

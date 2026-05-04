@@ -60,6 +60,19 @@ class _FakeOandaClient:
         return True, "ok", {}
 
 
+class _FakeOandaEntryClient(_FakeOandaClient):
+    place_calls = 0
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.place_calls = 0
+
+    def place_market_order(self, instrument: str, units: int, client_order_id: str, max_retries: int = 2, max_retry_after_s: float = 300.0):
+        del instrument, units, client_order_id, max_retries, max_retry_after_s
+        type(self).place_calls += 1
+        return True, "entry ok", {"orderFillTransaction": {"id": "oanda-order-1"}}
+
+
 class TestCachedScanEntryGuard(unittest.TestCase):
     def _write_json(self, path: str, payload: dict) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -133,6 +146,65 @@ class TestCachedScanEntryGuard(unittest.TestCase):
             self.assertIn("cached fallback", str(out.get("msg", "")).lower())
             self.assertGreaterEqual(int(out.get("entry_eval_total", 0) or 0), 1)
             self.assertIn("cached fallback", str(out.get("entry_eval_top_reason", "")).lower())
+
+    def test_forex_loss_streak_guard_auto_clears_when_flat_and_cooldown_elapsed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            _FakeOandaEntryClient.reset()
+            now_ts = 1_700_000_100
+            fx_dir = os.path.join(td, "forex")
+            os.makedirs(fx_dir, exist_ok=True)
+            self._write_json(
+                os.path.join(fx_dir, "forex_thinker_status.json"),
+                {
+                    "updated_at": now_ts,
+                    "fallback_cached": False,
+                    "health": {"data_ok": True},
+                    "reject_summary": {"reject_rate_pct": 5.0},
+                    "leaders": [{"pair": "EUR_USD", "side": "long", "score": 0.62, "eligible_for_entry": True, "data_quality_ok": True, "bars_count": 48}],
+                    "all_scores": [{"pair": "EUR_USD", "side": "long", "score": 0.62, "eligible_for_entry": True, "data_quality_ok": True, "bars_count": 48}],
+                },
+            )
+            # Stuck guard state from a prior session: loss streak is high but we are currently flat.
+            self._write_json(
+                os.path.join(fx_dir, "forex_trader_state.json"),
+                {
+                    "loss_streak": 6,
+                    "loss_streak_updated_at": now_ts - 7200,
+                    "cooldown_until": {"EUR_USD": now_ts - 1200},
+                    "open_meta": {},
+                    "trail": {},
+                    "pending": {},
+                },
+            )
+            settings = {
+                "forex_auto_trade_enabled": True,
+                "forex_max_loss_streak": 5,
+                "forex_loss_cooldown_seconds": 900,
+                "forex_require_data_quality_ok_for_entries": True,
+                "forex_require_reject_rate_max_pct": 95.0,
+                "forex_block_entries_on_cached_scan": False,
+                "market_rollout_stage": "execution_v2",
+                "forex_max_signal_age_seconds": 600,
+                "forex_max_open_positions": 2,
+                "forex_trade_units": 1000,
+            }
+            with (
+                patch.object(forex_trader, "get_oanda_creds", return_value=("acct", "token")),
+                patch.object(forex_trader, "OandaBrokerClient", _FakeOandaEntryClient),
+                patch.object(forex_trader, "_session_blocked", return_value=False),
+                patch.object(forex_trader, "_daily_loss_guard_triggered", return_value=False),
+                patch("engines.forex_trader.time.time", return_value=now_ts),
+            ):
+                out = forex_trader.run_step(settings, td)
+            self.assertEqual(str(out.get("state", "")), "READY")
+            self.assertNotIn("loss-streak guard active", str(out.get("msg", "")).lower())
+            self.assertGreaterEqual(int(_FakeOandaEntryClient.place_calls), 1)
+
+            with open(os.path.join(fx_dir, "forex_trader_state.json"), "r", encoding="utf-8") as f:
+                persisted = json.load(f)
+            self.assertEqual(int(persisted.get("loss_streak", 0) or 0), 0)
+            gate_flags = persisted.get("entry_gate_flags", {}) if isinstance(persisted.get("entry_gate_flags", {}), dict) else {}
+            self.assertEqual(int(gate_flags.get("loss_streak", 0) or 0), 0)
 
 
 if __name__ == "__main__":

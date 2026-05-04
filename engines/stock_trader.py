@@ -632,6 +632,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     runtime_events_path = os.path.join(hub_dir, "runtime_events.jsonl")
 
     auto_enabled = bool(settings.get("stock_auto_trade_enabled", False))
+    independent_market_mode = bool(settings.get("market_independent_execution_enabled", False))
     trade_notional = max(1.0, float(settings.get("stock_trade_notional_usd", 100.0) or 100.0))
     loss_size_step_pct = max(0.0, min(0.9, float(settings.get("stock_loss_streak_size_step_pct", 0.15) or 0.15)))
     loss_size_floor_pct = max(0.10, min(1.0, float(settings.get("stock_loss_streak_size_floor_pct", 0.40) or 0.40)))
@@ -800,6 +801,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     runtime_state = _safe_read_json(os.path.join(hub_dir, "runtime_state.json"))
     runtime_alerts = runtime_state.get("alerts", {}) if isinstance(runtime_state.get("alerts", {}), dict) else {}
     entry_size_scale = 1.0
+    allocator_size_scale = 1.0
     if fallback_active and (not block_cached_scan):
         entry_size_scale = float(cached_scan_entry_size_mult)
     trade_notional_entry = max(1.0, float(trade_notional_effective) * float(entry_size_scale))
@@ -1156,18 +1158,24 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         required_score = float(alignment_required_score)
         max_slippage_bps = max(0.0, float(settings.get("stock_max_slippage_bps", 35.0) or 35.0))
         global_cap_pct = max(0.0, float(settings.get("market_max_total_exposure_pct", 0.0) or 0.0))
+        if independent_market_mode:
+            global_cap_pct = 0.0
         crypto_exposure_usd = _crypto_holdings_usd(hub_dir)
         forex_exposure_usd = _market_status_exposure_usd(hub_dir, "forex")
-        cross_market_exposure_usd = (
-            float(total_positions_value)
-            + float(max(0.0, crypto_exposure_usd))
-            + float(max(0.0, forex_exposure_usd))
-        )
-        cross_market_cap_basis_usd = _portfolio_account_value_usd(
-            hub_dir,
-            current_market="stocks",
-            current_account_value_usd=float(equity),
-        )
+        if independent_market_mode:
+            cross_market_exposure_usd = float(total_positions_value)
+            cross_market_cap_basis_usd = float(max(0.0, equity))
+        else:
+            cross_market_exposure_usd = (
+                float(total_positions_value)
+                + float(max(0.0, crypto_exposure_usd))
+                + float(max(0.0, forex_exposure_usd))
+            )
+            cross_market_cap_basis_usd = _portfolio_account_value_usd(
+                hub_dir,
+                current_market="stocks",
+                current_account_value_usd=float(equity),
+            )
         if signal_age_s > max_signal_age_s:
             entry_msg = f"Signal stale ({signal_age_s}s > {max_signal_age_s}s)"
         elif require_data_quality_ok and (not thinker_data_ok):
@@ -1369,7 +1377,24 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                                 fail = f"Portfolio allocator: {alloc_reason}"
                                 trade_quality_eval = dict(quality_eval)
                             else:
+                                allocator_size_mult = max(
+                                    0.25,
+                                    min(
+                                        1.0,
+                                        float(
+                                            (
+                                                allocator_eval.get("size_multiplier", 1.0)
+                                                if isinstance(allocator_eval, dict)
+                                                else 1.0
+                                            )
+                                            or 1.0
+                                        ),
+                                    ),
+                                )
+                                if abs(float(allocator_size_mult) - 1.0) >= 0.001:
+                                    proposed_notional = max(1.0, float(proposed_notional) * float(allocator_size_mult))
                                 selected_trade_notional = float(proposed_notional)
+                                allocator_size_scale = float(allocator_size_mult)
                                 selected_quality_eval = dict(quality_eval)
                                 trade_quality_eval = dict(quality_eval)
                                 selected_opportunity_eval = dict(allocator_eval)
@@ -1501,11 +1526,26 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     allocator_evaluated = bool(isinstance(opportunity_eval, dict) and opportunity_eval)
     allocator_reasons = opportunity_eval.get("reasons", []) if isinstance(opportunity_eval.get("reasons", []), list) else []
     allocator_top_reason = str((allocator_reasons[0] if allocator_reasons else "") or "").strip()
+    allocator_ai = opportunity_eval.get("openai_decision", {}) if isinstance(opportunity_eval.get("openai_decision", {}), dict) else {}
     trade_confidence_score = float(trade_quality_eval.get("confidence_score", 0.0) or 0.0) if isinstance(trade_quality_eval, dict) else 0.0
     quality_size_scale = float(trade_quality_eval.get("size_multiplier", 1.0) or 1.0) if isinstance(trade_quality_eval, dict) else 1.0
+    try:
+        allocator_size_from_eval = float(opportunity_eval.get("size_multiplier", 1.0) or 1.0)
+    except Exception:
+        allocator_size_from_eval = 1.0
+    allocator_size_from_eval = max(0.25, min(1.0, float(allocator_size_from_eval)))
+    allocator_size_scale = float(allocator_size_from_eval)
+    try:
+        openai_confidence = float(allocator_ai.get("portfolio_confidence", 0.0) or 0.0)
+    except Exception:
+        openai_confidence = 0.0
+    openai_confidence = max(0.0, min(1.0, float(openai_confidence)))
     if auto_enabled:
         cross_market_exposure_effective_usd = float(cross_market_exposure_usd)
         cross_market_cap_basis_effective_usd = float(cross_market_cap_basis_usd)
+    elif independent_market_mode:
+        cross_market_exposure_effective_usd = float(total_positions_value)
+        cross_market_cap_basis_effective_usd = float(max(0.0, equity))
     else:
         cross_market_exposure_effective_usd = (
             float(total_positions_value)
@@ -1546,6 +1586,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "runtime_trust_mode": str(runtime_trust.get("mode", "") or ""),
         "policy_mode": str(policy.get("mode", "") or ""),
         "policy_profile": str(policy.get("profile", "") or ""),
+        "independent_market_mode": bool(independent_market_mode),
         "policy_size_scale": float(round(policy_size_scale, 4)),
         "trade_quality_evaluated": bool(trade_quality_evaluated),
         "trade_quality_decision": str(
@@ -1561,6 +1602,14 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "portfolio_allocator_score": float(round(float(opportunity_eval.get("current_market_score", 0.0) or 0.0), 4)),
         "portfolio_allocator_top_reason": allocator_top_reason,
         "portfolio_allocator_capital_constrained": bool(opportunity_eval.get("capital_constrained", False)) if allocator_evaluated else False,
+        "portfolio_allocator_size_scale": float(round(float(allocator_size_from_eval), 4)) if allocator_evaluated else 1.0,
+        "portfolio_allocator_decision_source": str(opportunity_eval.get("decision_source", "") or "") if allocator_evaluated else "",
+        "openai_decision_active": bool(allocator_ai.get("active", False)),
+        "openai_decision_status": str(allocator_ai.get("status", "") or ""),
+        "openai_decision": str(allocator_ai.get("decision", "") or ""),
+        "openai_decision_best_market": str(allocator_ai.get("best_market", "") or ""),
+        "openai_decision_confidence": float(round(openai_confidence, 4)),
+        "openai_decision_applied": bool(allocator_ai.get("applied", False)),
         "signal_quality_pass": bool(quality_layers.get("signal_quality", False)),
         "execution_quality_pass": bool(quality_layers.get("execution_quality", False)),
         "compliance_permission_pass": bool(quality_layers.get("compliance_permission", False)),
@@ -1599,6 +1648,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "entry_gate_flags": dict(entry_gate_flags),
         "trade_notional_entry_usd": round(float(trade_notional_entry), 4),
         "entry_size_scale": round(float(entry_size_scale), 4),
+        "allocator_size_scale": round(float(allocator_size_scale), 4),
         "stale_exit_count": int(stale_exit_count),
         "stale_exit_events": list(stale_exit_events[:24]),
         "last_actions": actions[-80:],
@@ -1657,6 +1707,8 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         msg_parts.append(f"policy-size x{policy_size_scale:.2f}")
     if trade_quality_eval and abs(float(quality_size_scale) - 1.0) >= 0.01:
         msg_parts.append(f"quality-size x{quality_size_scale:.2f}")
+    if allocator_evaluated and abs(float(allocator_size_scale) - 1.0) >= 0.01:
+        msg_parts.append(f"allocator-size x{allocator_size_scale:.2f}")
     if allocator_evaluated:
         allocator_summary = str(opportunity_eval.get("summary", "") or "").strip()
         if allocator_summary:
@@ -1680,6 +1732,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "trade_notional_entry_usd": round(float(trade_notional_entry), 4),
         "loss_size_scale": round(float(loss_size_scale), 4),
         "entry_size_scale": round(float(entry_size_scale), 4),
+        "allocator_size_scale": round(float(allocator_size_scale), 4),
         "exposure_usd": round(total_positions_value, 4),
         "crypto_exposure_usd": round(crypto_exposure_usd, 4) if auto_enabled else round(_crypto_holdings_usd(hub_dir), 4),
         "other_market_exposure_usd": round(forex_exposure_usd, 4) if auto_enabled else round(_market_status_exposure_usd(hub_dir, "forex"), 4),

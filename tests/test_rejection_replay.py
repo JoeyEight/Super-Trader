@@ -73,6 +73,8 @@ class TestRejectionReplay(unittest.TestCase):
     def test_target_entries_helper_clamps(self) -> None:
         self.assertEqual(replay_target_entries_for_market({"replay_target_entries_stocks": 0}, "stocks"), 1)
         self.assertEqual(replay_target_entries_for_market({"replay_target_entries_forex": 999}, "forex"), 20)
+        self.assertEqual(replay_target_entries_for_market({"replay_target_entries_crypto": 0}, "crypto"), 1)
+        self.assertEqual(replay_target_entries_for_market({"replay_target_entries_crypto": 999}, "crypto"), 20)
 
     def test_replay_report_builds_both_markets(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -99,6 +101,38 @@ class TestRejectionReplay(unittest.TestCase):
             self.assertIn("forex", out)
             self.assertEqual(str((out.get("stocks", {}) if isinstance(out.get("stocks", {}), dict) else {}).get("market", "")), "stocks")
             self.assertEqual(str((out.get("forex", {}) if isinstance(out.get("forex", {}), dict) else {}).get("market", "")), "forex")
+
+    def test_crypto_market_replay_uses_dynamic_status_and_rankings(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            self._write_json(
+                os.path.join(td, "crypto_dynamic_status.json"),
+                {
+                    "ranked": [
+                        {"symbol": "BTC", "score": 1.42, "side": "long", "eligible_for_entry": True},
+                        {"symbol": "ETH", "score": 0.64, "side": "watch", "eligible_for_entry": False},
+                    ]
+                },
+            )
+            self._write_jsonl(
+                os.path.join(td, "crypto", "scanner_rankings.jsonl"),
+                [
+                    {"rejected": [{"symbol": "SOL", "reason": "cooldown"}]},
+                    {"rejected": [{"symbol": "DOGE", "reason": "signal"}]},
+                ],
+            )
+            out = build_market_rejection_replay(
+                td,
+                "crypto",
+                settings={
+                    "crypto_dynamic_min_projected_edge_pct": 0.20,
+                    "replay_target_entries_crypto": 3,
+                },
+            )
+            self.assertEqual(str(out.get("state", "")), "READY")
+            self.assertEqual(str(out.get("market", "")), "crypto")
+            self.assertTrue(isinstance(out.get("scenarios", []), list))
+            rec = out.get("recommendation", {}) if isinstance(out.get("recommendation", {}), dict) else {}
+            self.assertIn("recommended_threshold", rec)
 
 
 if __name__ == "__main__":

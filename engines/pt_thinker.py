@@ -228,8 +228,10 @@ import logging
 import json
 import uuid
 from app.credential_utils import get_robinhood_creds_from_env, get_robinhood_creds_from_files
+from app.confidence_calibration import build_market_confidence_calibration
 from app.news_event_provider import blend_score_with_news, build_unified_news_event_context
 from app.path_utils import resolve_runtime_paths, resolve_settings_path, read_settings_file, log_once, log_throttled
+from app.rejection_replay import recommend_threshold_from_scores, replay_target_entries_for_market
 
 from nacl.signing import SigningKey
 
@@ -607,9 +609,24 @@ def _write_runner_ready(ready: bool, stage: str, ready_coins=None, total_coins: 
 
 
 DYNAMIC_STATUS_PATH = os.path.join(HUB_DIR, "crypto_dynamic_status.json")
+CRYPTO_SCAN_DIR = os.path.join(HUB_DIR, "crypto")
+CRYPTO_SCANNER_RANKINGS_PATH = os.path.join(CRYPTO_SCAN_DIR, "scanner_rankings.jsonl")
 _dynamic_last_scan_ts = 0.0
 _dynamic_trainer_procs: dict[str, subprocess.Popen] = {}
 _dynamic_last_rotation_ts = 0.0
+
+
+def _append_jsonl(path: str, row: dict) -> None:
+	try:
+		os.makedirs(os.path.dirname(path), exist_ok=True)
+		with open(path, "a", encoding="utf-8") as f:
+			f.write(json.dumps(row, separators=(",", ":")) + "\n")
+	except Exception:
+		pass
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+	return float(max(lo, min(hi, float(value))))
 
 
 def _cleanup_dynamic_trainers() -> None:
@@ -780,6 +797,89 @@ def _dynamic_coin_manager() -> None:
 		except Exception as exc:
 			rejected.append({"symbol": sym, "reason": f"{type(exc).__name__}"})
 	ranked.sort(key=lambda r: float(r.get("score", -9999.0) or -9999.0), reverse=True)
+	abs_scores = [abs(float(r.get("score", 0.0) or 0.0)) for r in ranked if isinstance(r, dict)]
+	abs_scores = [v for v in abs_scores if v > 0.0]
+	vol_med = (sorted(abs_scores)[len(abs_scores) // 2] if abs_scores else 0.0)
+	base_thr = max(
+		0.01,
+		float(
+			settings.get(
+				"crypto_dynamic_min_projected_edge_pct",
+				settings.get("crypto_allocator_signal_floor", min_edge),
+			)
+			or min_edge
+		),
+	)
+	volatility_threshold = float(round(base_thr * (1.15 if vol_med >= (base_thr * 1.6) else 1.0), 6))
+	replay_enabled = bool(settings.get("crypto_replay_adaptive_enabled", True))
+	replay_weight = _clamp(float(settings.get("crypto_replay_adaptive_weight", 0.35) or 0.35), 0.0, 1.0)
+	replay_step_cap_pct = _clamp(float(settings.get("crypto_replay_adaptive_step_cap_pct", 40.0) or 40.0), 5.0, 90.0)
+	replay_target_entries = replay_target_entries_for_market(settings, "crypto")
+	replay_recommended = float(volatility_threshold)
+	replay_clamped = float(volatility_threshold)
+	replay_reason = ""
+	if replay_enabled and ranked:
+		replay_payload = recommend_threshold_from_scores(
+			ranked,
+			market="crypto",
+			current_threshold=volatility_threshold,
+			target_entries=replay_target_entries,
+		)
+		replay_rec = replay_payload.get("recommendation", {}) if isinstance(replay_payload.get("recommendation", {}), dict) else {}
+		replay_recommended = max(0.01, float(replay_rec.get("recommended_threshold", volatility_threshold) or volatility_threshold))
+		replay_reason = str(replay_rec.get("reason", "") or "")
+		max_step = max(base_thr * 0.05, volatility_threshold * (replay_step_cap_pct / 100.0))
+		replay_min = max(0.01, volatility_threshold - max_step)
+		replay_max = volatility_threshold + max_step
+		replay_clamped = min(replay_max, max(replay_min, replay_recommended))
+	effective_weight = replay_weight if replay_enabled else 0.0
+	adaptive_threshold = round(
+		max(
+			0.01,
+			((1.0 - effective_weight) * volatility_threshold) + (effective_weight * replay_clamped),
+		),
+		4,
+	)
+	calibration_payload = build_market_confidence_calibration(
+		HUB_DIR,
+		"crypto",
+		base_threshold=float(adaptive_threshold),
+		min_samples=max(6, int(float(settings.get("adaptive_confidence_min_samples", 18) or 18))),
+		target_success_pct=_clamp(float(settings.get("adaptive_confidence_target_success_pct", 55.0) or 55.0), 30.0, 90.0),
+	)
+	calibration_rec = calibration_payload.get("recommendation", {}) if isinstance(calibration_payload.get("recommendation", {}), dict) else {}
+	calibration_recommended_threshold = float(calibration_rec.get("recommended_threshold", adaptive_threshold) or adaptive_threshold)
+	calibration_curve = calibration_payload.get("curve", []) if isinstance(calibration_payload.get("curve", []), list) else []
+	calibration_samples = int(float(calibration_payload.get("samples", 0) or 0))
+	def _calib_prob_for_score(score_val: float) -> float:
+		score_abs = abs(float(score_val or 0.0))
+		for bin_row in calibration_curve:
+			if not isinstance(bin_row, dict):
+				continue
+			lo = float(bin_row.get("min_score", 0.0) or 0.0)
+			hi_raw = bin_row.get("max_score", None)
+			hi = float(hi_raw) if hi_raw not in (None, "") else 999999.0
+			if score_abs < lo:
+				continue
+			if score_abs >= hi:
+				continue
+			return _clamp(float(bin_row.get("success_rate_pct", 0.0) or 0.0) / 100.0, 0.0, 1.0)
+		return 0.0
+	for row in ranked:
+		if not isinstance(row, dict):
+			continue
+		score_val = float(row.get("score", 0.0) or 0.0)
+		row["side"] = "long" if score_val > 0.0 else "watch"
+		row["eligible_for_entry"] = bool(score_val >= adaptive_threshold)
+		row["adaptive_threshold"] = float(adaptive_threshold)
+		row["required_score"] = float(adaptive_threshold)
+		row["calib_prob"] = float(round(_calib_prob_for_score(score_val), 6))
+		row["samples"] = int(calibration_samples)
+		row["symbol_samples"] = int(calibration_samples)
+		row["market_calibration_samples"] = int(calibration_samples)
+		row["calibration_scope"] = "market_pooled"
+		row["calibration_effective_samples"] = int(calibration_samples)
+		row["calibration_effective_prob"] = float(row.get("calib_prob", 0.0) or 0.0)
 
 	# Launch background training for promising untrained symbols.
 	started_trainers = []
@@ -839,6 +939,27 @@ def _dynamic_coin_manager() -> None:
 		if changed:
 			_dynamic_last_rotation_ts = now
 
+	_append_jsonl(
+		CRYPTO_SCANNER_RANKINGS_PATH,
+		{
+			"ts": int(now),
+			"state": "READY",
+			"universe_total": int(len(pool)),
+			"candidates": int(len(ranked)),
+			"rejected": rejected[:100],
+			"top": ranked[:20],
+			"adaptive_threshold": float(adaptive_threshold),
+			"adaptive_threshold_base": float(base_thr),
+			"adaptive_threshold_volatility": float(round(volatility_threshold, 6)),
+			"adaptive_threshold_replay_recommended": float(round(replay_recommended, 6)),
+			"adaptive_threshold_replay_clamped": float(round(replay_clamped, 6)),
+			"adaptive_threshold_replay_weight": float(round(effective_weight, 4)),
+			"adaptive_threshold_replay_target_entries": int(replay_target_entries),
+			"adaptive_threshold_replay_reason": str(replay_reason),
+			"adaptive_threshold_replay_enabled": bool(replay_enabled),
+		},
+	)
+
 	_atomic_write_json(
 		DYNAMIC_STATUS_PATH,
 		{
@@ -850,6 +971,17 @@ def _dynamic_coin_manager() -> None:
 				"held": sorted(list(held)),
 				"ranked": ranked[:20],
 				"rejected": rejected[:20],
+				"adaptive_threshold": float(adaptive_threshold),
+				"adaptive_threshold_base": float(base_thr),
+				"adaptive_threshold_volatility": float(round(volatility_threshold, 6)),
+				"adaptive_threshold_replay_recommended": float(round(replay_recommended, 6)),
+				"adaptive_threshold_replay_clamped": float(round(replay_clamped, 6)),
+				"adaptive_threshold_replay_weight": float(round(effective_weight, 4)),
+				"adaptive_threshold_replay_target_entries": int(replay_target_entries),
+				"adaptive_threshold_replay_reason": str(replay_reason),
+				"adaptive_threshold_replay_enabled": bool(replay_enabled),
+				"calibration": calibration_payload if isinstance(calibration_payload, dict) else {},
+				"calibration_recommended_threshold": float(round(calibration_recommended_threshold, 6)),
 				"started_trainers": started_trainers,
 				"active_trainers": sorted(list(_dynamic_trainer_procs.keys())),
 				"min_projected_edge_pct": min_edge,
