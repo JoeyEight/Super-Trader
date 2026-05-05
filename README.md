@@ -9,6 +9,29 @@ The desktop hub UI implementation is in `ui/hub/main.py` (legacy compatibility s
 Crypto coin workspaces are now managed under `market_data/coins` by default (auto-migrated from legacy root-level coin folders when needed).
 Primary repository: `https://github.com/JoeyEight/Super-Trader.git`
 
+## Overview
+
+Super Trader is a desktop-based, multi-market trading application designed to centralize trading activity across crypto, stocks, and forex from one coordinated hub. The app provides a unified interface for monitoring runtime status, launching and stopping trading services, reviewing diagnostics, managing market-specific engines, and coordinating advisory tools without requiring the operator to manage each market separately.
+
+The application is structured around three primary trading engines:
+
+- **Crypto**: live-capable crypto trading runtime with coin-specific workspaces and model/data directories.
+- **Stocks**: Alpaca-backed stock trading workflow with scanner, thinker, trader, watchlist, and diagnostics support.
+- **Forex**: OANDA-backed forex trading workflow with macro-event awareness, scanner/trader status files, and execution safeguards.
+
+Super Trader is built to act as an operator-controlled trading hub rather than a fully autonomous black box. Runtime services are supervised through the hub and supporting runner modules, while safety gates, readiness checks, broker credentials, exposure controls, diagnostics, and paper/live configuration remain the responsibility of the user. Optional OpenAI-powered modules are advisory only and do not place trades directly or bypass the local trading guards.
+
+This version expands the original concept into a broader multi-market desktop trading hub with updated runtime orchestration, broker integrations, diagnostics, readiness tooling, OpenAI advisory hooks, and market-specific runtime structure.
+
+## Attribution
+
+Super Trader was inspired by the original **PowerTrader_AI** project created by **Stephen Hughes**.
+
+Original project:
+`https://github.com/garagesteve1155/PowerTrader_AI`
+
+Credit and appreciation go to Stephen Hughes for the original codebase and concept that helped inspire this version of the app.
+
 ## Safety First
 - This software can place real orders when configured for live mode.
 - Keep `paper_only_unless_checklist_green=true` until checklist is green.
