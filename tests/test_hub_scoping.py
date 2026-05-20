@@ -6,6 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 
 
 def _install_matplotlib_stubs() -> None:
@@ -70,7 +71,60 @@ class HubScopingTests(unittest.TestCase):
         hub.project_dir = ""
         hub.crypto_dynamic_status_path = ""
         hub._active_market_key = lambda: "stocks"
+        hub.market_panels = {}
         return hub
+
+    class _Var:
+        def __init__(self, value: str = "") -> None:
+            self._value = value
+
+        def get(self) -> str:
+            return self._value
+
+        def set(self, value: str) -> None:
+            self._value = value
+
+    class _Combo:
+        def __init__(self) -> None:
+            self.values = []
+
+        def configure(self, **kwargs) -> None:
+            vals = kwargs.get("values")
+            if vals is not None:
+                self.values = list(vals)
+
+    class _Canvas:
+        class _Parent:
+            def winfo_width(self) -> int:
+                return 640
+
+        def __init__(self) -> None:
+            self._width = 520
+            self._height = 300
+
+        def winfo_width(self) -> int:
+            return self._width
+
+        def winfo_height(self) -> int:
+            return self._height
+
+        def winfo_reqwidth(self) -> int:
+            return self._width
+
+        def winfo_reqheight(self) -> int:
+            return self._height
+
+        def winfo_parent(self) -> str:
+            return "fake_parent"
+
+        def nametowidget(self, _name: str):
+            return self._Parent()
+
+        def configure(self, **_kwargs) -> None:
+            return None
+
+        def update_idletasks(self) -> None:
+            return None
 
     def test_markets_for_global_alert_uses_top_exposure_market(self) -> None:
         hub = self._make_hub()
@@ -85,6 +139,71 @@ class HubScopingTests(unittest.TestCase):
             },
         )
         self.assertEqual(markets, ["stocks"])
+
+    def test_market_chart_focus_options_include_positions_rows(self) -> None:
+        hub = self._make_hub()
+        hub.market_panels = {
+            "stocks": {
+                "instrument_var": self._Var("ACCOUNT"),
+                "positions_rows": [
+                    {"symbol": "ACTG"},
+                    {"symbol": "AIP"},
+                ],
+            }
+        }
+        opts = hub._market_chart_focus_options("stocks", thinker_data={}, status_data={})
+        self.assertIn("ACCOUNT", opts)
+        self.assertIn("ACTG", opts)
+        self.assertIn("AIP", opts)
+
+    def test_market_first_open_symbol_prefers_positions_then_status(self) -> None:
+        hub = self._make_hub()
+        hub.market_panels = {
+            "stocks": {
+                "positions_rows": [{"symbol": "XOM"}],
+            },
+            "forex": {
+                "positions_rows": [],
+            },
+        }
+        self.assertEqual(hub._market_first_open_symbol("stocks", status_data={}), "XOM")
+        self.assertEqual(
+            hub._market_first_open_symbol(
+                "forex",
+                status_data={"raw_positions": [{"instrument": "EUR_USD"}]},
+            ),
+            "EUR_USD",
+        )
+
+    def test_refresh_market_current_chart_panel_uses_first_open_when_focus_is_account(self) -> None:
+        hub = self._make_hub()
+        focus_var = self._Var("ACCOUNT")
+        current_focus_var = self._Var("ACCOUNT")
+        combo = self._Combo()
+        hub.market_panels = {
+            "stocks": {
+                "current_chart_canvas": self._Canvas(),
+                "current_chart_focus_combo": combo,
+                "current_chart_focus_var": current_focus_var,
+                "instrument_var": focus_var,
+                "positions_rows": [{"symbol": "ACTG"}],
+            }
+        }
+        hub._schedule_market_chart_redraw = lambda *_a, **_k: None
+        hub._render_market_canvas = lambda *_a, **_k: None
+        hub._market_chart_focus_options = lambda *_a, **_k: ["ACCOUNT"]
+
+        hub._refresh_market_current_chart_panel(
+            "stocks",
+            thinker_data={},
+            status_data={"raw_positions": []},
+            trader_data={},
+            diag_data={},
+        )
+
+        self.assertEqual(focus_var.get(), "ACTG")
+        self.assertEqual(current_focus_var.get(), "ACTG")
+        self.assertIn("ACTG", combo.values)
 
     def test_scoped_notification_items_filter_global_runtime_alerts_by_market(self) -> None:
         hub = self._make_hub()
@@ -331,6 +450,49 @@ class HubScopingTests(unittest.TestCase):
         self.assertIn("Why top candidate was not traded", titles)
         self.assertNotIn("shadow_scorecard_blocked", titles)
         self.assertNotIn("scanner_cadence_drift", titles)
+
+    def test_notification_payload_caches_rebuild_when_sources_unchanged(self) -> None:
+        hub = self._make_hub()
+        with tempfile.TemporaryDirectory() as tmp:
+            hub.hub_dir = tmp
+            with open(os.path.join(tmp, "runtime_state.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "ts": 1_700_100_000,
+                        "alerts": {"severity": "critical", "reasons": ["exposure_concentration"], "hints": ["high concentration"]},
+                    },
+                    f,
+                )
+            fake_payload = {"items": [{"title": "exposure_concentration", "severity": "critical", "market": "global"}]}
+            with patch("ui.pt_hub.build_notification_center_from_hub", return_value=fake_payload) as mocked_build:
+                first = hub._notification_payload()
+                second = hub._notification_payload()
+        self.assertEqual(first, second)
+        self.assertEqual(mocked_build.call_count, 1)
+
+    def test_coin_workspace_migration_moves_root_coin_folders(self) -> None:
+        hub = self._make_hub()
+        with tempfile.TemporaryDirectory() as tmp:
+            hub.project_dir = tmp
+            hub.hub_dir = os.path.join(tmp, "hub_data")
+            os.makedirs(hub.hub_dir, exist_ok=True)
+            hub.settings = {
+                "coins": ["ADA"],
+                "crypto_dynamic_pool_symbols": "ADA",
+            }
+
+            src_coin_dir = os.path.join(tmp, "ADA")
+            os.makedirs(src_coin_dir, exist_ok=True)
+            with open(os.path.join(src_coin_dir, "trainer_status.json"), "w", encoding="utf-8") as f:
+                json.dump({"state": "READY"}, f)
+
+            resolved = hub._resolve_coin_workspace_dir(configured_main_dir=tmp, coins=["ADA"])
+            expected_root = os.path.join(tmp, "market_data", "coins")
+
+            self.assertEqual(os.path.abspath(resolved), os.path.abspath(expected_root))
+            self.assertTrue(os.path.isdir(os.path.join(expected_root, "ADA")))
+            self.assertTrue(os.path.isfile(os.path.join(expected_root, "ADA", "trainer_status.json")))
+            self.assertFalse(os.path.isdir(src_coin_dir))
 
     def test_crypto_training_candidate_symbols_merges_dynamic_and_disk_symbols(self) -> None:
         hub = self._make_hub()
