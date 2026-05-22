@@ -432,6 +432,11 @@ def _clear_stop_flag(path: str) -> bool:
 def _run_startup_checks(scripts: Dict[str, str], settings: Dict[str, Any], stale_pid_removed: bool) -> Dict[str, Any]:
     errors = []
     warnings = []
+    crypto_enabled = bool(settings.get("market_crypto_enabled", True))
+    stocks_enabled = bool(settings.get("market_stocks_enabled", True))
+    forex_enabled = bool(settings.get("market_forex_enabled", True))
+    if not (crypto_enabled or stocks_enabled or forex_enabled):
+        crypto_enabled = True
 
     for key, path in scripts.items():
         if not os.path.isfile(path):
@@ -444,18 +449,20 @@ def _run_startup_checks(scripts: Dict[str, str], settings: Dict[str, Any], stale
     if log_write:
         errors.append(f"log_dir_not_writable:{log_write}")
 
-    try:
-        a_key, a_secret = get_alpaca_creds(settings, base_dir=BASE_DIR)
-        if not (str(a_key or "").strip() and str(a_secret or "").strip()):
-            warnings.append("alpaca_credentials_missing")
-    except Exception:
-        warnings.append("alpaca_credentials_check_failed")
-    try:
-        o_id, o_tok = get_oanda_creds(settings, base_dir=BASE_DIR)
-        if not (str(o_id or "").strip() and str(o_tok or "").strip()):
-            warnings.append("oanda_credentials_missing")
-    except Exception:
-        warnings.append("oanda_credentials_check_failed")
+    if stocks_enabled:
+        try:
+            a_key, a_secret = get_alpaca_creds(settings, base_dir=BASE_DIR)
+            if not (str(a_key or "").strip() and str(a_secret or "").strip()):
+                warnings.append("alpaca_credentials_missing")
+        except Exception:
+            warnings.append("alpaca_credentials_check_failed")
+    if forex_enabled:
+        try:
+            o_id, o_tok = get_oanda_creds(settings, base_dir=BASE_DIR)
+            if not (str(o_id or "").strip() and str(o_tok or "").strip()):
+                warnings.append("oanda_credentials_missing")
+        except Exception:
+            warnings.append("oanda_credentials_check_failed")
 
     if stale_pid_removed:
         warnings.append("stale_pid_file_removed")
@@ -1250,7 +1257,7 @@ class Runner:
             "date_local": str(row.get("date_local", "") or ""),
             "model": str(row.get("model", cfg.get("openai_position_review_model", cfg.get("openai_model", "gpt-5.4-mini"))) or ""),
             "interval_s": float(max(0.0, _f(cfg.get("openai_position_review_interval_s", 300.0), 300.0))),
-            "timeout_s": float(max(0.0, _f(row.get("timeout_s", cfg.get("openai_position_review_timeout_s", 8.0)), 8.0))),
+            "timeout_s": float(max(0.0, _f(row.get("timeout_s", cfg.get("openai_position_review_timeout_s", 12.0)), 12.0))),
             "max_positions": int(max(0.0, _f(row.get("max_positions", cfg.get("openai_position_review_max_positions", 48)), 0.0))),
             "auto_act_enabled": bool(row.get("auto_act_enabled", cfg.get("openai_position_review_auto_act_enabled", False))),
             "actions_count": int(max(0.0, _f(row.get("actions_count", 0), 0.0))),

@@ -21,6 +21,29 @@ class TestHealthRules(unittest.TestCase):
         self.assertEqual(out["severity"], "warn")
         self.assertIn("scan_reject_pressure", out["reasons"])
 
+    def test_disabled_market_reject_pressure_is_ignored(self) -> None:
+        state = {
+            "checks": {"ok": True, "warnings": []},
+            "scan_health": {
+                "stocks": {"reject_rate_pct": 99.0},
+                "forex": {"reject_rate_pct": 0.0},
+            },
+            "incidents_last_200": {"count": 0, "by_severity": {"error": 0, "warning": 0}},
+            "autopilot": {"api_unstable": False},
+        }
+        out = evaluate_runtime_alerts(
+            state,
+            {
+                "market_stocks_enabled": False,
+                "market_forex_enabled": True,
+                "runtime_alert_scan_reject_warn_pct": 65.0,
+                "runtime_alert_scan_reject_crit_pct": 85.0,
+            },
+        )
+        self.assertEqual(out["severity"], "ok")
+        self.assertNotIn("scan_reject_pressure", out["reasons"])
+        self.assertFalse(bool(out.get("metrics", {}).get("stocks_enabled", True)))
+
     def test_cooldown_dominated_rejects_do_not_trigger_pressure(self) -> None:
         state = {
             "checks": {"ok": True, "warnings": []},

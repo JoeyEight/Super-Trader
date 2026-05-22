@@ -1172,7 +1172,7 @@ def _load_market_context_advisory(
     by_symbol = row.get("by_symbol", {}) if isinstance(row.get("by_symbol", {}), dict) else {}
     if not by_market:
         by_market = {
-            _market(item.get("market", "")): dict(item)
+            _market_key(item.get("market", "")): dict(item)
             for item in market_scores
             if isinstance(item, dict) and str(item.get("market", "") or "").strip()
         }
@@ -1189,7 +1189,7 @@ def _load_market_context_advisory(
         for item in symbol_scores:
             if not isinstance(item, dict):
                 continue
-            mk = _market(item.get("market", ""))
+            mk = _market_key(item.get("market", ""))
             symbol = str(item.get("symbol", "") or "").strip().upper()
             if not symbol:
                 continue

@@ -937,6 +937,70 @@ class PowerTraderHub(tk.Tk):
         self.settings = sanitize_settings(self.settings, defaults=DEFAULT_SETTINGS)
         _safe_write_json(settings_path, self.settings)
 
+    def _enabled_markets(self, settings: Optional[Dict[str, Any]] = None) -> List[str]:
+        cfg = settings if isinstance(settings, dict) else self.settings
+        enabled: List[str] = []
+        if bool((cfg or {}).get("market_crypto_enabled", True)):
+            enabled.append("crypto")
+        if bool((cfg or {}).get("market_stocks_enabled", True)):
+            enabled.append("stocks")
+        if bool((cfg or {}).get("market_forex_enabled", True)):
+            enabled.append("forex")
+        if not enabled:
+            enabled = ["crypto"]
+        return enabled
+
+    def _market_enabled(self, market_key: str, settings: Optional[Dict[str, Any]] = None) -> bool:
+        mk = str(market_key or "").strip().lower()
+        return mk in set(self._enabled_markets(settings=settings))
+
+    def _refresh_market_tab_visibility(self) -> None:
+        nb = getattr(self, "market_nb", None)
+        if nb is None:
+            return
+        frames: Dict[str, Any] = {
+            "crypto": getattr(self, "crypto_market_tab", None),
+            "stocks": getattr(self, "stocks_market_tab", None),
+            "forex": getattr(self, "forex_market_tab", None),
+        }
+        labels = {"crypto": "Crypto", "stocks": "Stocks", "forex": "Forex"}
+        enabled = self._enabled_markets()
+        prev_active = "crypto"
+        try:
+            prev_active = str(self._active_market_key() or "crypto").strip().lower()
+        except Exception:
+            prev_active = "crypto"
+
+        for mk in ("crypto", "stocks", "forex"):
+            frame = frames.get(mk)
+            if frame is None:
+                continue
+            try:
+                if mk in enabled and str(frame) not in set(nb.tabs()):
+                    nb.add(frame, text=labels.get(mk, mk.title()))
+                elif mk not in enabled and str(frame) in set(nb.tabs()):
+                    nb.forget(frame)
+            except Exception:
+                continue
+
+        for idx, mk in enumerate(enabled):
+            frame = frames.get(mk)
+            if frame is None:
+                continue
+            try:
+                nb.insert(idx, frame)
+                nb.tab(frame, text=labels.get(mk, mk.title()))
+            except Exception:
+                pass
+
+        target = prev_active if prev_active in enabled else enabled[0]
+        frame = frames.get(target)
+        if frame is not None:
+            try:
+                nb.select(frame)
+            except Exception:
+                pass
+
     def _profile_market_snapshots(self) -> Dict[str, Dict[str, Any]]:
         crypto_raw = _safe_read_json(getattr(self, "trader_data_path", "")) or {}
         crypto_account = crypto_raw.get("account", {}) if isinstance(crypto_raw.get("account", {}), dict) else {}
@@ -1723,6 +1787,9 @@ class PowerTraderHub(tk.Tk):
         nb = getattr(self, "market_nb", None)
         if nb is None:
             return
+        enabled = self._enabled_markets()
+        if name not in enabled:
+            name = enabled[0]
         try:
             if name == "crypto":
                 nb.select(self.crypto_market_tab)
@@ -1736,16 +1803,17 @@ class PowerTraderHub(tk.Tk):
     def _active_market_key(self) -> str:
         nb = getattr(self, "market_nb", None)
         if nb is None:
-            return "crypto"
+            return self._enabled_markets()[0]
         try:
             label = str(nb.tab(nb.select(), "text") or "Crypto").strip().lower()
         except Exception:
+            label = self._enabled_markets()[0]
+        if label not in {"crypto", "stocks", "forex"}:
             label = "crypto"
-        if label == "stocks":
-            return "stocks"
-        if label == "forex":
-            return "forex"
-        return "crypto"
+        enabled = self._enabled_markets()
+        if label not in enabled:
+            return enabled[0]
+        return label
 
     def _refresh_active_market_context(self) -> None:
         try:
@@ -2763,10 +2831,13 @@ class PowerTraderHub(tk.Tk):
             checks_txt = checks_txt[:89] + "..."
         self._set_badge_style(self.lbl_toolbar_checks_badge, checks_txt, tone=checks_tone)
 
+        crypto_enabled = self._market_enabled("crypto")
+        stocks_enabled = self._market_enabled("stocks")
+        forex_enabled = self._market_enabled("forex")
         subtitle = (
-            f"Auto Crypto={'ON' if bool(self.settings.get('auto_start_trading_when_all_trained', True)) else 'OFF'} | "
-            f"Auto Stocks={'ON' if bool(self.settings.get('stock_auto_trade_enabled', False)) else 'OFF'} | "
-            f"Auto Forex={'ON' if bool(self.settings.get('forex_auto_trade_enabled', False)) else 'OFF'}"
+            f"Auto Crypto={('ON' if bool(self.settings.get('auto_start_trading_when_all_trained', True)) else 'OFF') if crypto_enabled else 'DISABLED'} | "
+            f"Auto Stocks={('ON' if bool(self.settings.get('stock_auto_trade_enabled', False)) else 'OFF') if stocks_enabled else 'DISABLED'} | "
+            f"Auto Forex={('ON' if bool(self.settings.get('forex_auto_trade_enabled', False)) else 'OFF') if forex_enabled else 'DISABLED'}"
         )
         try:
             self.lbl_toolbar_subtitle.configure(text=subtitle)
@@ -5970,6 +6041,7 @@ class PowerTraderHub(tk.Tk):
             ),
         )
 
+        self._refresh_market_tab_visibility()
 
         # status bar
         self.status = ttk.Label(self, text="Ready", anchor="w")
@@ -8783,7 +8855,8 @@ class PowerTraderHub(tk.Tk):
         current_focus = self._market_focus_selection(market_key)
         if current_focus not in {"", "ACCOUNT"}:
             _add(current_focus)
-        panel = self.market_panels.get(str(market_key or "").strip().lower(), {})
+        panels = self.__dict__.get("market_panels", {}) or {}
+        panel = panels.get(str(market_key or "").strip().lower(), {}) if isinstance(panels, dict) else {}
         for row in list(panel.get("positions_rows", []) or []):
             if not isinstance(row, dict):
                 continue
@@ -8808,7 +8881,8 @@ class PowerTraderHub(tk.Tk):
         status_data: Optional[Dict[str, Any]] = None,
     ) -> str:
         mk = str(market_key or "").strip().lower()
-        panel = self.market_panels.get(mk, {})
+        panels = self.__dict__.get("market_panels", {}) or {}
+        panel = panels.get(mk, {}) if isinstance(panels, dict) else {}
         for row in list(panel.get("positions_rows", []) or []):
             if not isinstance(row, dict):
                 continue
@@ -20455,6 +20529,15 @@ class PowerTraderHub(tk.Tk):
         )
         settings_mode_var = tk.StringVar(value=_mode_to_label.get(_settings_mode_raw, "Self Managed"))
         settings_profile_var = tk.StringVar(value=_profile_to_label.get(_settings_profile_raw, "Balanced"))
+        market_crypto_enabled_var = tk.BooleanVar(
+            value=bool(self.settings.get("market_crypto_enabled", DEFAULT_SETTINGS.get("market_crypto_enabled", True)))
+        )
+        market_stocks_enabled_var = tk.BooleanVar(
+            value=bool(self.settings.get("market_stocks_enabled", DEFAULT_SETTINGS.get("market_stocks_enabled", True)))
+        )
+        market_forex_enabled_var = tk.BooleanVar(
+            value=bool(self.settings.get("market_forex_enabled", DEFAULT_SETTINGS.get("market_forex_enabled", True)))
+        )
         alpaca_status_var = tk.StringVar(value="")
         oanda_status_var = tk.StringVar(value="")
         openai_status_var = tk.StringVar(value="")
@@ -22120,6 +22203,13 @@ class PowerTraderHub(tk.Tk):
             wraplength=760,
         ).grid(row=r, column=0, columnspan=3, sticky="w", pady=(0, 8))
         r += 1
+        market_toggle_row = ttk.Frame(frm)
+        market_toggle_row.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        ttk.Label(market_toggle_row, text="Enabled markets:").pack(side="left")
+        ttk.Checkbutton(market_toggle_row, text="Crypto", variable=market_crypto_enabled_var).pack(side="left", padx=(12, 0))
+        ttk.Checkbutton(market_toggle_row, text="Stocks", variable=market_stocks_enabled_var).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(market_toggle_row, text="Forex", variable=market_forex_enabled_var).pack(side="left", padx=(8, 0))
+        r += 1
         add_status_action_row(
             r,
             "OpenAI API key:",
@@ -22165,10 +22255,56 @@ class PowerTraderHub(tk.Tk):
             tab.columnconfigure(0, weight=0)
             tab.columnconfigure(1, weight=1)
             tab.columnconfigure(2, weight=0)
+        settings_market_labels: Dict[str, str] = {"crypto": "Crypto", "stocks": "Stocks", "forex": "Forex"}
+        settings_market_tabs: Dict[str, ttk.Frame] = {"crypto": crypto_tab, "stocks": stocks_tab, "forex": forex_tab}
 
-        market_settings_nb.add(crypto_tab, text="Crypto")
-        market_settings_nb.add(stocks_tab, text="Stocks")
-        market_settings_nb.add(forex_tab, text="Forex")
+        def _enabled_settings_market_keys() -> List[str]:
+            keys: List[str] = []
+            if bool(market_crypto_enabled_var.get()):
+                keys.append("crypto")
+            if bool(market_stocks_enabled_var.get()):
+                keys.append("stocks")
+            if bool(market_forex_enabled_var.get()):
+                keys.append("forex")
+            if not keys:
+                market_crypto_enabled_var.set(True)
+                keys = ["crypto"]
+            return keys
+
+        def _refresh_settings_market_tabs(prefer_market: str = "") -> None:
+            enabled_keys = _enabled_settings_market_keys()
+            selected_market = str(prefer_market or "").strip().lower()
+            try:
+                cur = str(market_settings_nb.tab(market_settings_nb.select(), "text") or "").strip().lower()
+                if cur in {"crypto", "stocks", "forex"}:
+                    selected_market = selected_market or cur
+            except Exception:
+                pass
+            for tab_id in list(market_settings_nb.tabs()):
+                try:
+                    market_settings_nb.forget(tab_id)
+                except Exception:
+                    pass
+            for mk in enabled_keys:
+                tab = settings_market_tabs.get(mk)
+                if tab is None:
+                    continue
+                market_settings_nb.add(tab, text=settings_market_labels.get(mk, mk.title()))
+            combo_values = [settings_market_labels.get(mk, mk.title()) for mk in enabled_keys]
+            try:
+                settings_tab_jump_combo.configure(values=combo_values)
+            except Exception:
+                pass
+            if selected_market not in enabled_keys:
+                selected_market = enabled_keys[0]
+            selected_label = settings_market_labels.get(selected_market, "Crypto")
+            settings_tab_jump_var.set(selected_label)
+            try:
+                market_settings_nb.select(settings_market_tabs[selected_market])
+            except Exception:
+                pass
+            win.after(0, _update_settings_scrollbars)
+
         def _on_settings_tab_changed(_e=None) -> None:
             try:
                 cur = str(market_settings_nb.tab(market_settings_nb.select(), "text") or "Crypto")
@@ -22179,15 +22315,18 @@ class PowerTraderHub(tk.Tk):
             win.after(0, _update_settings_scrollbars)
 
         market_settings_nb.bind("<<NotebookTabChanged>>", _on_settings_tab_changed, add="+")
-        settings_tab_jump_combo.bind(
-            "<<ComboboxSelected>>",
-            lambda _e: market_settings_nb.select(
-                crypto_tab
-                if settings_tab_jump_var.get() == "Crypto"
-                else (stocks_tab if settings_tab_jump_var.get() == "Stocks" else forex_tab)
-            ),
-            add="+",
-        )
+        def _on_settings_jump_selected(_e=None) -> None:
+            label = str(settings_tab_jump_var.get() or "").strip()
+            key = "crypto"
+            for mk, mk_label in settings_market_labels.items():
+                if label == mk_label:
+                    key = mk
+                    break
+            _refresh_settings_market_tabs(prefer_market=key)
+        settings_tab_jump_combo.bind("<<ComboboxSelected>>", _on_settings_jump_selected, add="+")
+        for _market_var in (market_crypto_enabled_var, market_stocks_enabled_var, market_forex_enabled_var):
+            _market_var.trace_add("write", lambda *_: _refresh_settings_market_tabs())
+        _refresh_settings_market_tabs()
 
         role_mode_default = str(self.settings.get("ui_role_mode", DEFAULT_SETTINGS.get("ui_role_mode", "basic")) or "basic").strip().lower()
         show_adv_default = role_mode_default in {"advanced", "admin"}
@@ -23135,17 +23274,20 @@ class PowerTraderHub(tk.Tk):
                 return
             key = str(focus_key or "").strip().lower()
             if key in {"stocks", "stocks_credentials", "alpaca", "alpaca_credentials"}:
-                market_settings_nb.select(stocks_tab)
+                market_stocks_enabled_var.set(True)
+                _refresh_settings_market_tabs(prefer_market="stocks")
                 if "credential" in key or "alpaca" in key:
                     win.after(120, _open_alpaca_key_editor)
                 return
             if key in {"forex", "forex_credentials", "oanda", "oanda_credentials"}:
-                market_settings_nb.select(forex_tab)
+                market_forex_enabled_var.set(True)
+                _refresh_settings_market_tabs(prefer_market="forex")
                 if "credential" in key or "oanda" in key:
                     win.after(120, _open_oanda_key_editor)
                 return
             if key in {"crypto", "crypto_credentials", "robinhood", "robinhood_credentials"}:
-                market_settings_nb.select(crypto_tab)
+                market_crypto_enabled_var.set(True)
+                _refresh_settings_market_tabs(prefer_market="crypto")
                 if "credential" in key or "robinhood" in key:
                     win.after(120, _open_robinhood_api_wizard)
                 return
@@ -23169,6 +23311,16 @@ class PowerTraderHub(tk.Tk):
                     _apply_profile_to_form(profile_key)
                 self.settings["settings_control_mode"] = str(mode_key)
                 self.settings["settings_profile"] = str(profile_key)
+                enabled_markets = {
+                    "crypto": bool(market_crypto_enabled_var.get()),
+                    "stocks": bool(market_stocks_enabled_var.get()),
+                    "forex": bool(market_forex_enabled_var.get()),
+                }
+                if not any(enabled_markets.values()):
+                    enabled_markets["crypto"] = True
+                self.settings["market_crypto_enabled"] = bool(enabled_markets["crypto"])
+                self.settings["market_stocks_enabled"] = bool(enabled_markets["stocks"])
+                self.settings["market_forex_enabled"] = bool(enabled_markets["forex"])
                 _ = bool(paper_only_guard_var.get())
 
                 alpaca_base_default = f"https://{ALPACA_LIVE_HOST}"
@@ -23702,6 +23854,7 @@ class PowerTraderHub(tk.Tk):
                     self.settings["global_drawdown_resume_recovery_buffer_pct"] = float(DEFAULT_SETTINGS.get("global_drawdown_resume_recovery_buffer_pct", 0.25))
                 self.settings["global_drawdown_require_manual_ack"] = bool(drawdown_ack_required_var.get())
                 self._save_settings()
+                self._refresh_market_tab_visibility()
                 self._apply_font_scale_preset(fs, persist=False)
                 self._apply_layout_preset(lp, persist=False)
                 self._audit_operator_action(

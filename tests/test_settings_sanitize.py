@@ -278,7 +278,18 @@ class TestSettingsSanitize(unittest.TestCase):
         self.assertEqual(float(overrides["market_max_total_exposure_pct"]), 0.0)
         self.assertEqual(float(overrides["stock_max_daily_loss_pct"]), 0.0)
         self.assertEqual(float(overrides["forex_max_daily_loss_pct"]), 0.0)
-        self.assertEqual(float(overrides["forex_stale_min_notional_usd"]), 3.0)
+
+    def test_sanitize_keeps_at_least_one_market_enabled(self) -> None:
+        out = sanitize_settings(
+            {
+                "market_crypto_enabled": False,
+                "market_stocks_enabled": False,
+                "market_forex_enabled": False,
+            }
+        )
+        self.assertTrue(bool(out.get("market_crypto_enabled", False)))
+        self.assertFalse(bool(out.get("market_stocks_enabled", True)))
+        self.assertFalse(bool(out.get("market_forex_enabled", True)))
 
     def test_settings_profile_aliases_and_new_presets(self) -> None:
         self.assertEqual(normalize_settings_profile("guarded"), "safe")

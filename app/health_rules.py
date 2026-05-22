@@ -43,8 +43,18 @@ _RUNBOOK_LINK_MAP: Dict[str, str] = {
 
 def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
     scan_health = runtime_state.get("scan_health", {}) if isinstance(runtime_state.get("scan_health", {}), dict) else {}
-    stocks = scan_health.get("stocks", {}) if isinstance(scan_health.get("stocks", {}), dict) else {}
-    forex = scan_health.get("forex", {}) if isinstance(scan_health.get("forex", {}), dict) else {}
+    stocks_enabled = bool(settings.get("market_stocks_enabled", True))
+    forex_enabled = bool(settings.get("market_forex_enabled", True))
+    stocks = (
+        scan_health.get("stocks", {})
+        if stocks_enabled and isinstance(scan_health.get("stocks", {}), dict)
+        else {}
+    )
+    forex = (
+        scan_health.get("forex", {})
+        if forex_enabled and isinstance(scan_health.get("forex", {}), dict)
+        else {}
+    )
     checks = runtime_state.get("checks", {}) if isinstance(runtime_state.get("checks", {}), dict) else {}
     incidents = runtime_state.get("incidents_last_200", {}) if isinstance(runtime_state.get("incidents_last_200", {}), dict) else {}
     sev = incidents.get("by_severity", {}) if isinstance(incidents.get("by_severity", {}), dict) else {}
@@ -55,9 +65,24 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
     by_event_sev = incidents.get("by_event_severity", {}) if isinstance(incidents.get("by_event_severity", {}), dict) else {}
     autopilot = runtime_state.get("autopilot", {}) if isinstance(runtime_state.get("autopilot", {}), dict) else {}
     scan_drift = runtime_state.get("scan_drift", {}) if isinstance(runtime_state.get("scan_drift", {}), dict) else {}
-    active_drift = scan_drift.get("active", []) if isinstance(scan_drift.get("active", []), list) else []
+    active_drift_raw = scan_drift.get("active", []) if isinstance(scan_drift.get("active", []), list) else []
     scan_cadence = runtime_state.get("scan_cadence", {}) if isinstance(runtime_state.get("scan_cadence", {}), dict) else {}
-    active_cadence = scan_cadence.get("active", []) if isinstance(scan_cadence.get("active", []), list) else []
+    active_cadence_raw = scan_cadence.get("active", []) if isinstance(scan_cadence.get("active", []), list) else []
+    enabled_markets = {mk for mk, on in {"stocks": stocks_enabled, "forex": forex_enabled}.items() if bool(on)}
+    active_drift: List[Dict[str, Any]] = []
+    for row in active_drift_raw:
+        if not isinstance(row, dict):
+            continue
+        mk = str(row.get("market", "") or "").strip().lower()
+        if mk in {"", "global"} or (mk in enabled_markets):
+            active_drift.append(row)
+    active_cadence: List[Dict[str, Any]] = []
+    for row in active_cadence_raw:
+        if not isinstance(row, dict):
+            continue
+        mk = str(row.get("market", "") or "").strip().lower()
+        if mk in {"", "global"} or (mk in enabled_markets):
+            active_cadence.append(row)
     execution_guard = runtime_state.get("execution_guard", {}) if isinstance(runtime_state.get("execution_guard", {}), dict) else {}
     guard_markets = execution_guard.get("markets", {}) if isinstance(execution_guard.get("markets", {}), dict) else {}
     market_loop = runtime_state.get("market_loop", {}) if isinstance(runtime_state.get("market_loop", {}), dict) else {}
@@ -116,7 +141,7 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
         scores_total=f_scores,
         unknown_dom_cap_pct=unknown_dom_cap,
     )
-    max_reject = max(s_reject, f_reject)
+    max_reject = max((s_reject if stocks_enabled else 0.0), (f_reject if forex_enabled else 0.0))
     incident_count_total = int(incidents.get("count", 0) or 0)
     sev_src = sev_1h if bool(sev_1h) else sev
     warn_count = int((sev_src.get("warning", 0) or 0) + (sev_src.get("warn", 0) or 0))
@@ -226,7 +251,10 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
     forex_score_gate = str((shadow_scorecards.get("forex", {}) if isinstance(shadow_scorecards.get("forex", {}), dict) else {}).get("promotion_gate", "") or "").strip().upper()
     notif_by_sev = notification_center.get("by_severity", {}) if isinstance(notification_center.get("by_severity", {}), dict) else {}
     notif_critical = int(notif_by_sev.get("critical", 0) or 0)
-    shadow_scorecard_blocked = shadow_scorecard_gate_relevant and (stocks_score_gate == "BLOCK" or forex_score_gate == "BLOCK")
+    shadow_scorecard_blocked = shadow_scorecard_gate_relevant and (
+        (stocks_enabled and stocks_score_gate == "BLOCK")
+        or (forex_enabled and forex_score_gate == "BLOCK")
+    )
 
     reasons: List[str] = []
     hints: List[str] = []
@@ -326,6 +354,8 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
             "forex_reject_rate_pct": round(f_reject, 3),
             "stocks_reject_rate_raw_pct": round(s_reject_raw, 3),
             "forex_reject_rate_raw_pct": round(f_reject_raw, 3),
+            "stocks_enabled": bool(stocks_enabled),
+            "forex_enabled": bool(forex_enabled),
             "incident_count_last_200": int(incident_count),
             "incident_count_total_last_200": int(incident_count_total),
             "warning_incidents_last_200": int(warn_count),

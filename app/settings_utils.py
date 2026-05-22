@@ -28,6 +28,7 @@ def normalize_settings_profile(profile_key: Any, default: str = "balanced") -> s
 SANITIZER_DEFAULTS: Dict[str, Any] = {
     "settings_schema_version": CURRENT_SETTINGS_VERSION,
     "settings_upgrade_notes": [],
+    "main_neural_dir": "market_data/coins",
     "coins": ["BTC", "ETH", "XRP", "BNB", "DOGE"],
     "market_rollout_stage": "live",
     "alpaca_paper_mode": False,
@@ -35,6 +36,9 @@ SANITIZER_DEFAULTS: Dict[str, Any] = {
     "profile_manual_overrides": [],
     "settings_control_mode": "self_managed",
     "settings_profile": "balanced",
+    "market_crypto_enabled": True,
+    "market_stocks_enabled": True,
+    "market_forex_enabled": True,
     "ui_role_mode": "basic",
     "ui_timestamp_mode": "local_24h",
     "market_panel_compact_mode": False,
@@ -120,7 +124,7 @@ SANITIZER_DEFAULTS: Dict[str, Any] = {
     "openai_position_review_enabled": False,
     "openai_position_review_interval_s": 300.0,
     "openai_position_review_model": "gpt-5.4-mini",
-    "openai_position_review_timeout_s": 8.0,
+    "openai_position_review_timeout_s": 12.0,
     "openai_position_review_live_enabled": True,
     "openai_position_review_paper_enabled": True,
     "openai_position_review_auto_act_enabled": False,
@@ -460,6 +464,9 @@ _BOOL_KEYS = {
     "openai_postmortem_write_report_enabled",
     "openai_postmortem_auto_apply_tuning_enabled",
     "market_independent_execution_enabled",
+    "market_crypto_enabled",
+    "market_stocks_enabled",
+    "market_forex_enabled",
 }
 
 _FLOAT_BOUNDS: Dict[str, Tuple[float, float, float]] = {
@@ -502,7 +509,7 @@ _FLOAT_BOUNDS: Dict[str, Tuple[float, float, float]] = {
     "openai_decision_min_interval_s": (0.0, 0.0, 604800.0),
     "openai_nightly_review_timeout_s": (12.0, 1.0, 60.0),
     "openai_position_review_interval_s": (300.0, 30.0, 604800.0),
-    "openai_position_review_timeout_s": (8.0, 1.0, 30.0),
+    "openai_position_review_timeout_s": (12.0, 1.0, 30.0),
     "openai_capital_planner_interval_s": (180.0, 30.0, 604800.0),
     "openai_capital_planner_timeout_s": (6.0, 1.0, 30.0),
     "openai_root_cause_interval_s": (240.0, 30.0, 604800.0),
@@ -1691,6 +1698,14 @@ def sanitize_settings(raw: Dict[str, Any] | None, defaults: Dict[str, Any] | Non
 
     for key in _BOOL_KEYS:
         out[key] = _as_bool(out.get(key), bool(base.get(key, False)))
+
+    # Keep at least one market enabled for a usable UI/runtime.
+    if not (
+        bool(out.get("market_crypto_enabled", True))
+        or bool(out.get("market_stocks_enabled", True))
+        or bool(out.get("market_forex_enabled", True))
+    ):
+        out["market_crypto_enabled"] = True
 
     if bool(out.get("openai_managed_auto_tuning_enabled", False)):
         if bool(out.get("openai_nightly_review_enabled", False)) or bool(out.get("openai_decision_enabled", False)):

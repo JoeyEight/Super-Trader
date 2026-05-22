@@ -57,6 +57,18 @@ class TestSettingsMigrations(unittest.TestCase):
         self.assertTrue(bool(out.get("openai_postmortem_write_report_enabled", False)))
         self.assertFalse(bool(out.get("openai_postmortem_auto_apply_tuning_enabled", True)))
 
+    def test_migrate_v4_adds_market_enable_flags(self) -> None:
+        raw = {
+            "settings_schema_version": 4,
+        }
+        out, notes, from_v, to_v = migrate_settings(raw)
+        self.assertEqual(from_v, 4)
+        self.assertEqual(to_v, int(CURRENT_SETTINGS_VERSION))
+        self.assertTrue(bool(out.get("market_crypto_enabled", False)))
+        self.assertTrue(bool(out.get("market_stocks_enabled", False)))
+        self.assertTrue(bool(out.get("market_forex_enabled", False)))
+        self.assertTrue(isinstance(notes, list))
+
 
 if __name__ == "__main__":
     unittest.main()

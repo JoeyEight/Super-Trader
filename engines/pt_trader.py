@@ -2962,6 +2962,22 @@ class CryptoAPITrading:
             )
         except Exception:
             stale_exit_force_short_count = max(4, int(start_level) + 1)
+        try:
+            default_trail_hold_near_flat_pct = 3.0 if str(profile_key) == "max_growth" else 1.5
+            trail_hold_near_flat_pct = max(
+                0.0,
+                float(settings.get("crypto_trail_hold_near_flat_pct", default_trail_hold_near_flat_pct) or default_trail_hold_near_flat_pct),
+            )
+        except Exception:
+            trail_hold_near_flat_pct = 3.0 if str(profile_key) == "max_growth" else 1.5
+        try:
+            default_trail_hold_min_profit_usd = 0.25 if str(profile_key) == "max_growth" else 0.10
+            trail_hold_min_profit_usd = max(
+                0.0,
+                float(settings.get("crypto_trail_hold_min_profit_usd", default_trail_hold_min_profit_usd) or default_trail_hold_min_profit_usd),
+            )
+        except Exception:
+            trail_hold_min_profit_usd = 0.25 if str(profile_key) == "max_growth" else 0.10
 
         # Calculate total account value (robust: never drop a held coin to $0 on transient API misses)
         snapshot_ok = True
@@ -3226,6 +3242,28 @@ class CryptoAPITrading:
             positions[symbol]["aligned_with_strategy"] = bool(aligned_with_strategy)
             positions[symbol]["alignment_reasons"] = [str(r) for r in align_reasons[:3]]
             positions[symbol]["alignment_streak"] = int(stale_streak)
+            try:
+                open_pos_map = self._pnl_ledger.get("open_positions", {}) if isinstance(self._pnl_ledger, dict) else {}
+            except Exception:
+                open_pos_map = {}
+            if not isinstance(open_pos_map, dict):
+                open_pos_map = {}
+            open_pos_row = open_pos_map.get(str(symbol).upper(), {})
+            if not isinstance(open_pos_row, dict):
+                open_pos_row = {}
+            last_entry_ts_map = getattr(self, "_last_entry_ts", {})
+            if not isinstance(last_entry_ts_map, dict):
+                last_entry_ts_map = {}
+            try:
+                opened_ts = float(
+                    open_pos_row.get("opened_ts", last_entry_ts_map.get(str(symbol).upper(), 0.0))
+                    or 0.0
+                )
+            except Exception:
+                opened_ts = 0.0
+            position_age_s = max(0, int(time.time() - opened_ts)) if opened_ts > 0.0 else -1
+            position_unrealized_usd = max(0.0, float(current_sell_price - avg_cost_basis) * float(quantity))
+            positions[symbol]["position_age_s"] = int(position_age_s)
 
 
             print(
@@ -3255,28 +3293,8 @@ class CryptoAPITrading:
                 and stale_streak >= int(stale_exit_grace_cycles)
                 and stale_exit_count < int(stale_exit_max_per_cycle)
             )
+            sell_pressure = int(align_snapshot.get("sell_count", 0) or 0)
             if should_force_stale_exit:
-                try:
-                    open_pos_row = (
-                        (self._pnl_ledger.get("open_positions", {}) if isinstance(self._pnl_ledger.get("open_positions", {}), dict) else {})
-                        .get(str(symbol).upper(), {})
-                    )
-                except Exception:
-                    open_pos_row = {}
-                if not isinstance(open_pos_row, dict):
-                    open_pos_row = {}
-                last_entry_ts_map = getattr(self, "_last_entry_ts", {})
-                if not isinstance(last_entry_ts_map, dict):
-                    last_entry_ts_map = {}
-                try:
-                    opened_ts = float(
-                        open_pos_row.get("opened_ts", last_entry_ts_map.get(str(symbol).upper(), 0.0))
-                        or 0.0
-                    )
-                except Exception:
-                    opened_ts = 0.0
-                position_age_s = max(0, int(time.time() - opened_ts)) if opened_ts > 0.0 else -1
-                sell_pressure = int(align_snapshot.get("sell_count", 0) or 0)
                 mild_loss = (gain_loss_percentage_sell < 0.0) and (gain_loss_percentage_sell > float(stale_exit_loss_cut_pct))
                 hold_guard_active = (
                     position_age_s >= 0
@@ -3408,6 +3426,7 @@ class CryptoAPITrading:
 
                 # Use SELL price because that's what you actually get when you market sell
                 above_now = current_sell_price >= state["line"]
+                preserve_above_for_next_cycle = False
 
                 # Activate trailing once we first get above the base PM line
                 if (not state["active"]) and above_now:
@@ -3427,37 +3446,93 @@ class CryptoAPITrading:
 
                     # Forced sell on cross from ABOVE -> BELOW trailing line
                     if state["was_above"] and (current_sell_price < state["line"]):
-                        print(
-                            f"  Trailing PM hit for {symbol}. "
-                            f"Sell price {current_sell_price:.8f} fell below trailing line {state['line']:.8f}."
+                        dynamic_score_now = float(align_snapshot.get("dynamic_score", 0.0) or 0.0)
+                        dynamic_threshold_now = max(
+                            0.0,
+                            float(
+                                align_snapshot.get(
+                                    "adaptive_dynamic_threshold",
+                                    dynamic_adaptive_threshold,
+                                )
+                                or dynamic_adaptive_threshold
+                                or 0.0
+                            ),
                         )
-                        response = self.place_sell_order(
-                            str(uuid.uuid4()),
-                            "sell",
-                            "market",
-                            full_symbol,
-                            quantity,
-                            expected_price=current_sell_price,
-                            avg_cost_basis=avg_cost_basis,
-                            pnl_pct=gain_loss_percentage_sell,
-                            tag="TRAIL_SELL",
+                        near_flat_gain = (
+                            float(gain_loss_percentage_sell) >= 0.0
+                            and float(gain_loss_percentage_sell) <= float(trail_hold_near_flat_pct)
                         )
+                        tiny_profit_usd = (
+                            float(position_unrealized_usd) > 0.0
+                            and float(position_unrealized_usd) <= float(trail_hold_min_profit_usd)
+                        )
+                        fresh_trade_window = position_age_s >= 0 and position_age_s < int(stale_exit_min_hold_s)
+                        strong_signal_alignment = dynamic_score_now >= float(dynamic_threshold_now)
+                        low_short_pressure = sell_pressure <= max(1, int(start_level) - 1)
+                        hold_trail_exit = (
+                            bool(aligned_with_strategy)
+                            and bool(strong_signal_alignment)
+                            and bool(low_short_pressure)
+                            and bool(fresh_trade_window)
+                            and bool(near_flat_gain or tiny_profit_usd)
+                        )
+                        if hold_trail_exit:
+                            guard_detail = (
+                                f"Holding {symbol}: trailing crossed but setup remains aligned "
+                                f"(score {dynamic_score_now:.3f} >= {dynamic_threshold_now:.3f}, "
+                                f"short S{sell_pressure}), near-flat gain/profit floor guard "
+                                f"(pnl {gain_loss_percentage_sell:+.2f}% | ${position_unrealized_usd:.2f})."
+                            )
+                            stale_exit_events.append(
+                                {
+                                    "symbol": str(symbol),
+                                    "ok": False,
+                                    "reason": "trail_sell_hold_alignment_guard",
+                                    "detail": guard_detail,
+                                    "streak": int(stale_streak),
+                                    "age_s": int(position_age_s),
+                                    "reasons": [str(r) for r in align_reasons[:3]],
+                                }
+                            )
+                            self._log_rate_limited(
+                                f"trail_sell_hold_alignment_guard_{symbol}",
+                                guard_detail,
+                                every_s=20.0,
+                            )
+                            # Keep cross re-check armed so we can still exit promptly if alignment degrades.
+                            preserve_above_for_next_cycle = True
+                        else:
+                            print(
+                                f"  Trailing PM hit for {symbol}. "
+                                f"Sell price {current_sell_price:.8f} fell below trailing line {state['line']:.8f}."
+                            )
+                            response = self.place_sell_order(
+                                str(uuid.uuid4()),
+                                "sell",
+                                "market",
+                                full_symbol,
+                                quantity,
+                                expected_price=current_sell_price,
+                                avg_cost_basis=avg_cost_basis,
+                                pnl_pct=gain_loss_percentage_sell,
+                                tag="TRAIL_SELL",
+                            )
 
-                        if response and isinstance(response, dict) and "errors" not in response:
-                            trades_made = True
-                            self.trailing_pm.pop(symbol, None)  # clear per-coin trailing state on exit
+                            if response and isinstance(response, dict) and "errors" not in response:
+                                trades_made = True
+                                self.trailing_pm.pop(symbol, None)  # clear per-coin trailing state on exit
 
-                            # Trade ended -> reset rolling 24h DCA window for this coin
-                            self._reset_dca_window_for_trade(symbol, sold=True)
+                                # Trade ended -> reset rolling 24h DCA window for this coin
+                                self._reset_dca_window_for_trade(symbol, sold=True)
 
-                            print(f"  Successfully sold {quantity} {symbol}.")
-                            time.sleep(5)
-                            holdings = self.get_holdings()
-                            continue
+                                print(f"  Successfully sold {quantity} {symbol}.")
+                                time.sleep(5)
+                                holdings = self.get_holdings()
+                                continue
 
 
                 # Save this tick’s position relative to the line (needed for “above -> below” detection)
-                state["was_above"] = above_now
+                state["was_above"] = True if preserve_above_for_next_cycle else above_now
 
 
 
@@ -4200,6 +4275,8 @@ class CryptoAPITrading:
             "stale_exit_min_hold_s": int(stale_exit_min_hold_s),
             "stale_exit_loss_cut_pct": round(float(stale_exit_loss_cut_pct), 4),
             "stale_exit_force_short_count": int(stale_exit_force_short_count),
+            "trail_hold_near_flat_pct": round(float(trail_hold_near_flat_pct), 4),
+            "trail_hold_min_profit_usd": round(float(trail_hold_min_profit_usd), 4),
             "skip_new_entries_this_cycle": bool(skip_new_entries_this_cycle),
             "signal_gate_symbol": str(signal_gate_debug.get("symbol", "") or ""),
             "signal_gate_mode": str(signal_gate_debug.get("gate_mode", "") or ""),

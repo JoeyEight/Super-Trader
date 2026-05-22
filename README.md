@@ -212,6 +212,10 @@ Output report:
 - Forex `event_feed` warnings indicate macro-event feed degradation and do not by themselves disable forex trading; execution gates still apply independently.
 - OpenAI advisory services are optional and fail closed (local logic remains authoritative on errors/timeouts/missing key).
 - For lowest CPU usage, leave OpenAI advisory/review services disabled unless you are actively using them.
+- Market modules can be enabled/disabled per user in Settings (`Enabled markets`).
+- Disabled markets are hidden from the main tabs and from market-specific settings panels.
+- Disabled markets do not emit missing-credential startup warnings or reject-pressure runtime alert noise.
+- If all markets are disabled accidentally, the app auto-enables Crypto to keep the UI/runtime usable.
 
 ## OpenAI (Optional Advisory Layer)
 All OpenAI-powered modules are advisory only. They do not place trades directly and do not bypass local guards.

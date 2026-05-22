@@ -708,7 +708,7 @@ def request_openai_position_review(
     cfg = sanitize_settings(settings if isinstance(settings, dict) else {})
     enabled, reason = _position_review_enabled(cfg, mode=str(review_packet.get("mode", "")))
     model = _s(cfg.get("openai_position_review_model", cfg.get("openai_model", "gpt-5.4-mini"))) or "gpt-5.4-mini"
-    timeout_s = _clamp(_f(cfg.get("openai_position_review_timeout_s", 8.0), 8.0), 1.0, 30.0)
+    timeout_s = _clamp(_f(cfg.get("openai_position_review_timeout_s", 12.0), 12.0), 1.0, 30.0)
     max_positions = max(8, min(200, int(_f(cfg.get("openai_position_review_max_positions", 48), 48))))
     if not enabled:
         return {
@@ -1022,7 +1022,7 @@ def run_openai_position_review(
     enabled, enabled_reason = _position_review_enabled(cfg, mode=_trading_mode(cfg))
     auto_act_enabled = bool(cfg.get("openai_position_review_auto_act_enabled", False))
     max_positions = max(8, min(200, int(_f(cfg.get("openai_position_review_max_positions", 48), 48))))
-    timeout_s = _clamp(_f(cfg.get("openai_position_review_timeout_s", 8.0), 8.0), 1.0, 30.0)
+    timeout_s = _clamp(_f(cfg.get("openai_position_review_timeout_s", 12.0), 12.0), 1.0, 30.0)
     model = _s(cfg.get("openai_position_review_model", cfg.get("openai_model", "gpt-5.4-mini"))) or "gpt-5.4-mini"
 
     pre_status = {

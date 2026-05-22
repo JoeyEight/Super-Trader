@@ -537,6 +537,17 @@ def _load_settings() -> Dict[str, Any]:
     return sanitize_settings(data if isinstance(data, dict) else {})
 
 
+def _market_enabled(settings: Dict[str, Any], market: str) -> bool:
+    mk = str(market or "").strip().lower()
+    if mk == "stocks":
+        return bool(settings.get("market_stocks_enabled", True))
+    if mk == "forex":
+        return bool(settings.get("market_forex_enabled", True))
+    if mk == "crypto":
+        return bool(settings.get("market_crypto_enabled", True))
+    return True
+
+
 def _jittered_interval(base_s: float, jitter_pct: float) -> float:
     base = max(1.0, float(base_s))
     pct = max(0.0, min(0.5, float(jitter_pct)))
@@ -745,6 +756,10 @@ def _write_snapshots(settings: Dict[str, Any]) -> Dict[str, Any]:
         "stocks_state": "",
         "forex_state": "",
     }
+    stocks_enabled = _market_enabled(settings, "stocks")
+    forex_enabled = _market_enabled(settings, "forex")
+    out["stocks_enabled"] = bool(stocks_enabled)
+    out["forex_enabled"] = bool(forex_enabled)
     now_ts = int(time.time())
     try:
         snapshot_fallback_age_s = max(30.0, float(settings.get("market_fallback_snapshot_max_age_s", 1800.0) or 1800.0))
@@ -753,152 +768,180 @@ def _write_snapshots(settings: Dict[str, Any]) -> Dict[str, Any]:
     stocks_path = os.path.join(stocks_dir, "alpaca_status.json")
     forex_path = os.path.join(forex_dir, "oanda_status.json")
 
-    alpaca_key, alpaca_secret = get_alpaca_creds(settings, base_dir=BASE_DIR)
-    oanda_account, oanda_token = get_oanda_creds(settings, base_dir=BASE_DIR)
-    alpaca_endpoint = validate_alpaca_endpoints(
-        settings.get("alpaca_base_url", "https://paper-api.alpaca.markets"),
-        settings.get("alpaca_data_url", "https://data.alpaca.markets"),
-        paper_mode=bool(settings.get("alpaca_paper_mode", True)),
-    )
-    oanda_endpoint = validate_oanda_endpoints(
-        settings.get("oanda_rest_url", "https://api-fxpractice.oanda.com"),
-        settings.get("oanda_stream_url", ""),
-        practice_mode=bool(settings.get("oanda_practice_mode", True)),
-    )
+    alpaca_key = ""
+    alpaca_secret = ""
+    if stocks_enabled:
+        alpaca_key, alpaca_secret = get_alpaca_creds(settings, base_dir=BASE_DIR)
+    oanda_account = ""
+    oanda_token = ""
+    if forex_enabled:
+        oanda_account, oanda_token = get_oanda_creds(settings, base_dir=BASE_DIR)
+    alpaca_endpoint: Dict[str, Any] = {"valid": True, "issues": []}
+    if stocks_enabled:
+        alpaca_endpoint = validate_alpaca_endpoints(
+            settings.get("alpaca_base_url", "https://paper-api.alpaca.markets"),
+            settings.get("alpaca_data_url", "https://data.alpaca.markets"),
+            paper_mode=bool(settings.get("alpaca_paper_mode", True)),
+        )
+    oanda_endpoint: Dict[str, Any] = {"valid": True, "issues": []}
+    if forex_enabled:
+        oanda_endpoint = validate_oanda_endpoints(
+            settings.get("oanda_rest_url", "https://api-fxpractice.oanda.com"),
+            settings.get("oanda_stream_url", ""),
+            practice_mode=bool(settings.get("oanda_practice_mode", True)),
+        )
     out["endpoint_validation"] = {
         "alpaca_valid": bool(alpaca_endpoint.get("valid", False)),
         "oanda_valid": bool(oanda_endpoint.get("valid", False)),
         "alpaca_issues": int(len(list(alpaca_endpoint.get("issues", []) or []))),
         "oanda_issues": int(len(list(oanda_endpoint.get("issues", []) or []))),
     }
-    for row in list(alpaca_endpoint.get("issues", []) or []):
-        if not isinstance(row, dict):
-            continue
-        lvl = str(row.get("level", "warning") or "warning").strip().lower()
-        msg = str(row.get("message", "alpaca endpoint warning") or "alpaca endpoint warning")
-        _incident(
-            "error" if lvl == "critical" else "warning",
-            str(row.get("code", "alpaca_endpoint_warning") or "alpaca_endpoint_warning"),
-            msg,
-            {"service": "alpaca", "details": row.get("details", {}) if isinstance(row.get("details", {}), dict) else {}},
-            cooldown_key=f"endpoint:alpaca:{str(row.get('code', '') or '')}",
+    if stocks_enabled:
+        for row in list(alpaca_endpoint.get("issues", []) or []):
+            if not isinstance(row, dict):
+                continue
+            lvl = str(row.get("level", "warning") or "warning").strip().lower()
+            msg = str(row.get("message", "alpaca endpoint warning") or "alpaca endpoint warning")
+            _incident(
+                "error" if lvl == "critical" else "warning",
+                str(row.get("code", "alpaca_endpoint_warning") or "alpaca_endpoint_warning"),
+                msg,
+                {"service": "alpaca", "details": row.get("details", {}) if isinstance(row.get("details", {}), dict) else {}},
+                cooldown_key=f"endpoint:alpaca:{str(row.get('code', '') or '')}",
+            )
+    if forex_enabled:
+        for row in list(oanda_endpoint.get("issues", []) or []):
+            if not isinstance(row, dict):
+                continue
+            lvl = str(row.get("level", "warning") or "warning").strip().lower()
+            msg = str(row.get("message", "oanda endpoint warning") or "oanda endpoint warning")
+            _incident(
+                "error" if lvl == "critical" else "warning",
+                str(row.get("code", "oanda_endpoint_warning") or "oanda_endpoint_warning"),
+                msg,
+                {"service": "oanda", "details": row.get("details", {}) if isinstance(row.get("details", {}), dict) else {}},
+                cooldown_key=f"endpoint:oanda:{str(row.get('code', '') or '')}",
+            )
+    alpaca = None
+    if stocks_enabled:
+        alpaca = AlpacaBrokerClient(
+            api_key_id=alpaca_key,
+            secret_key=alpaca_secret,
+            base_url=str(alpaca_endpoint.get("normalized_base_url", "") or "https://paper-api.alpaca.markets"),
+            data_url=str(alpaca_endpoint.get("normalized_data_url", "") or "https://data.alpaca.markets"),
         )
-    for row in list(oanda_endpoint.get("issues", []) or []):
-        if not isinstance(row, dict):
-            continue
-        lvl = str(row.get("level", "warning") or "warning").strip().lower()
-        msg = str(row.get("message", "oanda endpoint warning") or "oanda endpoint warning")
-        _incident(
-            "error" if lvl == "critical" else "warning",
-            str(row.get("code", "oanda_endpoint_warning") or "oanda_endpoint_warning"),
-            msg,
-            {"service": "oanda", "details": row.get("details", {}) if isinstance(row.get("details", {}), dict) else {}},
-            cooldown_key=f"endpoint:oanda:{str(row.get('code', '') or '')}",
+    oanda = None
+    if forex_enabled:
+        oanda = OandaBrokerClient(
+            account_id=oanda_account,
+            api_token=oanda_token,
+            rest_url=str(oanda_endpoint.get("normalized_rest_url", "") or "https://api-fxpractice.oanda.com"),
         )
-    alpaca = AlpacaBrokerClient(
-        api_key_id=alpaca_key,
-        secret_key=alpaca_secret,
-        base_url=str(alpaca_endpoint.get("normalized_base_url", "") or "https://paper-api.alpaca.markets"),
-        data_url=str(alpaca_endpoint.get("normalized_data_url", "") or "https://data.alpaca.markets"),
-    )
-    oanda = OandaBrokerClient(
-        account_id=oanda_account,
-        api_token=oanda_token,
-        rest_url=str(oanda_endpoint.get("normalized_rest_url", "") or "https://api-fxpractice.oanda.com"),
-    )
 
-    try:
-        t0 = time.perf_counter()
-        s = alpaca.fetch_snapshot()
-        s["ts"] = int(time.time())
-        s = _merge_with_last_good(stocks_path, s)
-        _atomic_write_json(stocks_path, s)
+    if not stocks_enabled:
         out["stocks_ok"] = True
-        out["stocks_state"] = str(s.get("state", "") or "")
-        out["stocks_elapsed_ms"] = round((time.perf_counter() - t0) * 1000.0, 3)
-        _incident("info", "stocks_snapshot_ok", "stocks snapshot updated", {"state": s.get("state", "")}, cooldown_key="stocks_snapshot_ok")
-        _update_sla_metrics("stocks_snapshot", ok=True, elapsed_ms=(time.perf_counter() - t0) * 1000.0, extra={"state": s.get("state", "")})
-        _record_guard_result(
-            settings,
-            market="stocks",
-            failed=_broker_failure_signal(str(s.get("msg", "") or ""), str(s.get("state", "") or "")),
-            reason=str(s.get("msg", "") or ""),
-        )
-    except Exception as exc:
-        print(f"[MARKETS] stocks snapshot failed: {type(exc).__name__}: {exc}")
-        out["stocks_ok"] = False
-        out["stocks_state"] = "ERROR"
-        _incident("error", "stocks_snapshot_failed", f"{type(exc).__name__}: {exc}", {"market": "stocks"}, cooldown_key="stocks_snapshot_failed")
-        _update_sla_metrics("stocks_snapshot", ok=False, elapsed_ms=0.0, extra={"error": f"{type(exc).__name__}: {exc}"})
-        _record_guard_result(settings, market="stocks", failed=True, reason=f"{type(exc).__name__}: {exc}")
-        cached = _cached_status_fallback(stocks_path, snapshot_fallback_age_s, now_ts=now_ts)
-        if cached:
-            cached["state"] = str(cached.get("state", "READY") or "READY")
-            cached["msg"] = f"{type(exc).__name__}: {exc} | using cached snapshot ({int(cached.get('fallback_age_s', 0))}s old)"
-            _atomic_write_json(stocks_path, cached)
+        out["stocks_state"] = "DISABLED"
+        out["stocks_elapsed_ms"] = 0.0
+        _update_sla_metrics("stocks_snapshot", ok=True, elapsed_ms=0.0, extra={"state": "DISABLED"})
+    else:
+        try:
+            t0 = time.perf_counter()
+            s = alpaca.fetch_snapshot() if alpaca is not None else {"state": "ERROR", "msg": "alpaca_client_unavailable"}
+            s["ts"] = int(time.time())
+            s = _merge_with_last_good(stocks_path, s)
+            _atomic_write_json(stocks_path, s)
             out["stocks_ok"] = True
-            out["stocks_state"] = str(cached.get("state", "READY") or "READY")
-            out["stocks_elapsed_ms"] = 0.0
-            out["stocks_fallback_cached"] = True
-            _incident(
-                "warning",
-                "stocks_snapshot_fallback_cached",
-                str(cached.get("msg", "") or "stocks snapshot fallback cached"),
-                {"market": "stocks", "fallback_age_s": int(cached.get("fallback_age_s", 0) or 0)},
-                cooldown_key="stocks_snapshot_fallback_cached",
+            out["stocks_state"] = str(s.get("state", "") or "")
+            out["stocks_elapsed_ms"] = round((time.perf_counter() - t0) * 1000.0, 3)
+            _incident("info", "stocks_snapshot_ok", "stocks snapshot updated", {"state": s.get("state", "")}, cooldown_key="stocks_snapshot_ok")
+            _update_sla_metrics("stocks_snapshot", ok=True, elapsed_ms=(time.perf_counter() - t0) * 1000.0, extra={"state": s.get("state", "")})
+            _record_guard_result(
+                settings,
+                market="stocks",
+                failed=_broker_failure_signal(str(s.get("msg", "") or ""), str(s.get("state", "") or "")),
+                reason=str(s.get("msg", "") or ""),
             )
-            _update_sla_metrics(
-                "stocks_snapshot",
-                ok=True,
-                elapsed_ms=0.0,
-                extra={"state": "CACHED_FALLBACK", "fallback_age_s": int(cached.get("fallback_age_s", 0) or 0)},
-            )
-    try:
-        t0 = time.perf_counter()
-        f = oanda.fetch_snapshot()
-        f["ts"] = int(time.time())
-        f = _merge_with_last_good(forex_path, f)
-        _atomic_write_json(forex_path, f)
+        except Exception as exc:
+            print(f"[MARKETS] stocks snapshot failed: {type(exc).__name__}: {exc}")
+            out["stocks_ok"] = False
+            out["stocks_state"] = "ERROR"
+            _incident("error", "stocks_snapshot_failed", f"{type(exc).__name__}: {exc}", {"market": "stocks"}, cooldown_key="stocks_snapshot_failed")
+            _update_sla_metrics("stocks_snapshot", ok=False, elapsed_ms=0.0, extra={"error": f"{type(exc).__name__}: {exc}"})
+            _record_guard_result(settings, market="stocks", failed=True, reason=f"{type(exc).__name__}: {exc}")
+            cached = _cached_status_fallback(stocks_path, snapshot_fallback_age_s, now_ts=now_ts)
+            if cached:
+                cached["state"] = str(cached.get("state", "READY") or "READY")
+                cached["msg"] = f"{type(exc).__name__}: {exc} | using cached snapshot ({int(cached.get('fallback_age_s', 0))}s old)"
+                _atomic_write_json(stocks_path, cached)
+                out["stocks_ok"] = True
+                out["stocks_state"] = str(cached.get("state", "READY") or "READY")
+                out["stocks_elapsed_ms"] = 0.0
+                out["stocks_fallback_cached"] = True
+                _incident(
+                    "warning",
+                    "stocks_snapshot_fallback_cached",
+                    str(cached.get("msg", "") or "stocks snapshot fallback cached"),
+                    {"market": "stocks", "fallback_age_s": int(cached.get("fallback_age_s", 0) or 0)},
+                    cooldown_key="stocks_snapshot_fallback_cached",
+                )
+                _update_sla_metrics(
+                    "stocks_snapshot",
+                    ok=True,
+                    elapsed_ms=0.0,
+                    extra={"state": "CACHED_FALLBACK", "fallback_age_s": int(cached.get("fallback_age_s", 0) or 0)},
+                )
+    if not forex_enabled:
         out["forex_ok"] = True
-        out["forex_state"] = str(f.get("state", "") or "")
-        out["forex_elapsed_ms"] = round((time.perf_counter() - t0) * 1000.0, 3)
-        _incident("info", "forex_snapshot_ok", "forex snapshot updated", {"state": f.get("state", "")}, cooldown_key="forex_snapshot_ok")
-        _update_sla_metrics("forex_snapshot", ok=True, elapsed_ms=(time.perf_counter() - t0) * 1000.0, extra={"state": f.get("state", "")})
-        _record_guard_result(
-            settings,
-            market="forex",
-            failed=_broker_failure_signal(str(f.get("msg", "") or ""), str(f.get("state", "") or "")),
-            reason=str(f.get("msg", "") or ""),
-        )
-    except Exception as exc:
-        print(f"[MARKETS] forex snapshot failed: {type(exc).__name__}: {exc}")
-        out["forex_ok"] = False
-        out["forex_state"] = "ERROR"
-        _incident("error", "forex_snapshot_failed", f"{type(exc).__name__}: {exc}", {"market": "forex"}, cooldown_key="forex_snapshot_failed")
-        _update_sla_metrics("forex_snapshot", ok=False, elapsed_ms=0.0, extra={"error": f"{type(exc).__name__}: {exc}"})
-        _record_guard_result(settings, market="forex", failed=True, reason=f"{type(exc).__name__}: {exc}")
-        cached = _cached_status_fallback(forex_path, snapshot_fallback_age_s, now_ts=now_ts)
-        if cached:
-            cached["state"] = str(cached.get("state", "READY") or "READY")
-            cached["msg"] = f"{type(exc).__name__}: {exc} | using cached snapshot ({int(cached.get('fallback_age_s', 0))}s old)"
-            _atomic_write_json(forex_path, cached)
+        out["forex_state"] = "DISABLED"
+        out["forex_elapsed_ms"] = 0.0
+        _update_sla_metrics("forex_snapshot", ok=True, elapsed_ms=0.0, extra={"state": "DISABLED"})
+    else:
+        try:
+            t0 = time.perf_counter()
+            f = oanda.fetch_snapshot() if oanda is not None else {"state": "ERROR", "msg": "oanda_client_unavailable"}
+            f["ts"] = int(time.time())
+            f = _merge_with_last_good(forex_path, f)
+            _atomic_write_json(forex_path, f)
             out["forex_ok"] = True
-            out["forex_state"] = str(cached.get("state", "READY") or "READY")
-            out["forex_elapsed_ms"] = 0.0
-            out["forex_fallback_cached"] = True
-            _incident(
-                "warning",
-                "forex_snapshot_fallback_cached",
-                str(cached.get("msg", "") or "forex snapshot fallback cached"),
-                {"market": "forex", "fallback_age_s": int(cached.get("fallback_age_s", 0) or 0)},
-                cooldown_key="forex_snapshot_fallback_cached",
+            out["forex_state"] = str(f.get("state", "") or "")
+            out["forex_elapsed_ms"] = round((time.perf_counter() - t0) * 1000.0, 3)
+            _incident("info", "forex_snapshot_ok", "forex snapshot updated", {"state": f.get("state", "")}, cooldown_key="forex_snapshot_ok")
+            _update_sla_metrics("forex_snapshot", ok=True, elapsed_ms=(time.perf_counter() - t0) * 1000.0, extra={"state": f.get("state", "")})
+            _record_guard_result(
+                settings,
+                market="forex",
+                failed=_broker_failure_signal(str(f.get("msg", "") or ""), str(f.get("state", "") or "")),
+                reason=str(f.get("msg", "") or ""),
             )
-            _update_sla_metrics(
-                "forex_snapshot",
-                ok=True,
-                elapsed_ms=0.0,
-                extra={"state": "CACHED_FALLBACK", "fallback_age_s": int(cached.get("fallback_age_s", 0) or 0)},
-            )
+        except Exception as exc:
+            print(f"[MARKETS] forex snapshot failed: {type(exc).__name__}: {exc}")
+            out["forex_ok"] = False
+            out["forex_state"] = "ERROR"
+            _incident("error", "forex_snapshot_failed", f"{type(exc).__name__}: {exc}", {"market": "forex"}, cooldown_key="forex_snapshot_failed")
+            _update_sla_metrics("forex_snapshot", ok=False, elapsed_ms=0.0, extra={"error": f"{type(exc).__name__}: {exc}"})
+            _record_guard_result(settings, market="forex", failed=True, reason=f"{type(exc).__name__}: {exc}")
+            cached = _cached_status_fallback(forex_path, snapshot_fallback_age_s, now_ts=now_ts)
+            if cached:
+                cached["state"] = str(cached.get("state", "READY") or "READY")
+                cached["msg"] = f"{type(exc).__name__}: {exc} | using cached snapshot ({int(cached.get('fallback_age_s', 0))}s old)"
+                _atomic_write_json(forex_path, cached)
+                out["forex_ok"] = True
+                out["forex_state"] = str(cached.get("state", "READY") or "READY")
+                out["forex_elapsed_ms"] = 0.0
+                out["forex_fallback_cached"] = True
+                _incident(
+                    "warning",
+                    "forex_snapshot_fallback_cached",
+                    str(cached.get("msg", "") or "forex snapshot fallback cached"),
+                    {"market": "forex", "fallback_age_s": int(cached.get("fallback_age_s", 0) or 0)},
+                    cooldown_key="forex_snapshot_fallback_cached",
+                )
+                _update_sla_metrics(
+                    "forex_snapshot",
+                    ok=True,
+                    elapsed_ms=0.0,
+                    extra={"state": "CACHED_FALLBACK", "fallback_age_s": int(cached.get("fallback_age_s", 0) or 0)},
+                )
     return out
 
 
@@ -920,6 +963,23 @@ def _run_stocks(settings: Dict[str, Any], cadence_expected_s: float | None = Non
         "guard_active": False,
         "cadence": {},
     }
+    if not _market_enabled(settings, "stocks"):
+        disabled_payload = {
+            "state": "DISABLED",
+            "trader_state": "Market disabled",
+            "msg": "Stocks market disabled in settings.",
+            "ts": int(time.time()),
+            "market_enabled": False,
+        }
+        _atomic_write_json(thinker_status_path, dict(disabled_payload))
+        _atomic_write_json(os.path.join(stocks_dir, "stock_trader_status.json"), dict(disabled_payload))
+        _update_sla_metrics("stocks_scan", ok=True, elapsed_ms=0.0, extra={"state": "DISABLED"})
+        _update_sla_metrics("stocks_trader_step", ok=True, elapsed_ms=0.0, extra={"state": "DISABLED"})
+        out["scan_ok"] = True
+        out["scan_state"] = "DISABLED"
+        out["step_ok"] = True
+        out["step_state"] = "DISABLED"
+        return out
     try:
         t0 = time.perf_counter()
         thinker = run_stock_scan(settings, HUB_DATA_DIR)
@@ -1063,6 +1123,23 @@ def _run_forex(settings: Dict[str, Any], cadence_expected_s: float | None = None
         "guard_active": False,
         "cadence": {},
     }
+    if not _market_enabled(settings, "forex"):
+        disabled_payload = {
+            "state": "DISABLED",
+            "trader_state": "Market disabled",
+            "msg": "Forex market disabled in settings.",
+            "ts": int(time.time()),
+            "market_enabled": False,
+        }
+        _atomic_write_json(thinker_status_path, dict(disabled_payload))
+        _atomic_write_json(os.path.join(forex_dir, "forex_trader_status.json"), dict(disabled_payload))
+        _update_sla_metrics("forex_scan", ok=True, elapsed_ms=0.0, extra={"state": "DISABLED"})
+        _update_sla_metrics("forex_trader_step", ok=True, elapsed_ms=0.0, extra={"state": "DISABLED"})
+        out["scan_ok"] = True
+        out["scan_state"] = "DISABLED"
+        out["step_ok"] = True
+        out["step_state"] = "DISABLED"
+        return out
     try:
         t0 = time.perf_counter()
         thinker = run_forex_scan(settings, HUB_DATA_DIR)
@@ -1385,41 +1462,45 @@ def main() -> int:
         daemon=True,
     )
     heartbeat_thread.start()
-    stocks_thread = threading.Thread(
-        target=_market_cycle_worker,
-        args=(
-            "stocks",
-            "market_bg_stocks_interval_s",
-            18.0,
-            "stocks_scan",
-            "stocks_cycle",
-            _run_stocks,
-            running,
-            settings_state,
-            loop_status,
-            status_lock,
-        ),
-        daemon=True,
-    )
-    forex_thread = threading.Thread(
-        target=_market_cycle_worker,
-        args=(
-            "forex",
-            "market_bg_forex_interval_s",
-            12.0,
-            "forex_scan",
-            "forex_cycle",
-            _run_forex,
-            running,
-            settings_state,
-            loop_status,
-            status_lock,
-            (lambda _settings: _write_market_trends()),
-        ),
-        daemon=True,
-    )
-    stocks_thread.start()
-    forex_thread.start()
+    stocks_thread: threading.Thread | None = None
+    forex_thread: threading.Thread | None = None
+    if _market_enabled(settings, "stocks"):
+        stocks_thread = threading.Thread(
+            target=_market_cycle_worker,
+            args=(
+                "stocks",
+                "market_bg_stocks_interval_s",
+                18.0,
+                "stocks_scan",
+                "stocks_cycle",
+                _run_stocks,
+                running,
+                settings_state,
+                loop_status,
+                status_lock,
+            ),
+            daemon=True,
+        )
+        stocks_thread.start()
+    if _market_enabled(settings, "forex"):
+        forex_thread = threading.Thread(
+            target=_market_cycle_worker,
+            args=(
+                "forex",
+                "market_bg_forex_interval_s",
+                12.0,
+                "forex_scan",
+                "forex_cycle",
+                _run_forex,
+                running,
+                settings_state,
+                loop_status,
+                status_lock,
+                (lambda _settings: _write_market_trends()),
+            ),
+            daemon=True,
+        )
+        forex_thread.start()
 
     while running["ok"]:
         if os.path.exists(STOP_FLAG_PATH):
@@ -1437,8 +1518,16 @@ def main() -> int:
             settings_state["value"] = settings
         try:
             snap_every = max(5.0, float(settings.get("market_bg_snapshot_interval_s", 15.0) or 15.0))
-            stock_every = max(8.0, float(settings.get("market_bg_stocks_interval_s", 18.0) or 18.0))
-            fx_every = max(6.0, float(settings.get("market_bg_forex_interval_s", 12.0) or 12.0))
+            stock_every = (
+                max(8.0, float(settings.get("market_bg_stocks_interval_s", 18.0) or 18.0))
+                if _market_enabled(settings, "stocks")
+                else 0.0
+            )
+            fx_every = (
+                max(6.0, float(settings.get("market_bg_forex_interval_s", 12.0) or 12.0))
+                if _market_enabled(settings, "forex")
+                else 0.0
+            )
             jitter_pct = max(0.0, min(0.5, float(settings.get("market_loop_jitter_pct", 0.10) or 0.10)))
             intelligence_every = max(30.0, float(settings.get("market_intelligence_interval_s", 180.0) or 180.0))
         except Exception:
@@ -1510,8 +1599,10 @@ def main() -> int:
         time.sleep(1.0)
 
     running["ok"] = False
-    stocks_thread.join(timeout=2.0)
-    forex_thread.join(timeout=2.0)
+    if stocks_thread is not None:
+        stocks_thread.join(timeout=2.0)
+    if forex_thread is not None:
+        forex_thread.join(timeout=2.0)
     return 0
 
 
