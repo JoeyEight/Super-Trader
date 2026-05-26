@@ -490,6 +490,8 @@ def _apply_leader_hysteresis(
     top = rows[0]
     top_score = abs(_float(top.get("leader_rank_score", top.get("score", 0.0)), 0.0))
     top_side = str(top.get("side", "watch") or "watch").strip().lower()
+    top_eligible = bool(top.get("eligible_for_entry", False))
+    top_open_daily_fallback = bool(top.get("open_daily_fallback", False))
     if top_score <= 0.0:
         return rows, False
     for idx, row in enumerate(rows[1:], start=1):
@@ -498,6 +500,13 @@ def _apply_leader_hysteresis(
             continue
         row_side = str(row.get("side", "watch") or "watch").strip().lower()
         if row_side != top_side:
+            return rows, False
+        row_eligible = bool(row.get("eligible_for_entry", False))
+        row_open_daily_fallback = bool(row.get("open_daily_fallback", False))
+        # Keep a stronger leader at the top when eligibility or data-granularity differs.
+        if row_eligible != top_eligible:
+            return rows, False
+        if row_open_daily_fallback != top_open_daily_fallback:
             return rows, False
         row_score = abs(_float(row.get("leader_rank_score", row.get("score", 0.0)), 0.0))
         if row_score <= 0.0:
@@ -1992,7 +2001,12 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         return out
     headers = {"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": secret}
     now_utc = datetime.now(timezone.utc)
-    start_utc = now_utc - timedelta(days=10)
+    configured_min_bars_required = max(8, int(float(settings.get("stock_min_bars_required", 24) or 24)))
+    intraday_hours_hint = max(1.0, float(settings.get("stock_intraday_hours_per_day_hint", 6.5) or 6.5))
+    required_trading_days = float(configured_min_bars_required) / intraday_hours_hint
+    # Add weekend/holiday slack so high bar requirements (e.g. 48) don't under-fetch.
+    intraday_lookback_days = max(10, int(required_trading_days * 2.2) + 2)
+    start_utc = now_utc - timedelta(days=intraday_lookback_days)
     start_iso = _iso_utc(start_utc)
     end_iso = _iso_utc(now_utc)
     daily_start_iso = _iso_utc(now_utc - timedelta(days=220))
@@ -2178,7 +2192,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     max_spread_bps = max(0.0, float(settings.get("stock_max_spread_bps", 40.0) or 40.0))
     use_daily_when_closed = _setting_bool(settings, "stock_scan_use_daily_when_closed", True)
     closed_max_stale_hours = max(1.0, float(settings.get("stock_closed_max_stale_hours", 96.0) or 96.0))
-    min_bars_required = max(8, int(float(settings.get("stock_min_bars_required", 24) or 24)))
+    min_bars_required = int(configured_min_bars_required)
     symbol_fallback_limit = max(0, int(float(settings.get("stock_scan_symbol_fallback_limit", 48) or 48)))
     symbol_fallback_used = 0
     symbol_fallback_skipped = 0
@@ -2326,7 +2340,18 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     max_stale_hours_effective = max_stale_hours
     if (not market_open) and use_daily_when_closed:
         max_stale_hours_effective = max(max_stale_hours, closed_max_stale_hours)
-    for feed in feed_order:
+    # During market-open sessions we prefer a feed that yields genuine intraday bars.
+    # If a feed mostly falls back to daily bars, probe remaining feeds before settling.
+    open_min_intraday_rows = max(1, int(float(settings.get("stock_open_min_intraday_rows", 3) or 3)))
+    open_max_daily_fallback_ratio = max(
+        0.0,
+        min(1.0, float(settings.get("stock_open_max_daily_fallback_ratio", 0.45) or 0.45)),
+    )
+    selected_scored: List[Dict[str, Any]] = []
+    selected_intraday_rows = -1
+    selected_fallback_ratio = 1.0
+    selected_bars_count = -1
+    for feed_idx, feed in enumerate(feed_order):
         try:
             if provider == "twelvedata":
                 bars_by_symbol = dict(td_bars_by_symbol or {})
@@ -2527,6 +2552,42 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 bars_total = 0
             feed_health = _update_feed_health(feed_health, feed, ok=bool(scored), bars_total=bars_total)
             if any(float(row.get("score", -9999.0)) > -9999.0 for row in scored):
+                total_rows = len(scored)
+                fallback_rows = sum(1 for row in scored if bool(row.get("open_daily_fallback", False)))
+                intraday_rows = max(0, total_rows - fallback_rows)
+                fallback_ratio = (float(fallback_rows) / float(total_rows)) if total_rows > 0 else 1.0
+                bars_total_current = 0
+                try:
+                    bars_total_current = int(sum(len(list(v or [])) for v in best_bars_by_symbol.values()))
+                except Exception:
+                    bars_total_current = 0
+                if (
+                    (intraday_rows > selected_intraday_rows)
+                    or (
+                        intraday_rows == selected_intraday_rows
+                        and fallback_ratio < selected_fallback_ratio
+                    )
+                    or (
+                        intraday_rows == selected_intraday_rows
+                        and abs(fallback_ratio - selected_fallback_ratio) < 1e-9
+                        and bars_total_current > selected_bars_count
+                    )
+                ):
+                    selected_scored = list(scored)
+                    selected_intraday_rows = int(intraday_rows)
+                    selected_fallback_ratio = float(fallback_ratio)
+                    selected_bars_count = int(bars_total_current)
+                has_more_feeds = feed_idx < (len(feed_order) - 1)
+                if (
+                    market_open
+                    and provider != "twelvedata"
+                    and has_more_feeds
+                    and (
+                        (intraday_rows < open_min_intraday_rows)
+                        or (fallback_ratio > open_max_daily_fallback_ratio)
+                    )
+                ):
+                    continue
                 break
         except Exception as exc:
             last_exc = exc
@@ -2537,6 +2598,8 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 pass
             feed_health = _update_feed_health(feed_health, feed, ok=False, bars_total=0)
             scored = []
+    if selected_scored:
+        scored = list(selected_scored)
 
     # Keep chart hydration independent from entry/quality gates: open positions should
     # always have chart bars available even when a symbol is currently rejected.
