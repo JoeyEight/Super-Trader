@@ -404,6 +404,8 @@ class MarketPositionsTableTests(unittest.TestCase):
                 "$209.875",
                 "-1.31%",
                 "0.230557",
+                "TBD",
+                "Blocked",
             ),
         )
         self.assertIn("Open trades: 1", summary_var.get())
