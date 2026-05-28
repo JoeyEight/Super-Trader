@@ -497,6 +497,24 @@ class TestMarketTraderStaleExitPolicy(unittest.TestCase):
             self.assertEqual(_ForexStaleStrongGainClient.close_calls, 1)
             self.assertEqual(int(out.get("stale_exit_count", 0) or 0), 1)
 
+    def test_forex_align_pnl_pct_sign_uses_realized_direction(self) -> None:
+        aligned = forex_trader._align_pnl_pct_sign_with_realized(
+            pnl_pct_est=0.25,
+            pnl_usd_est=5.0,
+            realized_pnl_usd=-1.2,
+        )
+        self.assertLess(aligned, 0.0)
+        self.assertAlmostEqual(abs(aligned), 0.25, places=9)
+
+    def test_forex_align_pnl_pct_sign_handles_zero_estimate(self) -> None:
+        aligned = forex_trader._align_pnl_pct_sign_with_realized(
+            pnl_pct_est=0.0,
+            pnl_usd_est=0.0,
+            realized_pnl_usd=-0.5,
+        )
+        self.assertLess(aligned, 0.0)
+        self.assertAlmostEqual(abs(aligned), 0.000001, places=12)
+
 
 if __name__ == "__main__":
     unittest.main()

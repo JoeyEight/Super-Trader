@@ -14,6 +14,7 @@ from app.path_utils import resolve_runtime_paths
 from app.runtime_logging import runtime_event
 from app.scanner_quality import effective_reject_pressure
 from app.settings_utils import normalize_settings_profile
+from app.stale_exit_policy import evaluate_stale_profit_hold
 from app.trade_quality import evaluate_trade_quality
 from brokers.broker_oanda import OandaBrokerClient
 
@@ -270,6 +271,29 @@ def _audit_realized_pnl_usd(row: Dict[str, Any]) -> float:
         return float(row.get("pnl_usd", 0.0) or 0.0)
     except Exception:
         return 0.0
+
+
+def _align_pnl_pct_sign_with_realized(
+    *,
+    pnl_pct_est: float,
+    pnl_usd_est: float,
+    realized_pnl_usd: float | None,
+) -> float:
+    est = float(pnl_pct_est)
+    realized = None if realized_pnl_usd is None else float(realized_pnl_usd)
+    if realized is None:
+        return est
+    if abs(realized) <= 1e-12:
+        return 0.0
+    est_sign = 0 if abs(est) <= 1e-12 else (1 if est > 0.0 else -1)
+    real_sign = 1 if realized > 0.0 else -1
+    if est_sign == 0:
+        # Estimate is effectively flat; carry only directionality from realized PnL
+        # using a tiny placeholder magnitude in pct units.
+        return float(real_sign) * 0.000001
+    if est_sign == real_sign:
+        return est
+    return float(real_sign) * abs(est)
 
 
 def _safe_float_from_dict(d: Dict[str, Any], keys: List[str]) -> float:
@@ -912,6 +936,25 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         stale_exit_reverse_score_mult = max(1.0, float(settings.get("forex_stale_reverse_score_mult", 1.25) or 1.25))
     except Exception:
         stale_exit_reverse_score_mult = 1.25
+    try:
+        stale_profit_hold_min_pct = max(0.0, float(settings.get("forex_stale_profit_hold_min_pct", 0.15) or 0.15))
+    except Exception:
+        stale_profit_hold_min_pct = 0.15
+    try:
+        stale_profit_hold_extra_cycles = max(0, int(float(settings.get("forex_stale_profit_hold_extra_cycles", 3) or 3)))
+    except Exception:
+        stale_profit_hold_extra_cycles = 3
+    try:
+        stale_profit_hold_max_s = max(0, int(float(settings.get("forex_stale_profit_hold_max_seconds", 21600) or 21600)))
+    except Exception:
+        stale_profit_hold_max_s = 21600
+    try:
+        stale_profit_hold_max_pullback_pct = max(
+            0.0,
+            float(settings.get("forex_stale_profit_hold_max_pullback_pct", 0.20) or 0.20),
+        )
+    except Exception:
+        stale_profit_hold_max_pullback_pct = 0.20
     stale_exit_events: List[Dict[str, Any]] = []
     stale_exit_count = 0
     skip_new_entries_this_cycle = False
@@ -1024,6 +1067,41 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 )
                 trail_state[inst] = {"armed": armed, "peak_pct": peak, "last_pnl_pct": pnl, "updated_at": now_ts}
                 continue
+            trend_support = (
+                align_side in {"long", "short"}
+                and align_side == str(side or "").strip().lower()
+                and align_score_abs >= float(alignment_required_score)
+                and bool(align_snapshot.get("eligible_for_entry", True))
+            )
+            pullback_pct = max(0.0, float(mfe) - float(pnl))
+            stale_profit_guard = evaluate_stale_profit_hold(
+                pnl_pct=float(pnl),
+                stale_streak=int(stale_streak),
+                grace_cycles=int(stale_exit_grace_cycles),
+                position_age_s=int(entry_age_s),
+                hard_reverse=bool(hard_reverse),
+                trend_support=bool(trend_support),
+                profit_hold_min_pct=float(stale_profit_hold_min_pct),
+                profit_hold_extra_cycles=int(stale_profit_hold_extra_cycles),
+                profit_hold_max_s=int(stale_profit_hold_max_s),
+                pullback_pct=float(pullback_pct),
+                profit_hold_max_pullback_pct=float(stale_profit_hold_max_pullback_pct),
+            )
+            if bool(stale_profit_guard.get("hold", False)):
+                guard_detail = str(stale_profit_guard.get("detail", "") or "").strip()
+                stale_exit_events.append(
+                    {
+                        "instrument": str(inst),
+                        "ok": False,
+                        "reason": "stale_exit_profit_guard",
+                        "detail": guard_detail or "stale-profit hold guard active",
+                        "streak": int(stale_streak),
+                        "age_s": int(entry_age_s),
+                        "reasons": [str(r) for r in align_reasons[:3]],
+                    }
+                )
+                trail_state[inst] = {"armed": armed, "peak_pct": peak, "last_pnl_pct": pnl, "updated_at": now_ts}
+                continue
             if est_notional_usd < float(stale_exit_min_notional_usd):
                 stale_exit_events.append(
                     {
@@ -1043,6 +1121,11 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             ok, msg, payload = client.close_position(inst, side=close_side)
             realized_close_pnl = _realized_pnl_from_close_payload(payload if isinstance(payload, dict) else {})
             pnl_for_audit = float(realized_close_pnl) if realized_close_pnl is not None else float(pnl_usd)
+            pnl_pct_for_audit = _align_pnl_pct_sign_with_realized(
+                pnl_pct_est=float(pnl),
+                pnl_usd_est=float(pnl_usd),
+                realized_pnl_usd=realized_close_pnl,
+            )
             actions.append(f"POLICY STALE EXIT {inst} {close_side} | {'OK' if ok else 'FAIL'} | {msg}")
             _append_jsonl(
                 audit_path,
@@ -1055,7 +1138,8 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                     "side": close_side,
                     "units": units,
                     "price": mid_px,
-                    "pnl_pct": pnl,
+                    "pnl_pct": pnl_pct_for_audit,
+                    "pnl_pct_est": float(pnl),
                     "pnl_usd": pnl_for_audit,
                     "pnl_usd_est": float(pnl_usd),
                     "realized_pnl": pnl_for_audit if ok else None,
@@ -1102,6 +1186,11 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 ok, msg, payload = client.close_position(inst, side=close_side)
                 realized_close_pnl = _realized_pnl_from_close_payload(payload if isinstance(payload, dict) else {})
                 pnl_for_audit = float(realized_close_pnl) if realized_close_pnl is not None else float(pnl_usd)
+                pnl_pct_for_audit = _align_pnl_pct_sign_with_realized(
+                    pnl_pct_est=float(pnl),
+                    pnl_usd_est=float(pnl_usd),
+                    realized_pnl_usd=realized_close_pnl,
+                )
                 actions.append(f"CLOSE {inst} {close_side} | {'OK' if ok else 'FAIL'} | {msg}")
                 _append_jsonl(
                     audit_path,
@@ -1113,7 +1202,8 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                         "side": close_side,
                         "units": units,
                         "price": mid_px,
-                        "pnl_pct": pnl,
+                        "pnl_pct": pnl_pct_for_audit,
+                        "pnl_pct_est": float(pnl),
                         "pnl_usd": pnl_for_audit,
                         "pnl_usd_est": float(pnl_usd),
                         "realized_pnl": pnl_for_audit if ok else None,
