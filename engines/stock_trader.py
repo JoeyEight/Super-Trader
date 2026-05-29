@@ -14,6 +14,7 @@ from app.http_utils import parse_retry_after_value
 from app.path_utils import resolve_runtime_paths
 from app.runtime_logging import runtime_event
 from app.scanner_quality import effective_reject_pressure
+from app.stale_exit_policy import evaluate_stale_profit_hold
 from app.trade_quality import evaluate_trade_quality
 from brokers.broker_alpaca import AlpacaBrokerClient
 
@@ -55,6 +56,42 @@ def _append_jsonl(path: str, row: Dict[str, Any]) -> None:
             f.write(json.dumps(row, separators=(",", ":")) + "\n")
     except Exception:
         pass
+
+
+def _latest_entry_ts_from_audit(hub_dir: str, symbols: List[str], max_lines: int = 12000) -> Dict[str, float]:
+    wanted = {str(sym or "").strip().upper() for sym in list(symbols or []) if str(sym or "").strip()}
+    if not wanted:
+        return {}
+    path = os.path.join(hub_dir, "stocks", "execution_audit.jsonl")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception:
+        return {}
+    out: Dict[str, float] = {}
+    for raw in reversed(lines[-max(1, int(max_lines)):]):
+        try:
+            row = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("event", "") or "").strip().lower() != "entry":
+            continue
+        if not bool(row.get("ok", False)):
+            continue
+        symbol = str(row.get("symbol", "") or "").strip().upper()
+        if (not symbol) or (symbol not in wanted) or (symbol in out):
+            continue
+        try:
+            ts_val = float(row.get("ts", 0.0) or 0.0)
+        except Exception:
+            ts_val = 0.0
+        if ts_val > 0.0:
+            out[symbol] = ts_val
+        if len(out) >= len(wanted):
+            break
+    return out
 
 
 def _rollout_at_least(settings: Dict[str, Any], stage: str) -> bool:
@@ -808,6 +845,50 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
 
     raw_positions = client.list_positions()
     positions = _parse_positions(raw_positions)
+    audit_entry_ts = _latest_entry_ts_from_audit(hub_dir, list(positions.keys()))
+    if positions:
+        pos_symbols = [str(sym or "").strip().upper() for sym in positions.keys() if str(sym or "").strip()]
+        meta_ts: List[float] = []
+        for sym in pos_symbols:
+            meta_row = open_meta.get(sym, {}) if isinstance(open_meta.get(sym, {}), dict) else {}
+            try:
+                ts_val = float(meta_row.get("entry_ts", 0.0) or 0.0)
+            except Exception:
+                ts_val = 0.0
+            if ts_val > 0.0:
+                meta_ts.append(ts_val)
+        unique_meta_ts = {int(ts) for ts in meta_ts}
+        recent_uniform_seed = bool(
+            len(pos_symbols) >= 2
+            and len(unique_meta_ts) <= 1
+            and len(meta_ts) >= len(pos_symbols)
+            and meta_ts
+            and (max(meta_ts) >= float(now_ts - 86400))
+        )
+        if recent_uniform_seed and audit_entry_ts:
+            for sym in pos_symbols:
+                seed_ts = float(audit_entry_ts.get(sym, 0.0) or 0.0)
+                if seed_ts <= 0.0:
+                    continue
+                meta_row = open_meta.get(sym, {}) if isinstance(open_meta.get(sym, {}), dict) else {}
+                try:
+                    mfe_val = float(meta_row.get("mfe_pct", 0.0) or 0.0)
+                except Exception:
+                    mfe_val = 0.0
+                try:
+                    mae_val = float(meta_row.get("mae_pct", 0.0) or 0.0)
+                except Exception:
+                    mae_val = 0.0
+                try:
+                    last_pnl_val = float(meta_row.get("last_pnl_pct", 0.0) or 0.0)
+                except Exception:
+                    last_pnl_val = 0.0
+                open_meta[sym] = {
+                    "entry_ts": float(seed_ts),
+                    "mfe_pct": float(mfe_val),
+                    "mae_pct": float(mae_val),
+                    "last_pnl_pct": float(last_pnl_val),
+                }
     all_symbols = set(positions.keys())
     top_symbol = str(top_pick.get("symbol", "") or "").strip().upper()
     for row in candidate_rows[:12]:
@@ -875,9 +956,32 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     except Exception:
         stale_exit_max_per_cycle = 1
     try:
-        stale_exit_min_notional_usd = max(1.0, float(settings.get("stock_stale_min_notional_usd", 5.0) or 5.0))
+        stale_exit_min_notional_usd = max(0.0, float(settings.get("stock_stale_min_notional_usd", 0.05) or 0.05))
     except Exception:
-        stale_exit_min_notional_usd = 5.0
+        stale_exit_min_notional_usd = 0.05
+    try:
+        stale_exit_reverse_score_mult = max(1.0, float(settings.get("stock_stale_reverse_score_mult", 1.25) or 1.25))
+    except Exception:
+        stale_exit_reverse_score_mult = 1.25
+    try:
+        stale_profit_hold_min_pct = max(0.0, float(settings.get("stock_stale_profit_hold_min_pct", 0.35) or 0.35))
+    except Exception:
+        stale_profit_hold_min_pct = 0.35
+    try:
+        stale_profit_hold_extra_cycles = max(0, int(float(settings.get("stock_stale_profit_hold_extra_cycles", 3) or 3)))
+    except Exception:
+        stale_profit_hold_extra_cycles = 3
+    try:
+        stale_profit_hold_max_s = max(0, int(float(settings.get("stock_stale_profit_hold_max_seconds", 43200) or 43200)))
+    except Exception:
+        stale_profit_hold_max_s = 43200
+    try:
+        stale_profit_hold_max_pullback_pct = max(
+            0.0,
+            float(settings.get("stock_stale_profit_hold_max_pullback_pct", 0.85) or 0.85),
+        )
+    except Exception:
+        stale_profit_hold_max_pullback_pct = 0.85
     stale_exit_events: List[Dict[str, Any]] = []
     stale_exit_count = 0
     skip_new_entries_this_cycle = False
@@ -904,14 +1008,27 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         qty = float(pos.get("qty", 0.0) or 0.0)
         avg = float(pos.get("avg_entry_price", 0.0) or 0.0)
         mid = float(prices.get(symbol, 0.0) or 0.0)
-        if qty <= 0 or avg <= 0 or mid <= 0:
+        if qty <= 0 or avg <= 0:
+            continue
+        entry_seed = opened_today.get(symbol, audit_entry_ts.get(symbol, now_ts))
+        try:
+            entry_seed_f = float(entry_seed or now_ts)
+        except Exception:
+            entry_seed_f = float(now_ts)
+        meta = open_meta.get(symbol, {}) or {}
+        entry_ts = float(meta.get("entry_ts", entry_seed_f) or entry_seed_f)
+        if entry_ts <= 0:
+            entry_ts = float(now_ts)
+        if mid <= 0:
+            last_pnl = float(meta.get("last_pnl_pct", 0.0) or 0.0)
+            mfe = max(float(meta.get("mfe_pct", last_pnl) or last_pnl), last_pnl)
+            mae = min(float(meta.get("mae_pct", last_pnl) or last_pnl), last_pnl)
+            open_meta[symbol] = {"entry_ts": entry_ts, "mfe_pct": mfe, "mae_pct": mae, "last_pnl_pct": last_pnl}
             continue
         pnl = ((mid - avg) / avg) * 100.0
         pnl_usd = (mid - avg) * qty
-        meta = open_meta.get(symbol, {}) or {}
         mfe = max(float(meta.get("mfe_pct", pnl) or pnl), pnl)
         mae = min(float(meta.get("mae_pct", pnl) or pnl), pnl)
-        entry_ts = float(meta.get("entry_ts", now_ts) or now_ts)
         open_meta[symbol] = {"entry_ts": entry_ts, "mfe_pct": mfe, "mae_pct": mae, "last_pnl_pct": pnl}
         st = trail_state.get(symbol, {}) or {}
         armed = bool(st.get("armed", False))
@@ -971,6 +1088,50 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                         "ok": False,
                         "reason": "stale_exit_hold_gate",
                         "detail": hold_gate_block,
+                        "streak": int(stale_streak),
+                        "reasons": [str(r) for r in align_reasons[:3]],
+                    }
+                )
+                continue
+            align_side = str(align_snapshot.get("side", "watch") or "watch").strip().lower()
+            try:
+                align_score_abs = abs(float(align_snapshot.get("score", 0.0) or 0.0))
+            except Exception:
+                align_score_abs = 0.0
+            hard_reverse = (
+                align_side == "short"
+                and align_score_abs >= (float(alignment_required_score) * float(stale_exit_reverse_score_mult))
+            )
+            trend_support = (
+                align_side == "long"
+                and align_score_abs >= float(alignment_required_score)
+                and bool(align_snapshot.get("eligible_for_entry", True))
+            )
+            pullback_pct = max(0.0, float(mfe) - float(pnl))
+            stale_profit_guard = evaluate_stale_profit_hold(
+                pnl_pct=float(pnl),
+                stale_streak=int(stale_streak),
+                grace_cycles=int(stale_exit_grace_cycles),
+                position_age_s=int(hold_s),
+                hard_reverse=bool(hard_reverse),
+                trend_support=bool(trend_support),
+                profit_hold_min_pct=float(stale_profit_hold_min_pct),
+                profit_hold_extra_cycles=int(stale_profit_hold_extra_cycles),
+                profit_hold_max_s=int(stale_profit_hold_max_s),
+                pullback_pct=float(pullback_pct),
+                profit_hold_max_pullback_pct=float(stale_profit_hold_max_pullback_pct),
+            )
+            if bool(stale_profit_guard.get("hold", False)):
+                guard_detail = str(stale_profit_guard.get("detail", "") or "").strip()
+                if guard_detail:
+                    actions.append(f"HOLD {symbol} | {guard_detail}")
+                trail_state[symbol] = {"armed": armed, "peak_pct": peak, "last_pnl_pct": pnl, "updated_at": now_ts}
+                stale_exit_events.append(
+                    {
+                        "symbol": str(symbol),
+                        "ok": False,
+                        "reason": "stale_exit_profit_guard",
+                        "detail": guard_detail or "stale-profit hold guard active",
                         "streak": int(stale_streak),
                         "reasons": [str(r) for r in align_reasons[:3]],
                     }
@@ -1236,8 +1397,6 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 bars_count = int(float(cand.get("bars_count", 0) or 0))
                 mid = float((spreads.get(symbol, {}) or {}).get("mid", 0.0) or 0.0)
                 spread_bps = float((spreads.get(symbol, {}) or {}).get("spread_bps", 0.0) or 0.0)
-                if live_guarded_calibration and (calib_prob <= 0.0):
-                    calib_prob = 0.5
                 fail = ""
                 if bars_count > 0 and bars_count < min_bars_required:
                     fail = f"Bars preflight failed for {symbol} ({bars_count} < {min_bars_required})"

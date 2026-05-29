@@ -216,7 +216,7 @@ SANITIZER_DEFAULTS: Dict[str, Any] = {
     "stock_stale_exit_enabled": True,
     "stock_stale_alignment_grace_cycles": 2,
     "stock_stale_max_exits_per_cycle": 1,
-    "stock_stale_min_notional_usd": 5.0,
+    "stock_stale_min_notional_usd": 0.05,
     "stock_max_position_usd_per_symbol": 0.0,
     "stock_max_total_exposure_pct": 0.0,
     "stock_no_new_entries_mins_to_close": 15,
@@ -268,7 +268,7 @@ SANITIZER_DEFAULTS: Dict[str, Any] = {
     "forex_stale_exit_enabled": True,
     "forex_stale_alignment_grace_cycles": 2,
     "forex_stale_max_exits_per_cycle": 2,
-    "forex_stale_min_notional_usd": 5.0,
+    "forex_stale_min_notional_usd": 0.05,
     "forex_stale_hold_near_flat_pct": 0.10,
     "forex_profit_target_pct": 0.25,
     "forex_trailing_gap_pct": 0.15,
@@ -545,7 +545,7 @@ _FLOAT_BOUNDS: Dict[str, Tuple[float, float, float]] = {
     "stock_same_day_exception_min_pullback_pct": (0.9, 0.0, 100.0),
     "stock_same_day_exception_score_floor_mult": (0.75, 0.0, 3.0),
     "stock_pdt_equity_threshold_usd": (25_000.0, 0.0, 10_000_000.0),
-    "stock_stale_min_notional_usd": (5.0, 1.0, 1_000_000.0),
+    "stock_stale_min_notional_usd": (0.05, 0.0, 1_000_000.0),
     "stock_max_position_usd_per_symbol": (0.0, 0.0, 1_000_000_000.0),
     "stock_max_total_exposure_pct": (0.0, 0.0, 100.0),
     "stock_live_guarded_score_mult": (1.2, 0.5, 5.0),
@@ -573,7 +573,7 @@ _FLOAT_BOUNDS: Dict[str, Tuple[float, float, float]] = {
     "forex_score_threshold": (0.2, 0.0, 5.0),
     "forex_replay_adaptive_weight": (0.35, 0.0, 1.0),
     "forex_replay_adaptive_step_cap_pct": (40.0, 5.0, 90.0),
-    "forex_stale_min_notional_usd": (5.0, 1.0, 1_000_000.0),
+    "forex_stale_min_notional_usd": (0.05, 0.0, 1_000_000.0),
     "forex_stale_hold_near_flat_pct": (0.10, 0.0, 5.0),
     "forex_profit_target_pct": (0.25, 0.0, 100.0),
     "forex_trailing_gap_pct": (0.15, 0.0, 100.0),
@@ -1562,7 +1562,7 @@ def recommend_market_profile_overrides(
                 "stock_max_daily_loss_pct": 0.0,
                 "forex_max_daily_loss_usd": 0.0,
                 "forex_max_daily_loss_pct": 0.0,
-                "forex_stale_min_notional_usd": 3.0,
+                "forex_stale_min_notional_usd": 0.25,
             }
         )
         if live_profile_resolution:
@@ -1577,7 +1577,7 @@ def recommend_market_profile_overrides(
                 overrides["forex_max_total_exposure_pct"] = 35.0
                 overrides["forex_max_daily_loss_usd"] = 0.0
                 overrides["forex_max_daily_loss_pct"] = 1.5
-                overrides["forex_stale_min_notional_usd"] = 1.0
+                overrides["forex_stale_min_notional_usd"] = 0.05
             if portfolio_bucket in {"micro", "small"}:
                 overrides["market_max_total_exposure_pct"] = 40.0
             else:

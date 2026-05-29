@@ -7820,9 +7820,30 @@ class PowerTraderHub(tk.Tk):
             scan_interval_s = float(ctx.get("scan_interval_s", 0.0) or 0.0)
         except Exception:
             scan_interval_s = 0.0
+        try:
+            day_pct = float(ctx.get("day_pct", 0.0) or 0.0)
+        except Exception:
+            day_pct = 0.0
+        try:
+            model_score = float(ctx.get("model_score", 0.0) or 0.0)
+        except Exception:
+            model_score = 0.0
+        try:
+            model_calib_prob = float(ctx.get("model_calib_prob", 0.0) or 0.0)
+        except Exception:
+            model_calib_prob = 0.0
+        try:
+            model_change_24h = float(ctx.get("model_change_24h_pct", 0.0) or 0.0)
+        except Exception:
+            model_change_24h = 0.0
+        try:
+            model_change_6h = float(ctx.get("model_change_6h_pct", 0.0) or 0.0)
+        except Exception:
+            model_change_6h = 0.0
         stale_streak = int(float(ctx.get("stale_streak", 0) or 0))
         stale_grace = int(float(ctx.get("stale_grace_cycles", 0) or 0))
         source_txt = str(ctx.get("source", "runtime policy") or "runtime policy")
+        model_source_txt = str(ctx.get("model_source", source_txt) or source_txt)
         stale = stale_event if isinstance(stale_event, dict) else {}
         reason = str(stale.get("reason", "") or "").strip().lower()
         if reason in {"stale_exit_notional_guard", "stale_exit_price_or_notional_guard"}:
@@ -7910,6 +7931,7 @@ class PowerTraderHub(tk.Tk):
             if due_ts <= now_ts:
                 if mk in {"stocks", "forex"}:
                     threshold_txt = ""
+                    eta_txt = ""
                     if trail_armed and trail_trigger_px > 0.0 and current_px > 0.0:
                         threshold_txt = (
                             f"Trailing rule: sell when {ident} trades at or below {trail_trigger_px:.4f} "
@@ -7927,6 +7949,33 @@ class PowerTraderHub(tk.Tk):
                                 f"Trailing rule is not armed yet for {ident}; it arms after price reaches ~{arm_px:.4f} "
                                 f"(current {current_px:.4f}, avg {avg_px:.4f}, arm {profit_target_pct:.2f}%). "
                             )
+                            if mk == "stocks" and current_px > 0.0:
+                                remaining_pct = max(0.0, ((arm_px - current_px) / current_px) * 100.0)
+                                if remaining_pct > 0.0:
+                                    momentum_components: List[float] = []
+                                    if day_pct > 0.0:
+                                        momentum_components.append(day_pct)
+                                    if model_change_24h > 0.0:
+                                        momentum_components.append(model_change_24h)
+                                    if model_change_6h > 0.0:
+                                        momentum_components.append(model_change_6h * 4.0)
+                                    momentum_pct_day = max(momentum_components) if momentum_components else 0.0
+                                    if momentum_pct_day > 0.0:
+                                        est_days = max(1.0, min(15.0, remaining_pct / max(0.05, momentum_pct_day)))
+                                        est_due_ts = now_ts + (est_days * 86400.0)
+                                        est_due_txt = self._format_ui_timestamp(est_due_ts, include_date=True)
+                                        if day_pct > 0.0 and day_pct >= momentum_pct_day:
+                                            eta_txt = (
+                                                f"Estimated arm window: at ~{day_pct:.2f}%/day intraday momentum, "
+                                                f"{ident} could reach arm level around {est_due_txt}. "
+                                            )
+                                        else:
+                                            eta_txt = (
+                                                f"Estimated arm window: model momentum from {model_source_txt} "
+                                                f"(24h {model_change_24h:+.2f}%, 6h {model_change_6h:+.2f}%, "
+                                                f"score {model_score:+.3f}, calib {model_calib_prob:.2f}) "
+                                                f"projects arm around {est_due_txt}. "
+                                            )
                     stale_txt = ""
                     if stale_grace > 0:
                         rem = max(0, stale_grace - stale_streak)
@@ -7937,10 +7986,10 @@ class PowerTraderHub(tk.Tk):
                                 f"next eligibility check around {eta}. "
                             )
                     return {
-                        "label": "On Signal",
+                        "label": (est_due_txt if mk == "stocks" and eta_txt else "On Signal"),
                         "rule": (
                             f"{mk.title()} minimum hold window has elapsed for {ident}; "
-                            f"{threshold_txt}{stale_txt}"
+                            f"{threshold_txt}{eta_txt}{stale_txt}"
                             "next sell remains signal-driven (trailing/stale-alignment/AI-exit), "
                             f"not a forced immediate close. Prediction provided by {source_txt}."
                         ).strip(),
@@ -8394,6 +8443,66 @@ class PowerTraderHub(tk.Tk):
                 _consume(row)
         return out
 
+    def _market_signal_map(self, market_key: str) -> Dict[str, Dict[str, float]]:
+        mk = str(market_key or "").strip().lower()
+        reader = getattr(self, "_read_market_thinker_status", None)
+        if not callable(reader):
+            return {}
+        try:
+            thinker_data = reader(mk)
+        except Exception:
+            thinker_data = {}
+        if not isinstance(thinker_data, dict):
+            return {}
+
+        out: Dict[str, Dict[str, float]] = {}
+
+        def _consume(row: Dict[str, Any]) -> None:
+            if not isinstance(row, dict):
+                return
+            symbol = str(row.get("symbol", row.get("pair", "")) or "").strip().upper()
+            if not symbol:
+                return
+            prev = dict(out.get(symbol, {}) or {})
+
+            try:
+                score_f = float(row.get("score", 0.0) or 0.0)
+            except Exception:
+                score_f = 0.0
+            try:
+                calib_f = float(row.get("calibration_effective_prob", row.get("calib_prob", 0.0)) or 0.0)
+            except Exception:
+                calib_f = 0.0
+            try:
+                ch24_f = float(row.get("change_24h_pct", 0.0) or 0.0)
+            except Exception:
+                ch24_f = 0.0
+            try:
+                ch6_f = float(row.get("change_6h_pct", 0.0) or 0.0)
+            except Exception:
+                ch6_f = 0.0
+
+            prev["score"] = score_f
+            if calib_f > 0.0:
+                prev["calib_prob"] = calib_f
+            if ch24_f != 0.0:
+                prev["change_24h_pct"] = ch24_f
+            if ch6_f != 0.0:
+                prev["change_6h_pct"] = ch6_f
+            if prev:
+                out[symbol] = prev
+
+        top_pick = thinker_data.get("top_pick", {})
+        if isinstance(top_pick, dict):
+            _consume(top_pick)
+        for key in ("leaders", "all_scores"):
+            rows = thinker_data.get(key, [])
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                _consume(row)
+        return out
+
     def _market_position_rows(
         self,
         market_key: str,
@@ -8411,6 +8520,7 @@ class PowerTraderHub(tk.Tk):
         trader_state = self._read_market_trader_state(mk)
         schema = self._market_position_schema(mk)
         quote_map = self._market_quote_map(mk)
+        signal_map = self._market_signal_map(mk)
         openai_actions = self._openai_position_action_map()
         open_meta = trader_state.get("open_meta", {}) if isinstance(trader_state.get("open_meta", {}), dict) else {}
         entry_ts_by_symbol: Dict[str, float] = {}
@@ -8498,6 +8608,23 @@ class PowerTraderHub(tk.Tk):
                 except Exception:
                     realized_f = None
                 quote_row = quote_map.get(symbol, {}) if isinstance(quote_map.get(symbol, {}), dict) else {}
+                signal_row = signal_map.get(symbol, {}) if isinstance(signal_map.get(symbol, {}), dict) else {}
+                try:
+                    model_score_f = float(signal_row.get("score", 0.0) or 0.0)
+                except Exception:
+                    model_score_f = 0.0
+                try:
+                    model_calib_prob_f = float(signal_row.get("calib_prob", 0.0) or 0.0)
+                except Exception:
+                    model_calib_prob_f = 0.0
+                try:
+                    model_change_24h_f = float(signal_row.get("change_24h_pct", 0.0) or 0.0)
+                except Exception:
+                    model_change_24h_f = 0.0
+                try:
+                    model_change_6h_f = float(signal_row.get("change_6h_pct", 0.0) or 0.0)
+                except Exception:
+                    model_change_6h_f = 0.0
                 try:
                     ask_f = float(
                         raw_row.get("ask_price", raw_row.get("current_price", quote_row.get("last", 0.0))) or 0.0
@@ -8544,6 +8671,7 @@ class PowerTraderHub(tk.Tk):
                         "avg_price": float(avg_cost_f),
                         "quantity": float(qty_f),
                         "scan_interval_s": float(scan_interval_s),
+                        "day_pct": float(day_pct_f * 100.0),
                         "stale_streak": int(stale_streak),
                         "stale_grace_cycles": int(float(settings_map.get("stock_stale_alignment_grace_cycles", 2) or 2)),
                         "trail_peak_pct": float(trail_peak_pct),
@@ -8551,6 +8679,11 @@ class PowerTraderHub(tk.Tk):
                         "trail_trigger_price": float(trail_trigger_px),
                         "trail_armed": bool(trail_armed),
                         "profit_target_pct": float(stock_profit_target_pct),
+                        "model_score": float(model_score_f),
+                        "model_calib_prob": float(model_calib_prob_f),
+                        "model_change_24h_pct": float(model_change_24h_f),
+                        "model_change_6h_pct": float(model_change_6h_f),
+                        "model_source": "stocks thinker",
                     },
                 )
                 pnl_pct_f = 0.0

@@ -24,6 +24,7 @@ from app.http_utils import parse_retry_after_value
 from app.opportunity_allocator import evaluate_cross_market_allocation
 from app.path_utils import resolve_runtime_paths, resolve_settings_path, read_settings_file, log_once
 from app.settings_utils import normalize_settings_profile, sanitize_settings
+from app.stale_exit_policy import evaluate_stale_profit_hold
 from app.trade_quality import evaluate_trade_quality
 
 # -----------------------------
@@ -1054,7 +1055,9 @@ class CryptoAPITrading:
         dynamic_ok = bool(allow_dynamic_fallback and short_ok and dyn >= min_dynamic_score)
         calib_prob = float(calibration_prob or 0.0)
         min_calib = max(0.0, float(min_calibration_prob or 0.0))
-        calib_applied = bool(min_calib > 0.0 and calib_prob > 0.0)
+        # If a minimum calibration probability is configured, enforce it explicitly.
+        # This blocks zero-confidence candidates instead of silently bypassing the gate.
+        calib_applied = bool(min_calib > 0.0)
         calib_ok = bool((not calib_applied) or (calib_prob >= min_calib))
         passed = bool(short_ok and (long_ok or dynamic_ok) and calib_ok)
         gate_mode = "long_signal" if bool(passed and long_ok) else ("dynamic_score_fallback" if bool(passed and dynamic_ok) else "blocked")
@@ -2935,9 +2938,9 @@ class CryptoAPITrading:
         except Exception:
             stale_exit_max_per_cycle = 2
         try:
-            stale_exit_min_notional_usd = max(1.0, float(settings.get("crypto_stale_min_notional_usd", 5.0) or 5.0))
+            stale_exit_min_notional_usd = max(0.0, float(settings.get("crypto_stale_min_notional_usd", 0.05) or 0.05))
         except Exception:
-            stale_exit_min_notional_usd = 5.0
+            stale_exit_min_notional_usd = 0.05
         try:
             default_hold_s = 7200 if str(profile_key) == "max_growth" else 3600
             stale_exit_min_hold_s = max(0, int(float(settings.get("crypto_stale_min_hold_seconds", default_hold_s) or default_hold_s)))
@@ -2962,6 +2965,41 @@ class CryptoAPITrading:
             )
         except Exception:
             stale_exit_force_short_count = max(4, int(start_level) + 1)
+        try:
+            stale_profit_hold_min_pct = max(
+                0.0,
+                float(settings.get("crypto_stale_profit_hold_min_pct", 0.35) or 0.35),
+            )
+        except Exception:
+            stale_profit_hold_min_pct = 0.35
+        try:
+            stale_profit_hold_extra_cycles = max(
+                0,
+                int(float(settings.get("crypto_stale_profit_hold_extra_cycles", 3) or 3)),
+            )
+        except Exception:
+            stale_profit_hold_extra_cycles = 3
+        try:
+            stale_profit_hold_max_s = max(
+                0,
+                int(float(settings.get("crypto_stale_profit_hold_max_seconds", 28800) or 28800)),
+            )
+        except Exception:
+            stale_profit_hold_max_s = 28800
+        try:
+            stale_profit_hold_max_pullback_pct = max(
+                0.0,
+                float(settings.get("crypto_stale_profit_hold_max_pullback_pct", 0.85) or 0.85),
+            )
+        except Exception:
+            stale_profit_hold_max_pullback_pct = 0.85
+        try:
+            stale_exit_reverse_score_mult = max(
+                1.0,
+                float(settings.get("crypto_stale_reverse_score_mult", 1.25) or 1.25),
+            )
+        except Exception:
+            stale_exit_reverse_score_mult = 1.25
         try:
             default_trail_hold_near_flat_pct = 3.0 if str(profile_key) == "max_growth" else 1.5
             trail_hold_near_flat_pct = max(
@@ -3315,6 +3353,61 @@ class CryptoAPITrading:
                             ),
                             "streak": int(stale_streak),
                             "age_s": int(position_age_s),
+                            "sell_pressure": int(sell_pressure),
+                            "reasons": [str(r) for r in align_reasons[:3]],
+                        }
+                    )
+                    continue
+                dynamic_score_now = float(align_snapshot.get("dynamic_score", 0.0) or 0.0)
+                dynamic_threshold_now = max(
+                    0.0,
+                    float(
+                        align_snapshot.get(
+                            "adaptive_dynamic_threshold",
+                            dynamic_adaptive_threshold,
+                        )
+                        or dynamic_adaptive_threshold
+                        or 0.0
+                    ),
+                )
+                strong_negative_score = (
+                    dynamic_threshold_now > 0.0
+                    and dynamic_score_now <= (-1.0 * float(dynamic_threshold_now) * float(stale_exit_reverse_score_mult))
+                )
+                hard_reverse = bool(sell_pressure >= int(stale_exit_force_short_count) or strong_negative_score)
+                trend_support = bool(
+                    aligned_with_strategy
+                    and dynamic_score_now >= dynamic_threshold_now
+                    and sell_pressure <= max(1, int(start_level) - 1)
+                )
+                pullback_pct = 0.0
+                if float(trail_peak_disp) > 0.0 and float(current_sell_price) > 0.0:
+                    pullback_pct = max(
+                        0.0,
+                        ((float(trail_peak_disp) - float(current_sell_price)) / float(trail_peak_disp)) * 100.0,
+                    )
+                stale_profit_guard = evaluate_stale_profit_hold(
+                    pnl_pct=float(gain_loss_percentage_sell),
+                    stale_streak=int(stale_streak),
+                    grace_cycles=int(stale_exit_grace_cycles),
+                    position_age_s=int(max(0, position_age_s)),
+                    hard_reverse=bool(hard_reverse),
+                    trend_support=bool(trend_support),
+                    profit_hold_min_pct=float(stale_profit_hold_min_pct),
+                    profit_hold_extra_cycles=int(stale_profit_hold_extra_cycles),
+                    profit_hold_max_s=int(stale_profit_hold_max_s),
+                    pullback_pct=float(pullback_pct),
+                    profit_hold_max_pullback_pct=float(stale_profit_hold_max_pullback_pct),
+                )
+                if bool(stale_profit_guard.get("hold", False)):
+                    stale_exit_events.append(
+                        {
+                            "symbol": str(symbol),
+                            "ok": False,
+                            "reason": "stale_exit_profit_guard",
+                            "detail": str(stale_profit_guard.get("detail", "") or "stale-profit hold guard active"),
+                            "streak": int(stale_streak),
+                            "age_s": int(max(0, position_age_s)),
                             "sell_pressure": int(sell_pressure),
                             "reasons": [str(r) for r in align_reasons[:3]],
                         }

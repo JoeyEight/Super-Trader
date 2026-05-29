@@ -254,7 +254,7 @@ class TestSettingsSanitize(unittest.TestCase):
         self.assertEqual(float(overrides["forex_max_daily_loss_pct"]), 1.5)
         self.assertEqual(float(overrides["stock_max_daily_loss_usd"]), 0.0)
         self.assertEqual(float(overrides["forex_max_daily_loss_usd"]), 0.0)
-        self.assertEqual(float(overrides["forex_stale_min_notional_usd"]), 1.0)
+        self.assertEqual(float(overrides["forex_stale_min_notional_usd"]), 0.05)
         self.assertGreaterEqual(int(overrides["forex_trade_units"]), 80)
 
     def test_max_growth_large_live_accounts_keep_permissive_limits(self) -> None:

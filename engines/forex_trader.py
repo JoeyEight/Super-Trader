@@ -914,9 +914,9 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     except Exception:
         stale_exit_max_per_cycle = 2
     try:
-        stale_exit_min_notional_usd = max(1.0, float(settings.get("forex_stale_min_notional_usd", 5.0) or 5.0))
+        stale_exit_min_notional_usd = max(0.0, float(settings.get("forex_stale_min_notional_usd", 0.05) or 0.05))
     except Exception:
-        stale_exit_min_notional_usd = 5.0
+        stale_exit_min_notional_usd = 0.05
     try:
         stale_exit_min_hold_s = max(0, int(float(settings.get("forex_stale_min_hold_seconds", 1800) or 1800)))
     except Exception:
@@ -1331,8 +1331,6 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 raw_units = int(trade_units_entry)
                 if side == "short":
                     raw_units = -raw_units
-                if live_guarded and (calib_prob <= 0.0):
-                    calib_prob = 0.5
                 unit_notional_usd = _forex_unit_notional_usd(
                     pair,
                     (mid if mid > 0.0 else float(prices.get(pair, 0.0) or 0.0)),
