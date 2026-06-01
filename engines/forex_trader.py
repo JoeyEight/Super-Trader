@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Tuple
 
 from app.automation_policy import build_market_automation_policy
 from app.credential_utils import get_oanda_creds
+from app.entry_calibration import evaluate_entry_calibration_gate, load_replay_trigger_reliability
 from app.http_utils import parse_retry_after_value
 from app.opportunity_allocator import evaluate_cross_market_allocation
 from app.path_utils import resolve_runtime_paths
@@ -682,6 +683,19 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     enable_risk_caps = _rollout_at_least(settings, "risk_caps")
     shadow_only = stage == "shadow_only"
     live_guarded = stage == "live"
+    calibration_reliability = load_replay_trigger_reliability(
+        hub_dir,
+        "forex",
+        patterns=[
+            "forex_*replay*.json",
+            "fx_*replay*.json",
+            "forex_historical_replay*.json",
+            "fx_historical_replay*.json",
+        ],
+    )
+    calibration_trigger_reliability = max(0.0, min(1.0, float(calibration_reliability.get("value", 0.50) or 0.50)))
+    calibration_trigger_samples = max(0, int(float(calibration_reliability.get("samples", 0) or 0)))
+    calibration_trigger_source = str(calibration_reliability.get("source", "default_neutral") or "default_neutral").strip()
 
     oanda_account, oanda_token = get_oanda_creds(settings, base_dir=BASE_DIR)
     client = OandaBrokerClient(
@@ -1309,16 +1323,26 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             selected_samples = 0
             selected_calibration_scope = "pair"
             selected_bars = 0
+            selected_entry_calib_eval: Dict[str, Any] = {}
             selected_mid = 0.0
             selected_spread_bps = 0.0
             selected_units = 0
             selected_risk_cap_size_scale = 1.0
             selected_quality_eval: Dict[str, Any] = {}
             selected_opportunity_eval: Dict[str, Any] = {}
+            min_calib_prob_live_guarded = float(settings.get("forex_min_calib_prob_live_guarded", 0.56) or 0.56)
+            min_trigger_reliability_live_guarded = float(
+                settings.get("forex_min_trigger_reliability_live_guarded", 0.50) or 0.50
+            )
+            min_entry_score_live_guarded = float(settings.get("forex_min_entry_calibration_score_live_guarded", 0.54) or 0.54)
+            gate_weight_calib = float(settings.get("forex_entry_calibration_weight_confidence", 0.65) or 0.65)
+            gate_weight_trigger = float(settings.get("forex_entry_calibration_weight_trigger", 0.35) or 0.35)
+            gate_require_samples = bool(settings.get("forex_entry_calibration_require_samples", True))
             for cand in candidate_rows:
                 pair = str((cand or {}).get("pair", "") or "").strip().upper()
                 if not pair:
                     continue
+                entry_calib_eval: Dict[str, Any] = {}
                 score = float(cand.get("score", 0.0) or 0.0)
                 side = str(cand.get("side", "watch") or "watch").strip().lower()
                 calib_prob = float(cand.get("calibration_effective_prob", cand.get("calib_prob", 0.0)) or 0.0)
@@ -1328,6 +1352,17 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 pricing_row = pricing_details.get(pair, {}) if isinstance(pricing_details.get(pair, {}), dict) else {}
                 mid = float(pricing_row.get("mid", 0.0) or 0.0)
                 spread_bps = float(pricing_row.get("spread_bps", 0.0) or 0.0)
+                cand_gate_reason = str(cand.get("entry_gate_reason", "") or "").strip()
+                cand_gate_reason_lower = cand_gate_reason.lower()
+                local_calibration_override = bool(
+                    live_guarded
+                    and cand_gate_reason
+                    and (
+                        cand_gate_reason_lower.startswith("calibrated confidence gate")
+                        or cand_gate_reason_lower.startswith("calibration sample gate")
+                        or cand_gate_reason_lower.startswith("entry calibration gate")
+                    )
+                )
                 raw_units = int(trade_units_entry)
                 if side == "short":
                     raw_units = -raw_units
@@ -1339,8 +1374,8 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 fail = ""
                 if bars_count > 0 and bars_count < min_bars_required:
                     fail = f"Bars preflight failed for {pair} ({bars_count} < {min_bars_required})"
-                elif str(cand.get("entry_gate_reason", "") or "").strip():
-                    fail = str(cand.get("entry_gate_reason", "") or "").strip()
+                elif cand_gate_reason and (not local_calibration_override):
+                    fail = cand_gate_reason
                 elif side not in ("long", "short"):
                     fail = f"Top pair {pair} is WATCH"
                 elif not bool(cand.get("eligible_for_entry", True)):
@@ -1356,10 +1391,22 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                         cap_txt = int(effective_open_positions_hard_cap) if forex_exposure_slot_mode else int(max_open_positions)
                         mode_txt = "Exposure-budget cap" if forex_exposure_slot_mode else "Max open positions reached"
                         fail = f"{mode_txt} ({len(positions)}/{cap_txt})"
-                elif live_guarded and sample_count < min_samples_guarded:
-                    fail = f"Calibration sample gate for {pair} ({sample_count} < {min_samples_guarded})"
-                elif live_guarded and calib_prob < float(settings.get("forex_min_calib_prob_live_guarded", 0.56) or 0.56):
-                    fail = f"Calibrated confidence gate for {pair} ({calib_prob:.2f})"
+                elif live_guarded:
+                    entry_calib_eval = evaluate_entry_calibration_gate(
+                        calib_prob=calib_prob,
+                        calib_samples=sample_count,
+                        trigger_reliability=calibration_trigger_reliability,
+                        min_calib_prob=min_calib_prob_live_guarded,
+                        min_calib_samples=min_samples_guarded,
+                        min_trigger_reliability=min_trigger_reliability_live_guarded,
+                        min_entry_score=min_entry_score_live_guarded,
+                        weight_calib=gate_weight_calib,
+                        weight_trigger=gate_weight_trigger,
+                        require_samples=gate_require_samples,
+                    )
+                    if not bool(entry_calib_eval.get("passed", False)):
+                        fail_reason = str(entry_calib_eval.get("reason", "") or "").strip() or "entry calibration gate blocked"
+                        fail = f"Entry calibration gate for {pair}: {fail_reason}"
                 elif abs(score) < required_score:
                     fail = f"Top score below threshold for {pair} ({score:.4f} < {required_score:.4f})"
                 elif float(cooldown_until.get(pair, 0.0) or 0.0) > float(now_ts):
@@ -1525,6 +1572,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 selected_samples = sample_count
                 selected_calibration_scope = calibration_scope
                 selected_bars = bars_count
+                selected_entry_calib_eval = dict(entry_calib_eval) if isinstance(entry_calib_eval, dict) else {}
                 selected_mid = mid
                 selected_spread_bps = spread_bps
                 selected_units = units
@@ -1554,6 +1602,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                         "entry_size_scale": float(round(entry_size_scale, 4)),
                         "policy_size_scale": float(round(policy_size_scale, 4)),
                         "score": selected_score,
+                        "entry_calibration_gate": selected_entry_calib_eval if isinstance(selected_entry_calib_eval, dict) else {},
                         "calib_prob": selected_calib_prob,
                         "samples": selected_samples,
                         "calibration_scope": selected_calibration_scope,
@@ -1608,6 +1657,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                         "entry_size_scale": float(round(entry_size_scale, 4)),
                         "policy_size_scale": float(round(policy_size_scale, 4)),
                         "score": selected_score,
+                        "entry_calibration_gate": selected_entry_calib_eval if isinstance(selected_entry_calib_eval, dict) else {},
                         "calib_prob": selected_calib_prob,
                         "samples": selected_samples,
                         "calibration_scope": selected_calibration_scope,
@@ -1736,6 +1786,10 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "compliance_permission_pass": bool(quality_layers.get("compliance_permission", False)),
         "runtime_trust_pass": bool(quality_layers.get("runtime_trust", False)),
         "alignment_required_score": float(round(float(alignment_required_score), 6)),
+        "entry_calibration_gate_active": bool(live_guarded),
+        "entry_calibration_trigger_reliability": float(round(calibration_trigger_reliability, 6)),
+        "entry_calibration_trigger_samples": int(calibration_trigger_samples),
+        "entry_calibration_trigger_source": str(calibration_trigger_source),
         "stale_exit_enabled": bool(stale_exit_enabled),
         "stale_exit_grace_cycles": int(stale_exit_grace_cycles),
         "stale_exit_count": int(stale_exit_count),
