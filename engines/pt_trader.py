@@ -1196,6 +1196,117 @@ class CryptoAPITrading:
         }
 
     @staticmethod
+    def _load_replay_trigger_reliability(hub_dir: str) -> Dict[str, Any]:
+        """
+        Best-effort global trigger reliability from the latest replay artifact.
+        Falls back to a neutral 0.50 reliability when unavailable.
+        """
+        default = {
+            "value": 0.50,
+            "samples": 0,
+            "source": "default_neutral",
+        }
+        try:
+            openai_dir = os.path.join(str(hub_dir or "").strip(), "openai")
+            if not os.path.isdir(openai_dir):
+                return default
+            candidates = sorted(
+                glob.glob(os.path.join(openai_dir, "crypto_*replay*.json")),
+                key=lambda p: os.path.getmtime(p),
+                reverse=True,
+            )
+            for path in candidates:
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        payload = json.load(f) or {}
+                except Exception:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                hybrid = payload.get("hybrid_test_metrics", {}) if isinstance(payload.get("hybrid_test_metrics", {}), dict) else {}
+                best = payload.get("best_test_metrics", {}) if isinstance(payload.get("best_test_metrics", {}), dict) else {}
+                metric_source = hybrid if hybrid else best
+                trigger_match_pct = float(metric_source.get("trigger_match_pct", payload.get("trigger_match_pct", 0.0)) or 0.0)
+                trigger_match_pct = max(0.0, min(100.0, trigger_match_pct))
+                meta = payload.get("meta", {}) if isinstance(payload.get("meta", {}), dict) else {}
+                test_trades = int(float(meta.get("test_trades", payload.get("test_trades", 0)) or 0))
+                if trigger_match_pct <= 0.0 and test_trades <= 0:
+                    continue
+                return {
+                    "value": round(trigger_match_pct / 100.0, 6),
+                    "samples": int(max(0, test_trades)),
+                    "source": f"replay:{os.path.basename(path)}",
+                }
+        except Exception:
+            return default
+        return default
+
+    @classmethod
+    def _evaluate_entry_calibration_gate(
+        cls,
+        *,
+        calib_prob: float,
+        calib_samples: int,
+        trigger_reliability: float,
+        min_calib_prob: float,
+        min_calib_samples: int,
+        min_trigger_reliability: float,
+        min_entry_score: float,
+        weight_calib: float = 0.65,
+        weight_trigger: float = 0.35,
+        require_samples: bool = True,
+    ) -> Dict[str, Any]:
+        cp = max(0.0, min(1.0, float(calib_prob or 0.0)))
+        cs = max(0, int(calib_samples or 0))
+        tr = max(0.0, min(1.0, float(trigger_reliability or 0.0)))
+        min_cp = max(0.0, min(1.0, float(min_calib_prob or 0.0)))
+        min_cs = max(0, int(min_calib_samples or 0))
+        min_tr = max(0.0, min(1.0, float(min_trigger_reliability or 0.0)))
+        min_es = max(0.0, min(1.0, float(min_entry_score or 0.0)))
+        wc = max(0.0, min(1.0, float(weight_calib or 0.0)))
+        wt = max(0.0, min(1.0, float(weight_trigger or 0.0)))
+        if (wc + wt) <= 1e-9:
+            wc, wt = 0.65, 0.35
+        else:
+            den = float(wc + wt)
+            wc, wt = (wc / den), (wt / den)
+        score = (cp * wc) + (tr * wt)
+        samples_ok = (cs >= min_cs) if bool(require_samples) else True
+        prob_ok = cp >= min_cp
+        trig_ok = tr >= min_tr
+        score_ok = score >= min_es
+        passed = bool(samples_ok and prob_ok and trig_ok and score_ok)
+        reason = ""
+        if not passed:
+            if not samples_ok:
+                reason = f"calibration samples too low ({cs} < {min_cs})"
+            elif not prob_ok:
+                reason = f"calibrated confidence too low ({cp:.3f} < {min_cp:.3f})"
+            elif not trig_ok:
+                reason = f"trigger reliability too low ({tr:.3f} < {min_tr:.3f})"
+            else:
+                reason = f"entry calibration score too low ({score:.3f} < {min_es:.3f})"
+        return {
+            "passed": bool(passed),
+            "reason": str(reason),
+            "score": round(float(score), 6),
+            "calib_prob": round(float(cp), 6),
+            "calib_samples": int(cs),
+            "trigger_reliability": round(float(tr), 6),
+            "thresholds": {
+                "min_calib_prob": round(float(min_cp), 6),
+                "min_calib_samples": int(min_cs),
+                "min_trigger_reliability": round(float(min_tr), 6),
+                "min_entry_score": round(float(min_es), 6),
+            },
+            "weights": {
+                "calib": round(float(wc), 6),
+                "trigger": round(float(wt), 6),
+            },
+            "require_samples": bool(require_samples),
+        }
+
+    @staticmethod
     def _signal_score_for_candidate(
         dynamic_score: float,
         buy_count: int,
@@ -1470,6 +1581,7 @@ class CryptoAPITrading:
                         filled_qty, avg_price = self._extract_fill_from_order(order)
                         bp_after = self._get_buying_power()
                         bp_delta = float(bp_after) - float(bp_before)
+                        pending_meta = info.get("audit_meta", {}) if isinstance(info.get("audit_meta", {}), dict) else {}
 
                         self._record_trade(
                             side=side,
@@ -1484,6 +1596,14 @@ class CryptoAPITrading:
                             buying_power_before=bp_before,
                             buying_power_after=bp_after,
                             buying_power_delta=bp_delta,
+                            score=float(pending_meta.get("score", 0.0) or 0.0) if pending_meta.get("score", None) is not None else None,
+                            required_score=float(pending_meta.get("required_score", 0.0) or 0.0)
+                            if pending_meta.get("required_score", None) is not None
+                            else None,
+                            calib_prob=float(pending_meta.get("calib_prob", 0.0) or 0.0)
+                            if pending_meta.get("calib_prob", None) is not None
+                            else None,
+                            audit_meta=dict(pending_meta),
                         )
 
                         # Clear pending now that we recorded it
@@ -1517,6 +1637,7 @@ class CryptoAPITrading:
         score: Optional[float] = None,
         required_score: Optional[float] = None,
         calib_prob: Optional[float] = None,
+        audit_meta: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Minimal local ledger for GUI:
@@ -1669,6 +1790,40 @@ class CryptoAPITrading:
             "required_score": float(required_score) if required_score is not None else None,
             "calib_prob": float(calib_prob) if calib_prob is not None else None,
         }
+        if isinstance(audit_meta, dict) and audit_meta:
+            entry_features: Dict[str, Any] = {}
+            for key in (
+                "calib_prob",
+                "calib_samples",
+                "trigger_reliability",
+                "trigger_reliability_samples",
+                "trigger_reliability_source",
+                "entry_calibration_score",
+                "entry_calibration_passed",
+                "entry_calibration_reason",
+                "entry_calibration_min_prob",
+                "entry_calibration_min_samples",
+                "entry_calibration_min_trigger_reliability",
+                "entry_calibration_min_score",
+                "entry_calibration_weight_calib",
+                "entry_calibration_weight_trigger",
+                "signal_score",
+                "required_score",
+                "dynamic_score",
+                "buy_count",
+                "sell_count",
+                "signal_gate_mode",
+                "entry_alignment_mode",
+                "profile",
+                "policy_mode",
+            ):
+                if key not in audit_meta:
+                    continue
+                val = audit_meta.get(key)
+                if isinstance(val, (str, int, float, bool)) or val is None:
+                    entry_features[key] = val
+            if entry_features:
+                entry["entry_features"] = entry_features
         self._append_jsonl(TRADE_HISTORY_PATH, entry)
         audit_event = "entry" if side_l == "buy" else ("exit" if side_l == "sell" else "trade")
         self._append_execution_audit(
@@ -1687,6 +1842,7 @@ class CryptoAPITrading:
                 "calib_prob": float(calib_prob) if calib_prob is not None else None,
                 "tag": tag,
                 "order_id": order_id,
+                "entry_features": dict(entry.get("entry_features", {})) if isinstance(entry.get("entry_features", {}), dict) else {},
                 "payload": dict(entry),
             }
         )
@@ -2307,6 +2463,7 @@ class CryptoAPITrading:
                                 "avg_cost_basis": float(avg_cost_basis) if avg_cost_basis is not None else None,
                                 "pnl_pct": float(pnl_pct) if pnl_pct is not None else None,
                                 "tag": tag,
+                                "audit_meta": dict(audit_meta) if isinstance(audit_meta, dict) else {},
                                 "created_ts": time.time(),
                             }
                             self._save_pnl_ledger()
@@ -2351,6 +2508,7 @@ class CryptoAPITrading:
                             calib_prob=float((audit_meta or {}).get("calib_prob", 0.0) or 0.0)
                             if isinstance(audit_meta, dict) and ((audit_meta or {}).get("calib_prob", None) is not None)
                             else None,
+                            audit_meta=(dict(audit_meta) if isinstance(audit_meta, dict) else {}),
                         )
 
                         # Clear pending now that it is recorded
@@ -2865,6 +3023,9 @@ class CryptoAPITrading:
         dynamic_rank_map: Dict[str, float] = {}
         dynamic_calib_prob_map: Dict[str, float] = {}
         dynamic_samples_map: Dict[str, int] = {}
+        dynamic_trigger_reliability_map: Dict[str, float] = {}
+        dynamic_trigger_reliability_samples_map: Dict[str, int] = {}
+        dynamic_trigger_reliability_source_map: Dict[str, str] = {}
         for row in list(dynamic_rank_rows):
             if not isinstance(row, dict):
                 continue
@@ -2883,6 +3044,40 @@ class CryptoAPITrading:
                 dynamic_samples_map[symbol] = int(float(row.get("samples", row.get("symbol_samples", 0)) or 0))
             except Exception:
                 dynamic_samples_map[symbol] = 0
+            trig_rel = None
+            for trig_key in (
+                "trigger_reliability",
+                "trigger_match_prob",
+                "trigger_match_rate",
+                "trigger_confidence",
+            ):
+                if trig_key in row:
+                    try:
+                        trig_rel = float(row.get(trig_key, 0.0) or 0.0)
+                    except Exception:
+                        trig_rel = 0.0
+                    break
+            if trig_rel is not None:
+                trig_rel = max(0.0, min(1.0, float(trig_rel)))
+                dynamic_trigger_reliability_map[symbol] = float(trig_rel)
+            try:
+                tr_samps = int(
+                    float(
+                        row.get(
+                            "trigger_reliability_samples",
+                            row.get("trigger_samples", row.get("samples", row.get("symbol_samples", 0))),
+                        )
+                        or 0
+                    )
+                )
+            except Exception:
+                tr_samps = 0
+            dynamic_trigger_reliability_samples_map[symbol] = int(max(0, tr_samps))
+            dynamic_trigger_reliability_source_map[symbol] = "dynamic_status"
+        replay_trigger_reliability = self._load_replay_trigger_reliability(HUB_DATA_DIR)
+        replay_trigger_rel_value = max(0.0, min(1.0, float(replay_trigger_reliability.get("value", 0.50) or 0.50)))
+        replay_trigger_rel_samples = int(max(0, int(float(replay_trigger_reliability.get("samples", 0) or 0))))
+        replay_trigger_rel_source = str(replay_trigger_reliability.get("source", "default_neutral") or "default_neutral")
         dynamic_adaptive_threshold = max(
             0.0,
             float(
@@ -2917,6 +3112,34 @@ class CryptoAPITrading:
             0,
             int(float(settings.get("crypto_min_samples_live_guarded", settings.get("adaptive_confidence_min_samples", 6)) or 6)),
         )
+        entry_calib_min_prob = max(
+            0.0,
+            min(
+                1.0,
+                float(settings.get("crypto_entry_calib_prob_min", min_crypto_calib_prob) or min_crypto_calib_prob),
+            ),
+        )
+        entry_calib_min_samples = max(
+            0,
+            int(float(settings.get("crypto_entry_calib_samples_min", min_crypto_calib_samples) or min_crypto_calib_samples)),
+        )
+        entry_trigger_rel_min = max(
+            0.0,
+            min(1.0, float(settings.get("crypto_entry_trigger_reliability_min", 0.55) or 0.55)),
+        )
+        entry_calib_score_min = max(
+            0.0,
+            min(1.0, float(settings.get("crypto_entry_calibration_score_min", 0.60) or 0.60)),
+        )
+        entry_calib_weight_calib = max(
+            0.0,
+            min(1.0, float(settings.get("crypto_entry_calibration_weight_confidence", 0.65) or 0.65)),
+        )
+        entry_calib_weight_trigger = max(
+            0.0,
+            min(1.0, float(settings.get("crypto_entry_calibration_weight_trigger", 0.35) or 0.35)),
+        )
+        entry_calib_require_samples = bool(settings.get("crypto_entry_calibration_require_samples", True))
         reject_rows = dynamic_status.get("rejected", []) if isinstance(dynamic_status.get("rejected", []), list) else []
         ranked_count = len([r for r in dynamic_rank_rows if isinstance(r, dict)])
         rejected_count = len([r for r in reject_rows if isinstance(r, dict)])
@@ -3000,6 +3223,20 @@ class CryptoAPITrading:
             )
         except Exception:
             stale_exit_reverse_score_mult = 1.25
+        try:
+            stale_exit_require_hard_reverse_on_loss = bool(
+                settings.get("crypto_stale_require_hard_reverse_on_loss", True)
+            )
+        except Exception:
+            stale_exit_require_hard_reverse_on_loss = True
+        try:
+            stale_exit_force_loss_pct = float(
+                settings.get("crypto_stale_force_loss_pct", -4.0) or -4.0
+            )
+        except Exception:
+            stale_exit_force_loss_pct = -4.0
+        if stale_exit_force_loss_pct > 0.0:
+            stale_exit_force_loss_pct = -1.0 * stale_exit_force_loss_pct
         try:
             default_trail_hold_near_flat_pct = 3.0 if str(profile_key) == "max_growth" else 1.5
             trail_hold_near_flat_pct = max(
@@ -3380,6 +3617,30 @@ class CryptoAPITrading:
                     and dynamic_score_now >= dynamic_threshold_now
                     and sell_pressure <= max(1, int(start_level) - 1)
                 )
+                if float(gain_loss_percentage_sell) < 0.0:
+                    forced_loss_cut = float(gain_loss_percentage_sell) <= float(stale_exit_force_loss_pct)
+                    if (
+                        bool(stale_exit_require_hard_reverse_on_loss)
+                        and (not bool(hard_reverse))
+                        and (not forced_loss_cut)
+                    ):
+                        stale_exit_events.append(
+                            {
+                                "symbol": str(symbol),
+                                "ok": False,
+                                "reason": "stale_exit_loss_reverse_guard",
+                                "detail": (
+                                    f"Holding stale-aligned loser {symbol}: PnL {gain_loss_percentage_sell:+.2f}% "
+                                    f"has not reached force-loss threshold ({float(stale_exit_force_loss_pct):+.2f}%) "
+                                    "and hard reverse evidence is not active."
+                                ),
+                                "streak": int(stale_streak),
+                                "age_s": int(max(0, position_age_s)),
+                                "sell_pressure": int(sell_pressure),
+                                "reasons": [str(r) for r in align_reasons[:3]],
+                            }
+                        )
+                        continue
                 pullback_pct = 0.0
                 if float(trail_peak_disp) > 0.0 and float(current_sell_price) > 0.0:
                     pullback_pct = max(
@@ -3973,7 +4234,30 @@ class CryptoAPITrading:
                 dynamic_score = float(cand.get("dynamic_score", 0.0) or 0.0)
                 calib_prob = float(dynamic_calib_prob_map.get(base_symbol, 0.0) or 0.0)
                 calib_samples = int(dynamic_samples_map.get(base_symbol, 0) or 0)
+                trigger_reliability = float(dynamic_trigger_reliability_map.get(base_symbol, replay_trigger_rel_value) or replay_trigger_rel_value)
+                trigger_reliability_samples = int(
+                    dynamic_trigger_reliability_samples_map.get(base_symbol, replay_trigger_rel_samples) or replay_trigger_rel_samples
+                )
+                trigger_reliability_source = str(
+                    dynamic_trigger_reliability_source_map.get(base_symbol, replay_trigger_rel_source) or replay_trigger_rel_source
+                )
                 calib_gate_min = float(min_crypto_calib_prob) if calib_samples >= int(min_crypto_calib_samples) else 0.0
+                entry_calib_eval = self._evaluate_entry_calibration_gate(
+                    calib_prob=float(calib_prob),
+                    calib_samples=int(calib_samples),
+                    trigger_reliability=float(trigger_reliability),
+                    min_calib_prob=float(entry_calib_min_prob),
+                    min_calib_samples=int(entry_calib_min_samples),
+                    min_trigger_reliability=float(entry_trigger_rel_min),
+                    min_entry_score=float(entry_calib_score_min),
+                    weight_calib=float(entry_calib_weight_calib),
+                    weight_trigger=float(entry_calib_weight_trigger),
+                    require_samples=bool(entry_calib_require_samples),
+                )
+                if not bool(entry_calib_eval.get("passed", False)):
+                    fail_reason = str(entry_calib_eval.get("reason", "") or "").strip() or "entry calibration gate blocked"
+                    entry_fail_reasons.append(f"Entry calibration gate blocked {base_symbol} ({fail_reason})")
+                    continue
                 gate_eval = self._evaluate_crypto_signal_gate(
                     profile_key=profile_key,
                     start_level=int(start_level),
@@ -3999,6 +4283,10 @@ class CryptoAPITrading:
                     "calibration_samples": int(calib_samples),
                     "min_calibration_prob": round(float(calib_gate_min), 4),
                     "calibration_gate_applied": bool(gate_eval.get("calibration_gate_applied", False)),
+                    "trigger_reliability": round(float(trigger_reliability), 4),
+                    "trigger_reliability_samples": int(trigger_reliability_samples),
+                    "trigger_reliability_source": str(trigger_reliability_source),
+                    "entry_calibration_score": round(float(entry_calib_eval.get("score", 0.0) or 0.0), 4),
                 }
                 if not bool(gate_eval.get("passed", False)):
                     fail_reason = str(gate_eval.get("failure_reason", "") or "").strip()
@@ -4226,8 +4514,29 @@ class CryptoAPITrading:
                     proposed_notional,
                     audit_meta={
                         "score": float(signal_score),
+                        "signal_score": float(signal_score),
                         "required_score": float(required_score),
                         "calib_prob": float(calib_prob),
+                        "calib_samples": int(calib_samples),
+                        "trigger_reliability": float(trigger_reliability),
+                        "trigger_reliability_samples": int(trigger_reliability_samples),
+                        "trigger_reliability_source": str(trigger_reliability_source),
+                        "entry_calibration_score": float(entry_calib_eval.get("score", 0.0) or 0.0),
+                        "entry_calibration_passed": bool(entry_calib_eval.get("passed", False)),
+                        "entry_calibration_reason": str(entry_calib_eval.get("reason", "") or ""),
+                        "entry_calibration_min_prob": float(entry_calib_min_prob),
+                        "entry_calibration_min_samples": int(entry_calib_min_samples),
+                        "entry_calibration_min_trigger_reliability": float(entry_trigger_rel_min),
+                        "entry_calibration_min_score": float(entry_calib_score_min),
+                        "entry_calibration_weight_calib": float(entry_calib_weight_calib),
+                        "entry_calibration_weight_trigger": float(entry_calib_weight_trigger),
+                        "dynamic_score": float(dynamic_score),
+                        "buy_count": int(buy_count),
+                        "sell_count": int(sell_count),
+                        "signal_gate_mode": str(gate_eval.get("gate_mode", "blocked") or "blocked"),
+                        "entry_alignment_mode": str(entry_align_eval.get("alignment_mode", "not_evaluated") or "not_evaluated"),
+                        "profile": str(profile_key),
+                        "policy_mode": str(policy.get("mode", "") or ""),
                     },
                 )
                 if response and "errors" not in response:
@@ -4331,6 +4640,16 @@ class CryptoAPITrading:
             "adaptive_threshold_calibration_recommended": round(float(dynamic_calibration_recommended_threshold), 4),
             "min_calibration_prob": round(float(min_crypto_calib_prob), 4),
             "min_calibration_samples": int(min_crypto_calib_samples),
+            "entry_calibration_min_prob": round(float(entry_calib_min_prob), 4),
+            "entry_calibration_min_samples": int(entry_calib_min_samples),
+            "entry_trigger_reliability_min": round(float(entry_trigger_rel_min), 4),
+            "entry_calibration_score_min": round(float(entry_calib_score_min), 4),
+            "entry_calibration_weight_confidence": round(float(entry_calib_weight_calib), 4),
+            "entry_calibration_weight_trigger": round(float(entry_calib_weight_trigger), 4),
+            "entry_calibration_require_samples": bool(entry_calib_require_samples),
+            "replay_trigger_reliability_fallback": round(float(replay_trigger_rel_value), 4),
+            "replay_trigger_reliability_samples": int(replay_trigger_rel_samples),
+            "replay_trigger_reliability_source": str(replay_trigger_rel_source),
             "max_spread_bps": round(float(effective_crypto_max_spread_bps), 4),
             "runtime_trust_score": round(float(runtime_trust.get("score", 0.0) or 0.0), 4),
             "runtime_trust_mode": str(runtime_trust.get("mode", "") or ""),
@@ -4368,6 +4687,8 @@ class CryptoAPITrading:
             "stale_exit_min_hold_s": int(stale_exit_min_hold_s),
             "stale_exit_loss_cut_pct": round(float(stale_exit_loss_cut_pct), 4),
             "stale_exit_force_short_count": int(stale_exit_force_short_count),
+            "stale_exit_require_hard_reverse_on_loss": bool(stale_exit_require_hard_reverse_on_loss),
+            "stale_exit_force_loss_pct": round(float(stale_exit_force_loss_pct), 4),
             "trail_hold_near_flat_pct": round(float(trail_hold_near_flat_pct), 4),
             "trail_hold_min_profit_usd": round(float(trail_hold_min_profit_usd), 4),
             "skip_new_entries_this_cycle": bool(skip_new_entries_this_cycle),
