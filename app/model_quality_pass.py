@@ -467,12 +467,612 @@ def _median(vals: List[float], default: float = 0.0) -> float:
     return float((arr[m - 1] + arr[m]) / 2.0)
 
 
-def _predict_one(
+def _quantile(vals: List[float], q: float, default: float = 0.0) -> float:
+    if not vals:
+        return float(default)
+    arr = sorted(float(v) for v in vals)
+    idx = int(round((len(arr) - 1) * max(0.0, min(1.0, float(q)))))
+    idx = max(0, min(len(arr) - 1, idx))
+    return float(arr[idx])
+
+
+def _recent_slice(rows: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    if limit <= 0:
+        return []
+    return list(rows[-limit:]) if len(rows) > limit else list(rows)
+
+
+def _weighted_trade_stats(rows: List[Dict[str, Any]]) -> Dict[str, float]:
+    if not rows:
+        return {
+            "weight": 0.0,
+            "samples": 0.0,
+            "up_rate": 0.0,
+            "down_rate": 0.0,
+            "trailing_rate": 0.0,
+            "stale_rate": 0.0,
+            "manual_rate": 0.0,
+            "median_up_ret_pct": 0.0,
+            "median_down_ret_pct": 0.0,
+            "median_abs_return_pct": 0.0,
+            "q75_abs_return_pct": 0.0,
+            "median_hold_h": 0.0,
+            "q75_hold_h": 0.0,
+        }
+    total_w = 0.0
+    up_w = 0.0
+    down_w = 0.0
+    trailing_w = 0.0
+    stale_w = 0.0
+    manual_w = 0.0
+    up_rets: List[float] = []
+    down_rets: List[float] = []
+    abs_rets: List[float] = []
+    holds: List[float] = []
+    size = len(rows)
+    for idx, row in enumerate(rows):
+        # Mild recency weighting; newest rows matter more without swamping older signal.
+        age_rank = idx + 1
+        recency_w = 0.7 + (0.6 * (float(age_rank) / float(max(1, size))))
+        total_w += recency_w
+        ret_pct = _trade_return_pct(row)
+        abs_rets.append(abs(ret_pct))
+        holds.append(max(0.0, _f(row.get("hold_hours", 0.0), 0.0)))
+        direction = _trade_direction(row)
+        if direction == "up":
+            up_w += recency_w
+            up_rets.append(ret_pct)
+        elif direction == "down":
+            down_w += recency_w
+            down_rets.append(abs(ret_pct))
+        trig = _s(row.get("actual_exit_trigger", "Unknown")) or "Unknown"
+        if trig == "Trailing":
+            trailing_w += recency_w
+        elif trig == "Stale Alignment":
+            stale_w += recency_w
+        elif trig == "Manual":
+            manual_w += recency_w
+    return {
+        "weight": round(total_w, 6),
+        "samples": float(len(rows)),
+        "up_rate": (up_w / max(1e-9, total_w)),
+        "down_rate": (down_w / max(1e-9, total_w)),
+        "trailing_rate": (trailing_w / max(1e-9, total_w)),
+        "stale_rate": (stale_w / max(1e-9, total_w)),
+        "manual_rate": (manual_w / max(1e-9, total_w)),
+        "median_up_ret_pct": _median(up_rets, default=0.0),
+        "median_down_ret_pct": _median(down_rets, default=0.0),
+        "median_abs_return_pct": _median(abs_rets, default=0.0),
+        "q75_abs_return_pct": _quantile(abs_rets, 0.75, default=0.0),
+        "median_hold_h": max(0.25, _median(holds, default=2.0)),
+        "q75_hold_h": max(0.25, _quantile(holds, 0.75, default=2.0)),
+    }
+
+
+def _blend_probability(cohorts: List[Tuple[float, Dict[str, float]]], key: str) -> float:
+    num = 0.0
+    den = 0.0
+    for weight, stats in cohorts:
+        value = _f(stats.get(key, 0.0), 0.0)
+        support = min(1.0, math.log1p(_f(stats.get("samples", 0.0), 0.0)) / math.log1p(20.0))
+        w = weight * max(0.15, support)
+        num += w * value
+        den += w
+    if den <= 1e-9:
+        return 0.0
+    return num / den
+
+
+def _cohort_weighted_value(cohorts: List[Tuple[float, Dict[str, float]]], key: str, default: float = 0.0) -> float:
+    num = 0.0
+    den = 0.0
+    for weight, stats in cohorts:
+        value = _f(stats.get(key, default), default)
+        support = min(1.0, math.log1p(_f(stats.get("samples", 0.0), 0.0)) / math.log1p(20.0))
+        w = weight * max(0.15, support)
+        num += w * value
+        den += w
+    if den <= 1e-9:
+        return float(default)
+    return num / den
+
+
+def _recency_weight(age_rank: int, size: int) -> float:
+    return 0.7 + (0.6 * (float(age_rank) / float(max(1, size))))
+
+
+def _bucket_distribution(values: List[str], *, size: int) -> Dict[str, float]:
+    if not values:
+        return {}
+    counts: Dict[str, float] = {}
+    total = 0.0
+    for idx, value in enumerate(values):
+        w = _recency_weight(idx + 1, size)
+        counts[value] = float(counts.get(value, 0.0) + w)
+        total += w
+    if total <= 1e-9:
+        return {}
+    return {str(k): round(float(v / total), 6) for k, v in counts.items()}
+
+
+def _prototype_shape_similarity(proto: Dict[str, Any], expected_hold_h: float, expected_abs_return_pct: float) -> float:
+    hold_med = max(0.25, _f(proto.get("median_hold_h", 0.0), 0.0))
+    hold_q75 = max(hold_med, _f(proto.get("q75_hold_h", hold_med), hold_med))
+    ret_med = max(0.05, _f(proto.get("median_abs_return_pct", 0.0), 0.0))
+    ret_q75 = max(ret_med, _f(proto.get("q75_abs_return_pct", ret_med), ret_med))
+    hold_center = (0.55 * hold_med) + (0.45 * hold_q75)
+    ret_center = (0.55 * ret_med) + (0.45 * ret_q75)
+    hold_scale = max(2.0, hold_q75, expected_hold_h)
+    ret_scale = max(0.5, ret_q75, expected_abs_return_pct)
+    hold_similarity = max(0.0, 1.0 - (abs(expected_hold_h - hold_center) / hold_scale))
+    ret_similarity = max(0.0, 1.0 - (abs(expected_abs_return_pct - ret_center) / ret_scale))
+    return (0.60 * hold_similarity) + (0.40 * ret_similarity)
+
+
+def _count_by(rows: List[Dict[str, Any]], getter: Any, limit: int = 20) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for row in rows:
+        key = getter(row)
+        counts[str(key)] = int(counts.get(str(key), 0) + 1)
+    return _top_counter(counts, limit=limit)
+
+
+def _confidence_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    hit_conf: List[float] = []
+    miss_conf: List[float] = []
+    by_pred_trigger: Dict[str, List[float]] = {}
+    by_actual_trigger: Dict[str, List[float]] = {}
+    for row in rows:
+        conf = _f(row.get("predicted_confidence", 0.0), 0.0)
+        pred_trigger = _s(row.get("predicted_exit_trigger", "")) or "Unknown"
+        actual_trigger = _s(row.get("actual_exit_trigger", "")) or "Unknown"
+        by_pred_trigger.setdefault(pred_trigger, []).append(conf)
+        by_actual_trigger.setdefault(actual_trigger, []).append(conf)
+        hit = (
+            _s(row.get("predicted_direction", "")).lower() == _s(row.get("actual_direction", "")).lower()
+            and pred_trigger == actual_trigger
+        )
+        if hit:
+            hit_conf.append(conf)
+        else:
+            miss_conf.append(conf)
+    return {
+        "hit_count": int(len(hit_conf)),
+        "miss_count": int(len(miss_conf)),
+        "hit_mean": round(sum(hit_conf) / max(1, len(hit_conf)), 6),
+        "miss_mean": round(sum(miss_conf) / max(1, len(miss_conf)), 6),
+        "hit_median": round(_median(hit_conf, default=0.0), 6),
+        "miss_median": round(_median(miss_conf, default=0.0), 6),
+        "by_predicted_trigger": {
+            str(k): {
+                "count": int(len(v)),
+                "mean": round(sum(v) / max(1, len(v)), 6),
+                "median": round(_median(v, default=0.0), 6),
+            }
+            for k, v in by_pred_trigger.items()
+        },
+        "by_actual_trigger": {
+            str(k): {
+                "count": int(len(v)),
+                "mean": round(sum(v) / max(1, len(v)), 6),
+                "median": round(_median(v, default=0.0), 6),
+            }
+            for k, v in by_actual_trigger.items()
+        },
+    }
+
+
+def _population_diagnostics(full_rows: List[Dict[str, Any]], admitted_rows: List[Dict[str, Any]], abstained_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def summarize(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        return {
+            "trades": int(len(rows)),
+            "metrics": _metrics_for_rows(rows),
+            "actual_trigger_counts": _count_by(rows, lambda r: _s(r.get("actual_exit_trigger", "")) or "Unknown"),
+            "predicted_trigger_counts": _count_by(rows, lambda r: _s(r.get("predicted_exit_trigger", "")) or "Unknown"),
+            "actual_direction_counts": _count_by(rows, lambda r: _s(r.get("actual_direction", "")).lower() or "unknown"),
+            "predicted_direction_counts": _count_by(rows, lambda r: _s(r.get("predicted_direction", "")).lower() or "unknown"),
+            "symbol_counts": _count_by(rows, lambda r: _s(r.get("symbol", "")) or "UNKNOWN"),
+            "hold_bucket_counts": _count_by(rows, lambda r: _bucket_hold_hours(_f(r.get("hold_hours", 0.0), 0.0))),
+            "return_magnitude_bucket_counts": _count_by(
+                rows,
+                lambda r: _bucket_return_mag_pct(
+                    _f(r.get("entry_price", 0.0), 0.0),
+                    _f(r.get("actual_exit_price", r.get("exit_price", 0.0)), 0.0),
+                ),
+            ),
+            "confidence_summary": _confidence_summary(rows),
+        }
+
+    admission_rate = (100.0 * len(admitted_rows) / max(1, len(full_rows))) if full_rows else 0.0
+    return {
+        "full_test_trades": int(len(full_rows)),
+        "admitted_test_trades": int(len(admitted_rows)),
+        "abstained_test_trades": int(len(abstained_rows)),
+        "admission_rate_pct": round(admission_rate, 4),
+        "full_universe_metrics": _metrics_for_rows(full_rows),
+        "admitted_metrics": _metrics_for_rows(admitted_rows),
+        "abstained_metrics": _metrics_for_rows(abstained_rows),
+        "full_universe": summarize(full_rows),
+        "admitted": summarize(admitted_rows),
+        "abstained": summarize(abstained_rows),
+    }
+
+
+def _build_crypto_trigger_prototypes(
+    train_rows: List[Dict[str, Any]],
+    *,
+    symbol: str,
+    regime: str,
+) -> Dict[str, Dict[str, Any]]:
+    working = list(train_rows[-220:]) if len(train_rows) > 220 else list(train_rows)
+    classes = ("Stale Alignment", "Trailing", "Manual")
+    out: Dict[str, Dict[str, Any]] = {}
+    for cls in classes:
+        cls_rows = [r for r in working if _s(r.get("actual_exit_trigger", "Unknown")) == cls]
+        sym_rows = [r for r in cls_rows if _s(r.get("symbol", "")).upper() == symbol]
+        reg_rows = [r for r in cls_rows if _s(r.get("regime", "")) == regime]
+        sym_reg_rows = [r for r in sym_rows if _s(r.get("regime", "")) == regime]
+        recent80 = _recent_slice(cls_rows, 80)
+        recent40 = _recent_slice(cls_rows, 40)
+        recent_symbol = _recent_slice(sym_rows, 24)
+        stats = _weighted_trade_stats(cls_rows)
+        hold_buckets = _bucket_distribution(
+            [_bucket_hold_hours(_f(r.get("hold_hours", 0.0), 0.0)) for r in cls_rows],
+            size=len(cls_rows),
+        )
+        ret_buckets = _bucket_distribution(
+            [
+                _bucket_return_mag_pct(
+                    _f(r.get("entry_price", 0.0), 0.0),
+                    _f(r.get("exit_price", r.get("actual_exit_price", 0.0)), 0.0),
+                )
+                for r in cls_rows
+            ],
+            size=len(cls_rows),
+        )
+        out[cls] = {
+            "class_name": cls,
+            "support_count": int(len(cls_rows)),
+            "recency_weighted_support": round(_f(stats.get("weight", 0.0), 0.0), 6),
+            "symbol_support_count": int(len(sym_rows)),
+            "symbol_recent_support_count": int(len(recent_symbol)),
+            "regime_support_count": int(len(reg_rows)),
+            "symbol_regime_support_count": int(len(sym_reg_rows)),
+            "recent40_count": int(len(recent40)),
+            "recent80_count": int(len(recent80)),
+            "direction_up_rate": round(_f(stats.get("up_rate", 0.0), 0.0), 6),
+            "direction_down_rate": round(_f(stats.get("down_rate", 0.0), 0.0), 6),
+            "hold_bucket_distribution": hold_buckets,
+            "return_bucket_distribution": ret_buckets,
+            "median_hold_h": round(_f(stats.get("median_hold_h", 0.0), 0.0), 6),
+            "q75_hold_h": round(_f(stats.get("q75_hold_h", 0.0), 0.0), 6),
+            "median_abs_return_pct": round(_f(stats.get("median_abs_return_pct", 0.0), 0.0), 6),
+            "q75_abs_return_pct": round(_f(stats.get("q75_abs_return_pct", 0.0), 0.0), 6),
+        }
+    return out
+
+
+def _crypto_manual_signals(
+    train_rows: List[Dict[str, Any]],
+    *,
+    symbol: str,
+    regime: str,
+    candidate_hold_h: float,
+) -> Dict[str, float]:
+    working = list(train_rows[-220:]) if len(train_rows) > 220 else list(train_rows)
+    symbol_rows = [r for r in working if _s(r.get("symbol", "")).upper() == symbol]
+    regime_rows = [r for r in working if _s(r.get("regime", "")) == regime]
+    recent40 = _recent_slice(working, 40)
+    recent80 = _recent_slice(working, 80)
+    symbol_recent = _recent_slice(symbol_rows, 24)
+    manual_rows = [r for r in working if _s(r.get("actual_exit_trigger", "")) == "Manual"]
+    symbol_manual_rows = [r for r in manual_rows if _s(r.get("symbol", "")).upper() == symbol]
+    regime_manual_rows = [r for r in manual_rows if _s(r.get("regime", "")) == regime]
+    recent_manual_40 = [r for r in recent40 if _s(r.get("actual_exit_trigger", "")) == "Manual"]
+    recent_manual_80 = [r for r in recent80 if _s(r.get("actual_exit_trigger", "")) == "Manual"]
+    symbol_recent_manual = [r for r in symbol_recent if _s(r.get("actual_exit_trigger", "")) == "Manual"]
+    stale_rows = [r for r in working if _s(r.get("actual_exit_trigger", "")) == "Stale Alignment"]
+    symbol_stale_rows = [r for r in stale_rows if _s(r.get("symbol", "")).upper() == symbol]
+    long_symbol_rows = [r for r in symbol_rows if _f(r.get("hold_hours", 0.0), 0.0) >= max(12.0, 0.75 * candidate_hold_h)]
+    long_symbol_manual = [r for r in long_symbol_rows if _s(r.get("actual_exit_trigger", "")) == "Manual"]
+    long_symbol_stale = [r for r in long_symbol_rows if _s(r.get("actual_exit_trigger", "")) == "Stale Alignment"]
+
+    def ratio(num: int, den: int) -> float:
+        return float(num) / float(max(1, den))
+
+    return {
+        "manual_prior_support_count": float(len(manual_rows)),
+        "manual_recent_support_count": float(len(recent_manual_40)),
+        "manual_recent80_support_count": float(len(recent_manual_80)),
+        "manual_same_symbol_support_count": float(len(symbol_manual_rows)),
+        "manual_same_regime_support_count": float(len(regime_manual_rows)),
+        "manual_symbol_recent_support_count": float(len(symbol_recent_manual)),
+        "manual_recent_density_40": ratio(len(recent_manual_40), len(recent40)),
+        "manual_recent_density_80": ratio(len(recent_manual_80), len(recent80)),
+        "manual_symbol_long_hold_ratio": ratio(len(long_symbol_manual), len(long_symbol_rows)),
+        "manual_symbol_vs_stale_long_hold_ratio": ratio(len(long_symbol_manual), len(long_symbol_manual) + len(long_symbol_stale)),
+        "manual_symbol_vs_stale_ratio": ratio(len(symbol_manual_rows), len(symbol_manual_rows) + len(symbol_stale_rows)),
+    }
+
+
+def _crypto_predict_one(
     *,
     train_rows: List[Dict[str, Any]],
     candidate: Dict[str, Any],
     regime: str,
 ) -> Dict[str, Any]:
+    working = list(train_rows[-220:]) if len(train_rows) > 220 else list(train_rows)
+    sym = _s(candidate.get("symbol", "")).upper()
+
+    symbol_rows = [r for r in working if _s(r.get("symbol", "")).upper() == sym]
+    symbol_regime_rows = [r for r in symbol_rows if _s(r.get("regime", "")) == regime]
+    regime_rows = [r for r in working if _s(r.get("regime", "")) == regime]
+    recent_rows = _recent_slice(working, 80)
+    recent_symbol_rows = _recent_slice(symbol_rows, 24)
+    recent_regime_rows = _recent_slice(regime_rows, 80)
+    prototypes = _build_crypto_trigger_prototypes(working, symbol=sym, regime=regime)
+    symbol_cohorts: List[Tuple[float, Dict[str, float]]] = []
+    for base_weight, rows in [
+        (1.55, symbol_regime_rows),
+        (1.25, recent_symbol_rows),
+        (0.90, symbol_rows),
+    ]:
+        if not rows:
+            continue
+        stats = _weighted_trade_stats(rows)
+        if stats["weight"] <= 0.0:
+            continue
+        reliability = min(1.0, math.log1p(stats["weight"]) / math.log1p(24.0))
+        symbol_cohorts.append((base_weight * reliability, stats))
+
+    cohorts: List[Tuple[float, Dict[str, float]]] = []
+    for base_weight, rows in [
+        (1.85, symbol_regime_rows),
+        (1.60, recent_symbol_rows),
+        (1.10, symbol_rows),
+        (0.70, recent_regime_rows),
+        (0.45, recent_rows),
+    ]:
+        if not rows:
+            continue
+        stats = _weighted_trade_stats(rows)
+        if stats["weight"] <= 0.0:
+            continue
+        reliability = min(1.0, math.log1p(stats["weight"]) / math.log1p(32.0))
+        cohorts.append((base_weight * reliability, stats))
+
+    if not cohorts:
+        entry = _f(candidate.get("entry_price", 0.0), 0.0)
+        return {
+            "predicted_direction": "flat",
+            "predicted_exit_trigger": "Unknown",
+            "predicted_hold_hours": 2.0,
+            "predicted_exit_price": float(entry),
+            "predicted_confidence": 0.5,
+            "trigger_scores": {"Unknown": 0.0},
+            "direction_scores": {"flat": 0.0},
+            "trigger_margin": 0.0,
+            "direction_margin": 0.0,
+        }
+
+    total_weight = 0.0
+    for weight, _stats in cohorts:
+        total_weight += weight
+    norm = max(1e-9, total_weight)
+    p_up = _blend_probability(cohorts, "up_rate")
+    p_down = _blend_probability(cohorts, "down_rate")
+    p_trailing = _blend_probability(cohorts, "trailing_rate")
+    p_stale = _blend_probability(cohorts, "stale_rate")
+    p_manual = _blend_probability(cohorts, "manual_rate")
+    symbol_up = _weighted_trade_stats(recent_symbol_rows).get("up_rate", 0.0) if recent_symbol_rows else 0.0
+    symbol_down = _weighted_trade_stats(recent_symbol_rows).get("down_rate", 0.0) if recent_symbol_rows else 0.0
+    symbol_manual = _weighted_trade_stats(recent_symbol_rows).get("manual_rate", 0.0) if recent_symbol_rows else 0.0
+    symbol_momentum = _cohort_weighted_value(cohorts, "up_rate", 0.0) - _cohort_weighted_value(cohorts, "down_rate", 0.0)
+    expected_hold_h = _cohort_weighted_value(cohorts, "median_hold_h", 2.0)
+    expected_abs_return_pct = _cohort_weighted_value(cohorts, "median_abs_return_pct", 0.5)
+    symbol_hold_h = _cohort_weighted_value(symbol_cohorts, "q75_hold_h", expected_hold_h) if symbol_cohorts else expected_hold_h
+    symbol_abs_return_pct = (
+        _cohort_weighted_value(symbol_cohorts, "q75_abs_return_pct", expected_abs_return_pct) if symbol_cohorts else expected_abs_return_pct
+    )
+    candidate_hold_h = max(expected_hold_h, ((0.55 * expected_hold_h) + (0.45 * symbol_hold_h)))
+    candidate_abs_return_pct = max(
+        expected_abs_return_pct,
+        ((0.60 * expected_abs_return_pct) + (0.40 * symbol_abs_return_pct)),
+    )
+    expected_hold_bucket = _bucket_hold_hours(candidate_hold_h)
+    if candidate_abs_return_pct < 0.5:
+        expected_ret_bucket = "<0.5%"
+    elif candidate_abs_return_pct < 1.5:
+        expected_ret_bucket = "0.5-1.5%"
+    elif candidate_abs_return_pct < 3.0:
+        expected_ret_bucket = "1.5-3.0%"
+    else:
+        expected_ret_bucket = "3.0%+"
+    manual_proto = prototypes.get("Manual", {})
+    manual_support_count = int(manual_proto.get("support_count", 0) or 0)
+    manual_signals = _crypto_manual_signals(
+        working,
+        symbol=sym,
+        regime=regime,
+        candidate_hold_h=candidate_hold_h,
+    )
+
+    trig_scores: Dict[str, float] = {}
+    manual_reasons: List[str] = []
+    for cls in ("Stale Alignment", "Trailing", "Manual"):
+        proto = prototypes.get(cls, {})
+        if int(proto.get("support_count", 0) or 0) <= 0:
+            trig_scores[cls] = -1e9
+            continue
+        hold_bucket_prob = _f((proto.get("hold_bucket_distribution", {}) if isinstance(proto.get("hold_bucket_distribution", {}), dict) else {}).get(expected_hold_bucket, 0.0), 0.0)
+        ret_bucket_prob = _f((proto.get("return_bucket_distribution", {}) if isinstance(proto.get("return_bucket_distribution", {}), dict) else {}).get(expected_ret_bucket, 0.0), 0.0)
+        shape_similarity = _prototype_shape_similarity(proto, candidate_hold_h, candidate_abs_return_pct)
+        score = 0.0
+        score += 0.95 * math.log1p(int(proto.get("symbol_regime_support_count", 0) or 0))
+        score += 0.80 * math.log1p(int(proto.get("symbol_recent_support_count", 0) or 0))
+        score += 0.65 * math.log1p(int(proto.get("symbol_support_count", 0) or 0))
+        score += 0.40 * math.log1p(int(proto.get("regime_support_count", 0) or 0))
+        score += 0.30 * math.log1p(int(proto.get("recent80_count", 0) or 0))
+        score += 0.55 * hold_bucket_prob
+        score += 0.55 * ret_bucket_prob
+        score += 0.80 * shape_similarity
+        if cls == "Trailing":
+            score += 0.80 * max(0.0, p_up - p_down)
+            score += 0.65 * max(0.0, symbol_up - symbol_down)
+            score += 0.55 * p_trailing
+            score -= 0.30 * p_manual
+            if manual_support_count >= 3 and candidate_hold_h > (1.35 * max(1.0, _f(proto.get("q75_hold_h", 0.0), 0.0))):
+                score -= 0.40
+        elif cls == "Stale Alignment":
+            score += 0.80 * max(0.0, p_down - p_up)
+            score += 0.65 * max(0.0, symbol_down - symbol_up)
+            score += 0.55 * p_stale
+            score -= 0.15 * p_manual
+            if manual_support_count >= 3 and candidate_hold_h > (1.35 * max(1.0, _f(proto.get("q75_hold_h", 0.0), 0.0))):
+                score -= 0.75
+            score -= 0.50 * _f(manual_signals.get("manual_symbol_long_hold_ratio", 0.0), 0.0)
+            score -= 0.35 * _f(manual_signals.get("manual_symbol_vs_stale_ratio", 0.0), 0.0)
+        else:
+            score += 1.10 * p_manual
+            score += 0.95 * symbol_manual
+            score += 0.95 * (1.0 if expected_hold_bucket == "24h+" else 0.0)
+            score += 0.55 * (1.0 if expected_ret_bucket in {"1.5-3.0%", "3.0%+"} else 0.0)
+            if candidate_hold_h >= max(18.0, 0.90 * _f(proto.get("median_hold_h", 0.0), 0.0)):
+                score += 1.10
+                manual_reasons.append("long_hold_matches_manual")
+            if candidate_abs_return_pct >= max(1.5, 0.90 * _f(proto.get("median_abs_return_pct", 0.0), 0.0)):
+                score += 0.35
+                manual_reasons.append("return_mag_matches_manual")
+            score += 1.10 * min(1.0, _f(manual_signals.get("manual_symbol_long_hold_ratio", 0.0), 0.0))
+            score += 0.95 * min(1.0, _f(manual_signals.get("manual_symbol_vs_stale_long_hold_ratio", 0.0), 0.0))
+            score += 0.80 * min(1.0, _f(manual_signals.get("manual_symbol_vs_stale_ratio", 0.0), 0.0))
+            score += 0.55 * min(1.0, 2.0 * _f(manual_signals.get("manual_recent_density_40", 0.0), 0.0))
+            score += 0.35 * min(1.0, 2.0 * _f(manual_signals.get("manual_recent_density_80", 0.0), 0.0))
+            score += 0.45 * min(1.0, _f(manual_signals.get("manual_same_symbol_support_count", 0.0), 0.0) / 3.0)
+            score += 0.25 * min(1.0, _f(manual_signals.get("manual_same_regime_support_count", 0.0), 0.0) / 6.0)
+            if int(proto.get("support_count", 0) or 0) < 3:
+                score -= 0.75
+        trig_scores[cls] = score
+
+    sorted_trig = sorted(trig_scores.items(), key=lambda kv: kv[1], reverse=True)
+    pred_trig = sorted_trig[0][0]
+    trig_winner = float(sorted_trig[0][1])
+    trig_runner = float(sorted_trig[1][1]) if len(sorted_trig) > 1 else float(sorted_trig[0][1])
+    trig_margin = max(0.0, trig_winner - trig_runner)
+    stale_score = float(trig_scores.get("Stale Alignment", -1e9))
+    trailing_score = float(trig_scores.get("Trailing", -1e9))
+    manual_score = float(trig_scores.get("Manual", -1e9))
+    manual_runner_margin = manual_score - max(stale_score, trailing_score)
+    if pred_trig != "Manual":
+        if manual_score > -1e8:
+            if _f(manual_signals.get("manual_same_symbol_support_count", 0.0), 0.0) <= 0.0:
+                manual_reasons.append("no_same_symbol_manual_support")
+            if _f(manual_signals.get("manual_symbol_long_hold_ratio", 0.0), 0.0) < 0.25:
+                manual_reasons.append("weak_symbol_long_hold_manual_ratio")
+            if manual_runner_margin < 0.0:
+                manual_reasons.append("manual_score_below_runner_up")
+
+    direction_scores = {
+        "up": (1.10 * p_up) + (0.45 * max(0.0, symbol_momentum)) + (0.35 * max(0.0, trig_scores.get("Trailing", 0.0) - trig_scores.get("Stale Alignment", 0.0))),
+        "down": (1.10 * p_down) + (0.45 * max(0.0, -symbol_momentum)) + (0.35 * max(0.0, trig_scores.get("Stale Alignment", 0.0) - trig_scores.get("Trailing", 0.0))),
+        "flat": 0.10 + (0.25 * p_manual),
+    }
+    sorted_dir = sorted(direction_scores.items(), key=lambda kv: kv[1], reverse=True)
+    pred_dir = sorted_dir[0][0]
+    dir_winner = float(sorted_dir[0][1])
+    dir_runner = float(sorted_dir[1][1]) if len(sorted_dir) > 1 else float(sorted_dir[0][1])
+    dir_margin = max(0.0, dir_winner - dir_runner)
+
+    # Manual should be allowed, but only when it wins with real margin or clear support.
+    if pred_trig == "Manual" and (p_manual < 0.10 and trig_margin < 0.20):
+        pred_trig = "Trailing" if trig_scores.get("Trailing", -1e9) >= trig_scores.get("Stale Alignment", -1e9) else "Stale Alignment"
+
+    hold_h = max(0.25, candidate_hold_h)
+    up_mag = max(0.05, _cohort_weighted_value(cohorts, "median_up_ret_pct", 0.35))
+    down_mag = max(0.05, _cohort_weighted_value(cohorts, "median_down_ret_pct", 0.35))
+    move_pct = max(0.05, up_mag if pred_dir == "up" else down_mag if pred_dir == "down" else candidate_abs_return_pct) / 100.0
+    entry_px = _f(candidate.get("entry_price", 0.0), 0.0)
+    if pred_dir == "up":
+        exit_px = entry_px * (1.0 + move_pct)
+    elif pred_dir == "down":
+        exit_px = entry_px * (1.0 - move_pct)
+    else:
+        exit_px = entry_px
+
+    evidence = min(1.0, math.sqrt(norm / 4.0) / 3.2)
+    trig_scale = abs(trig_winner) + abs(trig_runner) + 1e-9
+    dir_scale = abs(dir_winner) + abs(dir_runner) + 1e-9
+    trig_margin_norm = min(1.0, trig_margin / trig_scale)
+    dir_margin_norm = min(1.0, dir_margin / dir_scale)
+    symbol_agreement = 0.0
+    if pred_trig == "Trailing":
+        symbol_agreement = max(0.0, symbol_up - symbol_down)
+    elif pred_trig == "Stale Alignment":
+        symbol_agreement = max(0.0, symbol_down - symbol_up)
+    elif pred_trig == "Manual":
+        symbol_agreement = min(1.0, _f(manual_signals.get("manual_symbol_vs_stale_ratio", 0.0), 0.0))
+    global_only_penalty = 0.0
+    if pred_trig == "Manual" and _f(manual_signals.get("manual_same_symbol_support_count", 0.0), 0.0) <= 0.0:
+        global_only_penalty += 0.08
+    if pred_trig in {"Stale Alignment", "Trailing"} and symbol_agreement < 0.10:
+        global_only_penalty += 0.06
+    conf = max(
+        0.0,
+        min(
+            1.0,
+            0.12
+            + (0.28 * evidence)
+            + (0.24 * trig_margin_norm)
+            + (0.18 * dir_margin_norm)
+            + (0.12 * min(1.0, symbol_agreement))
+            - global_only_penalty,
+        ),
+    )
+    if pred_dir == "flat" and pred_trig == "Unknown":
+        conf = min(conf, 0.60)
+    return {
+        "predicted_direction": pred_dir,
+        "predicted_exit_trigger": pred_trig,
+        "predicted_hold_hours": round(float(hold_h), 6),
+        "predicted_exit_price": round(float(max(1e-12, exit_px)), 10),
+        "predicted_confidence": round(float(conf), 6),
+        "trigger_scores": {k: round(float(v), 6) for k, v in trig_scores.items()},
+        "direction_scores": {k: round(float(v), 6) for k, v in direction_scores.items()},
+        "winning_trigger_score": round(float(trig_winner), 6),
+        "runner_up_trigger_score": round(float(trig_runner), 6),
+        "trigger_margin": round(float(trig_margin), 6),
+        "winning_direction_score": round(float(dir_winner), 6),
+        "runner_up_direction_score": round(float(dir_runner), 6),
+        "direction_margin": round(float(dir_margin), 6),
+        "manual_score": round(float(manual_score), 6),
+        "stale_score": round(float(stale_score), 6),
+        "trailing_score": round(float(trailing_score), 6),
+        "manual_runner_up_margin": round(float(manual_runner_margin), 6),
+        "manual_outcome_note": ";".join(sorted(set(manual_reasons))) if manual_reasons else ("manual_won" if pred_trig == "Manual" else ""),
+        "manual_prior_support_count": int(_f(manual_signals.get("manual_prior_support_count", 0.0), 0.0)),
+        "manual_recent_support_count": int(_f(manual_signals.get("manual_recent_support_count", 0.0), 0.0)),
+        "manual_same_symbol_support_count": int(_f(manual_signals.get("manual_same_symbol_support_count", 0.0), 0.0)),
+        "manual_same_regime_support_count": int(_f(manual_signals.get("manual_same_regime_support_count", 0.0), 0.0)),
+        "trigger_prototype_support": {
+            k: {
+                "support_count": int(v.get("support_count", 0) or 0),
+                "symbol_support_count": int(v.get("symbol_support_count", 0) or 0),
+                "symbol_regime_support_count": int(v.get("symbol_regime_support_count", 0) or 0),
+            }
+            for k, v in prototypes.items()
+        },
+    }
+
+
+def _predict_one(
+    *,
+    train_rows: List[Dict[str, Any]],
+    candidate: Dict[str, Any],
+    regime: str,
+    market: str = "",
+) -> Dict[str, Any]:
+    if _s(market).lower() == "crypto":
+        return _crypto_predict_one(train_rows=train_rows, candidate=candidate, regime=regime)
     # Keep predictor bounded in cost for large historical sets.
     working = list(train_rows[-220:]) if len(train_rows) > 220 else list(train_rows)
     sym = _s(candidate.get("symbol", "")).upper()
@@ -552,12 +1152,23 @@ def _objective_score(metrics: Dict[str, Any], market: str) -> float:
 
 def _score_with_threshold(rows: List[Dict[str, Any]], threshold: float, market: str) -> Dict[str, Any]:
     admitted = [r for r in rows if _f(r.get("predicted_confidence", 0.0), 0.0) >= float(threshold)]
+    abstained = [r for r in rows if _f(r.get("predicted_confidence", 0.0), 0.0) < float(threshold)]
     metrics = _metrics_for_rows(admitted)
+    full_metrics = _metrics_for_rows(rows)
+    abstained_metrics = _metrics_for_rows(abstained)
     coverage = (len(admitted) / max(1, len(rows))) if rows else 0.0
     score = _objective_score(metrics, market)
     if coverage < 0.30:
         score -= (0.30 - coverage) * 120.0
-    return {"score": score, "coverage": coverage, "metrics": metrics, "admitted": admitted}
+    return {
+        "score": score,
+        "coverage": coverage,
+        "metrics": metrics,
+        "full_metrics": full_metrics,
+        "abstained_metrics": abstained_metrics,
+        "admitted": admitted,
+        "abstained": abstained,
+    }
 
 
 def _calibrate_abstain_threshold(train_rows: List[Dict[str, Any]], market: str) -> Dict[str, Any]:
@@ -570,7 +1181,7 @@ def _calibrate_abstain_threshold(train_rows: List[Dict[str, Any]], market: str) 
     running = list(base)
     for row in val:
         regime = _regime_from_prior(running)
-        pred = _predict_one(train_rows=running, candidate=row, regime=regime)
+        pred = _predict_one(train_rows=running, candidate=row, regime=regime, market=market)
         merged = dict(row)
         merged.update(pred)
         pred_val.append(merged)
@@ -630,6 +1241,7 @@ def build_synthetic_replay_artifact(hub_dir: str, market: str, closed_rows: List
     step_n = max(5, int(test_n // 2))
     windows: List[Dict[str, Any]] = []
     admitted_all: List[Dict[str, Any]] = []
+    abstained_all: List[Dict[str, Any]] = []
     preds_all: List[Dict[str, Any]] = []
     thr_values: List[float] = []
     max_windows = 10
@@ -648,7 +1260,7 @@ def build_synthetic_replay_artifact(hub_dir: str, market: str, closed_rows: List
             regime = _regime_from_prior(prior)
             rr = dict(r)
             rr["regime"] = regime
-            pred = _predict_one(train_rows=prior, candidate=rr, regime=regime)
+            pred = _predict_one(train_rows=prior, candidate=rr, regime=regime, market=m)
             merged = dict(rr)
             merged.update(pred)
             merged["predicted_exit_ts"] = int(
@@ -659,15 +1271,20 @@ def build_synthetic_replay_artifact(hub_dir: str, market: str, closed_rows: List
         preds_all.extend(test_preds)
         scored = _score_with_threshold(test_preds, threshold, m)
         admitted = scored.get("admitted", []) if isinstance(scored.get("admitted", []), list) else []
+        abstained = scored.get("abstained", []) if isinstance(scored.get("abstained", []), list) else []
         admitted_all.extend(admitted)
+        abstained_all.extend(abstained)
         windows.append(
             {
                 "train_rows": int(len(train)),
                 "test_rows": int(len(test_preds)),
                 "admitted_rows": int(len(admitted)),
+                "abstained_rows": int(len(abstained)),
                 "threshold": round(float(threshold), 4),
                 "coverage": round(_f(scored.get("coverage", 0.0), 0.0), 6),
                 "metrics": scored.get("metrics", {}),
+                "full_universe_metrics": scored.get("full_metrics", {}),
+                "abstained_metrics": scored.get("abstained_metrics", {}),
             }
         )
         win_count += 1
@@ -706,8 +1323,12 @@ def build_synthetic_replay_artifact(hub_dir: str, market: str, closed_rows: List
         by_regime.setdefault(_s(r.get("regime", "unknown")) or "unknown", []).append(r)
     seg_trigger = {k: _metrics_for_rows(v) for k, v in by_trigger.items()}
     seg_regime = {k: _metrics_for_rows(v) for k, v in by_regime.items()}
+    population_diag = _population_diagnostics(preds_all, admitted_all, abstained_all)
+    crypto_diag = _crypto_replay_diagnostics(admitted_all, full_rows=preds_all, abstained_rows=abstained_all) if m == "crypto" else {}
+    if crypto_diag:
+        crypto_diag["population_diagnostics"] = population_diag
 
-    return {
+    payload = {
         "status": "ok",
         "summary": (
             f"{m} synthetic replay: admitted {len(admitted_all)}/{len(preds_all)} "
@@ -718,7 +1339,9 @@ def build_synthetic_replay_artifact(hub_dir: str, market: str, closed_rows: List
             "market": m,
             "closed_trades_total": int(len(rows)),
             "train_trades": int(max(w.get("train_rows", 0) for w in windows)),
-            "test_trades": int(sum(int(w.get("test_rows", 0) or 0) for w in windows)),
+            "test_trades": int(len(admitted_all)),
+            "full_test_trades": int(len(preds_all)),
+            "abstained_test_trades": int(len(abstained_all)),
             "admitted_test_trades": int(len(admitted_all)),
             "walkforward_windows": int(len(windows)),
         },
@@ -728,6 +1351,7 @@ def build_synthetic_replay_artifact(hub_dir: str, market: str, closed_rows: List
         },
         "best_test_metrics": metrics,
         "hybrid_test_metrics": metrics,
+        "population_diagnostics": population_diag,
         "worst_window_metrics": worst,
         "confidence_intervals": ci,
         "walkforward_windows": windows,
@@ -735,6 +1359,9 @@ def build_synthetic_replay_artifact(hub_dir: str, market: str, closed_rows: List
         "segmented_by_regime": seg_regime,
         "iterations": [{"iteration": 1, "test_predictions": admitted_all}],
     }
+    if crypto_diag:
+        payload["crypto_classifier_diagnostics"] = crypto_diag
+    return payload
 
 
 def _metrics_for_rows(rows: List[Dict[str, Any]]) -> Dict[str, float]:
@@ -775,6 +1402,240 @@ def _metrics_for_rows(rows: List[Dict[str, Any]]) -> Dict[str, float]:
         "trigger_scored_trades": float(t_scored),
         "trigger_coverage_pct": round(100.0 * t_scored / max(1, n), 4),
         "pnl_trend_match_pct": round(100.0 * p_hits / max(1, n), 4),
+    }
+
+
+def _bucket_hold_hours(value: float) -> str:
+    v = max(0.0, float(value))
+    if v < 1.0:
+        return "<1h"
+    if v < 4.0:
+        return "1-4h"
+    if v < 12.0:
+        return "4-12h"
+    if v < 24.0:
+        return "12-24h"
+    return "24h+"
+
+
+def _bucket_return_mag_pct(entry_price: float, exit_price: float) -> str:
+    if entry_price <= 0.0:
+        return "unknown"
+    mag = abs(((exit_price / entry_price) - 1.0) * 100.0)
+    if mag < 0.5:
+        return "<0.5%"
+    if mag < 1.5:
+        return "0.5-1.5%"
+    if mag < 3.0:
+        return "1.5-3.0%"
+    return "3.0%+"
+
+
+def _confusion_matrix(rows: List[Dict[str, Any]], actual_key: str, pred_key: str) -> Dict[str, Dict[str, int]]:
+    out: Dict[str, Dict[str, int]] = {}
+    for row in rows:
+        actual = _s(row.get(actual_key, "Unknown")) or "Unknown"
+        pred = _s(row.get(pred_key, "Unknown")) or "Unknown"
+        if actual not in out:
+            out[actual] = {}
+        out[actual][pred] = int(out[actual].get(pred, 0) + 1)
+    return out
+
+
+def _top_counter(values: Dict[str, int], limit: int = 12) -> Dict[str, int]:
+    items = sorted(values.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))
+    return {str(k): int(v) for k, v in items[:limit]}
+
+
+def _crypto_replay_diagnostics(
+    rows: List[Dict[str, Any]],
+    *,
+    full_rows: Optional[List[Dict[str, Any]]] = None,
+    abstained_rows: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    if not rows:
+        return {}
+    full_population = list(full_rows or rows)
+    abstained_population = list(abstained_rows or [])
+    dir_conf = _confusion_matrix(rows, "actual_direction", "predicted_direction")
+    trig_conf = _confusion_matrix(rows, "actual_exit_trigger", "predicted_exit_trigger")
+    miss_symbol: Dict[str, int] = {}
+    miss_regime: Dict[str, int] = {}
+    miss_actual_trigger: Dict[str, int] = {}
+    miss_pred_trigger: Dict[str, int] = {}
+    miss_hold: Dict[str, int] = {}
+    miss_ret: Dict[str, int] = {}
+    conf_hits: List[float] = []
+    conf_miss: List[float] = []
+    trig_margin_hits: List[float] = []
+    trig_margin_miss: List[float] = []
+    dir_margin_hits: List[float] = []
+    dir_margin_miss: List[float] = []
+    uptrail_downstale: List[Dict[str, Any]] = []
+    manual_mispreds: List[Dict[str, Any]] = []
+    stale_vs_trailing_examples: List[Dict[str, Any]] = []
+    stale_vs_manual_examples: List[Dict[str, Any]] = []
+    proto_support: Dict[str, Dict[str, int]] = {}
+    manual_predicted = 0
+    manual_correct = 0
+    trailing_predicted = 0
+    trailing_correct = 0
+    stale_predicted = 0
+    stale_correct = 0
+    for row in rows:
+        pred_trig = _s(row.get("predicted_exit_trigger", "")) or "Unknown"
+        act_trig = _s(row.get("actual_exit_trigger", "")) or "Unknown"
+        hit = (
+            _s(row.get("actual_direction", "")).lower() == _s(row.get("predicted_direction", "")).lower()
+            and act_trig == pred_trig
+        )
+        conf = _f(row.get("predicted_confidence", 0.0), 0.0)
+        trig_margin = _f(row.get("trigger_margin", 0.0), 0.0)
+        dir_margin = _f(row.get("direction_margin", 0.0), 0.0)
+        if hit:
+            conf_hits.append(conf)
+            trig_margin_hits.append(trig_margin)
+            dir_margin_hits.append(dir_margin)
+        else:
+            conf_miss.append(conf)
+            trig_margin_miss.append(trig_margin)
+            dir_margin_miss.append(dir_margin)
+            sym = _s(row.get("symbol", "")) or "UNKNOWN"
+            reg = _s(row.get("regime", "")) or "unknown"
+            atr = act_trig
+            ptr = pred_trig
+            miss_symbol[sym] = int(miss_symbol.get(sym, 0) + 1)
+            miss_regime[reg] = int(miss_regime.get(reg, 0) + 1)
+            miss_actual_trigger[atr] = int(miss_actual_trigger.get(atr, 0) + 1)
+            miss_pred_trigger[ptr] = int(miss_pred_trigger.get(ptr, 0) + 1)
+            miss_hold[_bucket_hold_hours(_f(row.get("hold_hours", row.get("actual_hold_hours", 0.0)), 0.0))] = int(
+                miss_hold.get(_bucket_hold_hours(_f(row.get("hold_hours", row.get("actual_hold_hours", 0.0)), 0.0)), 0) + 1
+            )
+            miss_ret[_bucket_return_mag_pct(_f(row.get("entry_price", 0.0), 0.0), _f(row.get("exit_price", row.get("actual_exit_price", 0.0)), 0.0))] = int(
+                miss_ret.get(
+                    _bucket_return_mag_pct(
+                        _f(row.get("entry_price", 0.0), 0.0),
+                        _f(row.get("exit_price", row.get("actual_exit_price", 0.0)), 0.0),
+                    ),
+                    0,
+                )
+                + 1
+            )
+        if (
+            _s(row.get("actual_direction", "")).lower() == "up"
+            and _s(row.get("actual_exit_trigger", "")) == "Trailing"
+            and _s(row.get("predicted_direction", "")).lower() == "down"
+            and _s(row.get("predicted_exit_trigger", "")) == "Stale Alignment"
+            and len(uptrail_downstale) < 15
+        ):
+            uptrail_downstale.append(
+                {
+                    "symbol": _s(row.get("symbol", "")),
+                    "entry_ts": int(_f(row.get("entry_ts", 0.0), 0.0)),
+                    "hold_hours": round(_f(row.get("hold_hours", row.get("actual_hold_hours", 0.0)), 0.0), 4),
+                    "predicted_confidence": round(conf, 6),
+                }
+            )
+        if act_trig == "Manual" and pred_trig in {"Stale Alignment", "Trailing"} and len(manual_mispreds) < 15:
+            manual_mispreds.append(
+                {
+                    "symbol": _s(row.get("symbol", "")),
+                    "entry_ts": int(_f(row.get("entry_ts", 0.0), 0.0)),
+                    "predicted_exit_trigger": pred_trig,
+                    "predicted_confidence": round(conf, 6),
+                }
+            )
+        if pred_trig == "Manual":
+            manual_predicted += 1
+            if act_trig == "Manual":
+                manual_correct += 1
+        if pred_trig == "Trailing":
+            trailing_predicted += 1
+            if act_trig == "Trailing":
+                trailing_correct += 1
+        if pred_trig == "Stale Alignment":
+            stale_predicted += 1
+            if act_trig == "Stale Alignment":
+                stale_correct += 1
+        if not proto_support and isinstance(row.get("trigger_prototype_support", {}), dict):
+            for k, v in (row.get("trigger_prototype_support", {}) or {}).items():
+                if isinstance(v, dict):
+                    proto_support[str(k)] = {
+                        "support_count": int(_f(v.get("support_count", 0), 0.0)),
+                        "symbol_support_count": int(_f(v.get("symbol_support_count", 0), 0.0)),
+                        "symbol_regime_support_count": int(_f(v.get("symbol_regime_support_count", 0), 0.0)),
+                    }
+        if len(stale_vs_trailing_examples) < 12 and isinstance(row.get("trigger_scores", {}), dict):
+            ts = row.get("trigger_scores", {})
+            if isinstance(ts, dict):
+                stale_vs_trailing_examples.append(
+                    {
+                        "symbol": _s(row.get("symbol", "")),
+                        "actual_trigger": act_trig,
+                        "predicted_trigger": pred_trig,
+                        "stale_score": round(_f(ts.get("Stale Alignment", 0.0), 0.0), 6),
+                        "trailing_score": round(_f(ts.get("Trailing", 0.0), 0.0), 6),
+                        "trigger_margin": round(trig_margin, 6),
+                    }
+                )
+        if len(stale_vs_manual_examples) < 12 and isinstance(row.get("trigger_scores", {}), dict):
+            ts = row.get("trigger_scores", {})
+            if isinstance(ts, dict):
+                stale_vs_manual_examples.append(
+                    {
+                        "symbol": _s(row.get("symbol", "")),
+                        "actual_trigger": act_trig,
+                        "predicted_trigger": pred_trig,
+                        "stale_score": round(_f(ts.get("Stale Alignment", 0.0), 0.0), 6),
+                        "manual_score": round(_f(ts.get("Manual", 0.0), 0.0), 6),
+                        "trigger_margin": round(trig_margin, 6),
+                    }
+                )
+    return {
+        "direction_confusion_matrix": dir_conf,
+        "trigger_confusion_matrix": trig_conf,
+        "trigger_class_prototypes_summary": proto_support,
+        "misses_by_symbol": _top_counter(miss_symbol),
+        "misses_by_regime": _top_counter(miss_regime),
+        "misses_by_actual_trigger": _top_counter(miss_actual_trigger),
+        "misses_by_predicted_trigger": _top_counter(miss_pred_trigger),
+        "misses_by_hold_bucket": _top_counter(miss_hold),
+        "misses_by_return_magnitude_bucket": _top_counter(miss_ret),
+        "confidence_distribution": _confidence_summary(rows),
+        "full_universe_confidence_distribution": _confidence_summary(full_population),
+        "abstained_confidence_distribution": _confidence_summary(abstained_population),
+        "margin_summary": {
+            "trigger_hit_median": round(_median(trig_margin_hits, default=0.0), 6),
+            "trigger_miss_median": round(_median(trig_margin_miss, default=0.0), 6),
+            "direction_hit_median": round(_median(dir_margin_hits, default=0.0), 6),
+            "direction_miss_median": round(_median(dir_margin_miss, default=0.0), 6),
+        },
+        "manual_support_prediction_summary": {
+            "predicted_count": int(manual_predicted),
+            "correct_count": int(manual_correct),
+        },
+        "trailing_support_prediction_summary": {
+            "predicted_count": int(trailing_predicted),
+            "correct_count": int(trailing_correct),
+        },
+        "stale_support_prediction_summary": {
+            "predicted_count": int(stale_predicted),
+            "correct_count": int(stale_correct),
+        },
+        "manual_score_summary": {
+            "predicted_manual_count": int(manual_predicted),
+            "predicted_manual_correct_count": int(manual_correct),
+            "same_symbol_support_max": int(
+                max([int(_f(r.get("manual_same_symbol_support_count", 0.0), 0.0)) for r in rows] or [0])
+            ),
+            "same_regime_support_max": int(
+                max([int(_f(r.get("manual_same_regime_support_count", 0.0), 0.0)) for r in rows] or [0])
+            ),
+        },
+        "stale_vs_trailing_score_margin_examples": stale_vs_trailing_examples,
+        "stale_vs_manual_score_margin_examples": stale_vs_manual_examples,
+        "actual_up_trailing_pred_down_stale_examples": uptrail_downstale,
+        "actual_manual_pred_directional_examples": manual_mispreds,
     }
 
 
@@ -894,10 +1755,13 @@ def run_model_quality_full_pass(
         ci = payload.get("confidence_intervals", {}) if isinstance(payload.get("confidence_intervals", {}), dict) else {}
         worst = payload.get("worst_window_metrics", {}) if isinstance(payload.get("worst_window_metrics", {}), dict) else {}
         meta = payload.get("meta", {}) if isinstance(payload.get("meta", {}), dict) else {}
+        population_diag = payload.get("population_diagnostics", {}) if isinstance(payload.get("population_diagnostics", {}), dict) else {}
         n_windows = int(_f(meta.get("walkforward_windows", 0), 0.0))
         n_test = int(_f(meta.get("test_trades", 0), 0.0))
+        n_full_test = int(_f(meta.get("full_test_trades", n_test), 0.0))
         trig_scored = _f(metrics.get("trigger_scored_trades", 0.0), 0.0)
         trig_cov = _f(metrics.get("trigger_coverage_pct", 0.0), 0.0)
+        admission_rate = _f(population_diag.get("admission_rate_pct", 100.0 if n_test > 0 else 0.0), 0.0)
         blockers: List[str] = []
         for key, need in promotion_thresholds.items():
             got = _f(metrics.get(key, 0.0), 0.0)
@@ -926,6 +1790,10 @@ def run_model_quality_full_pass(
             blockers.append(
                 f"trigger_coverage_insufficient({trig_cov:.2f}%<{float(promotion_minima['min_trigger_coverage_pct']):.2f}%)"
             )
+        if m == "crypto" and admission_rate < float(promotion_minima["min_trigger_coverage_pct"]):
+            blockers.append(
+                f"admission_rate_low({admission_rate:.2f}%<{float(promotion_minima['min_trigger_coverage_pct']):.2f}%)"
+            )
         state = "PASS" if not blockers and _s(row.get("state", "")) == "READY" else "BLOCK"
         promotion_readiness[m] = {
             "state": state,
@@ -934,6 +1802,8 @@ def run_model_quality_full_pass(
             "source": _s(row.get("source", "")),
             "windows": int(n_windows),
             "test_trades": int(n_test),
+            "full_test_trades": int(n_full_test),
+            "admission_rate_pct": round(float(admission_rate), 4),
         }
 
     return {
