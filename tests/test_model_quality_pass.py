@@ -4,9 +4,15 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from app.model_quality_pass import (
+    _generate_stock_historical_replay_closed_trades,
+    _prepare_forex_audit_rows,
+    _crypto_admission_decision,
     _predict_one,
+    _score_with_threshold,
+    build_market_dataset_quality,
     build_closed_trades,
     build_replay_diagnostics,
     build_synthetic_replay_artifact,
@@ -364,6 +370,317 @@ class TestModelQualityPass(unittest.TestCase):
         self.assertEqual(int(payload["population_diagnostics"]["admitted_test_trades"]), 1)
         self.assertEqual(int(payload["population_diagnostics"]["abstained_test_trades"]), 1)
 
+    def test_crypto_policy_admits_strong_manual_below_old_global_threshold(self) -> None:
+        row = {
+            "predicted_confidence": 0.31,
+            "predicted_exit_trigger": "Manual",
+            "trigger_margin": 0.9,
+            "direction_margin": 0.8,
+            "manual_score": 6.0,
+            "stale_score": 5.8,
+            "trailing_score": 4.9,
+            "manual_runner_up_margin": 0.2,
+            "manual_same_symbol_support_count": 2,
+            "manual_same_regime_support_count": 1,
+            "manual_recent_support_count": 2,
+            "manual_symbol_long_hold_ratio": 0.6,
+            "manual_symbol_vs_stale_ratio": 0.4,
+            "manual_symbol_vs_stale_long_hold_ratio": 0.5,
+            "manual_recent_density_40": 0.08,
+        }
+        policy = {
+            "base_conf_min": 0.50,
+            "manual_conf_min": 0.28,
+            "manual_runner_margin_min": -0.25,
+            "manual_trigger_margin_min": 0.25,
+            "manual_dir_margin_min": 0.25,
+            "manual_support_min": 2,
+            "manual_long_hold_ratio_min": 0.20,
+            "manual_vs_stale_ratio_min": 0.10,
+            "manual_vs_stale_long_hold_ratio_min": 0.15,
+            "manual_recent_density_min": 0.02,
+            "manual_signal_votes_min": 3,
+            "manual_score_advantage_min": -0.25,
+        }
+        admit, reason = _crypto_admission_decision(row, policy)
+        self.assertTrue(admit)
+        self.assertEqual(reason, "manual_strong")
+
+    def test_crypto_policy_rejects_weak_manual(self) -> None:
+        row = {
+            "predicted_confidence": 0.31,
+            "predicted_exit_trigger": "Manual",
+            "trigger_margin": 0.2,
+            "direction_margin": 0.1,
+            "manual_score": 5.0,
+            "stale_score": 5.6,
+            "trailing_score": 4.9,
+            "manual_runner_up_margin": -0.6,
+            "manual_same_symbol_support_count": 0,
+            "manual_same_regime_support_count": 0,
+            "manual_recent_support_count": 0,
+            "manual_symbol_long_hold_ratio": 0.05,
+            "manual_symbol_vs_stale_ratio": 0.0,
+            "manual_symbol_vs_stale_long_hold_ratio": 0.0,
+            "manual_recent_density_40": 0.0,
+        }
+        policy = {
+            "base_conf_min": 0.50,
+            "manual_conf_min": 0.28,
+            "manual_runner_margin_min": -0.25,
+            "manual_trigger_margin_min": 0.25,
+            "manual_dir_margin_min": 0.25,
+            "manual_support_min": 2,
+            "manual_long_hold_ratio_min": 0.20,
+            "manual_vs_stale_ratio_min": 0.10,
+            "manual_vs_stale_long_hold_ratio_min": 0.15,
+            "manual_recent_density_min": 0.02,
+            "manual_signal_votes_min": 3,
+            "manual_score_advantage_min": -0.25,
+        }
+        admit, reason = _crypto_admission_decision(row, policy)
+        self.assertFalse(admit)
+        self.assertIn("manual_", reason)
+
+    def test_manual_precision_gate_does_not_reject_all_manual_rows(self) -> None:
+        strong_row = {
+            "predicted_confidence": 0.34,
+            "predicted_exit_trigger": "Manual",
+            "trigger_margin": 1.1,
+            "direction_margin": 0.9,
+            "manual_score": 6.4,
+            "stale_score": 6.1,
+            "trailing_score": 5.0,
+            "manual_runner_up_margin": 0.3,
+            "manual_same_symbol_support_count": 1,
+            "manual_same_regime_support_count": 2,
+            "manual_recent_support_count": 2,
+            "manual_symbol_long_hold_ratio": 0.5,
+            "manual_symbol_vs_stale_ratio": 0.3,
+            "manual_symbol_vs_stale_long_hold_ratio": 0.4,
+            "manual_recent_density_40": 0.07,
+        }
+        policy = {
+            "base_conf_min": 0.50,
+            "manual_conf_min": 0.28,
+            "manual_runner_margin_min": -0.25,
+            "manual_trigger_margin_min": 0.25,
+            "manual_dir_margin_min": 0.25,
+            "manual_support_min": 2,
+            "manual_long_hold_ratio_min": 0.20,
+            "manual_vs_stale_ratio_min": 0.10,
+            "manual_vs_stale_long_hold_ratio_min": 0.15,
+            "manual_recent_density_min": 0.02,
+            "manual_signal_votes_min": 3,
+            "manual_score_advantage_min": -0.25,
+        }
+        admit, _ = _crypto_admission_decision(strong_row, policy)
+        self.assertTrue(admit)
+
+    def test_manual_cannot_be_admitted_from_regime_only_support(self) -> None:
+        row = {
+            "predicted_confidence": 0.34,
+            "predicted_exit_trigger": "Manual",
+            "trigger_margin": 1.0,
+            "direction_margin": 0.8,
+            "manual_score": 6.0,
+            "stale_score": 5.7,
+            "trailing_score": 4.8,
+            "manual_runner_up_margin": 0.3,
+            "manual_same_symbol_support_count": 0,
+            "manual_same_symbol_stale_count": 4,
+            "manual_same_regime_support_count": 5,
+            "manual_recent_support_count": 2,
+            "manual_symbol_long_hold_ratio": 0.35,
+            "manual_symbol_vs_stale_ratio": 0.12,
+            "manual_symbol_vs_stale_long_hold_ratio": 0.20,
+            "manual_recent_density_40": 0.08,
+        }
+        policy = {
+            "manual_mode": "strict",
+            "base_conf_min": 0.50,
+            "manual_conf_min": 0.24,
+            "manual_runner_margin_min": -0.25,
+            "manual_trigger_margin_min": 0.25,
+            "manual_dir_margin_min": 0.25,
+            "manual_support_min": 2,
+            "manual_long_hold_ratio_min": 0.20,
+            "manual_vs_stale_ratio_min": 0.10,
+            "manual_vs_stale_long_hold_ratio_min": 0.15,
+            "manual_recent_density_min": 0.02,
+            "manual_signal_votes_min": 3,
+            "manual_symbol_support_min": 2,
+            "manual_score_advantage_min": -0.10,
+        }
+        admit, reason = _crypto_admission_decision(row, policy)
+        self.assertFalse(admit)
+        self.assertEqual(reason, "manual_regime_only_signal")
+
+    def test_manual_blocked_when_symbol_vs_stale_ratio_low(self) -> None:
+        row = {
+            "predicted_confidence": 0.34,
+            "predicted_exit_trigger": "Manual",
+            "trigger_margin": 1.0,
+            "direction_margin": 0.8,
+            "manual_score": 6.0,
+            "stale_score": 5.7,
+            "trailing_score": 4.8,
+            "manual_runner_up_margin": 0.3,
+            "manual_same_symbol_support_count": 1,
+            "manual_same_symbol_stale_count": 5,
+            "manual_same_regime_support_count": 3,
+            "manual_recent_support_count": 2,
+            "manual_symbol_long_hold_ratio": 0.40,
+            "manual_symbol_vs_stale_ratio": 0.10,
+            "manual_symbol_vs_stale_long_hold_ratio": 0.20,
+            "manual_recent_density_40": 0.08,
+        }
+        policy = {
+            "manual_mode": "strict",
+            "base_conf_min": 0.50,
+            "manual_conf_min": 0.24,
+            "manual_runner_margin_min": -0.25,
+            "manual_trigger_margin_min": 0.25,
+            "manual_dir_margin_min": 0.25,
+            "manual_support_min": 2,
+            "manual_long_hold_ratio_min": 0.20,
+            "manual_vs_stale_ratio_min": 0.25,
+            "manual_vs_stale_long_hold_ratio_min": 0.15,
+            "manual_recent_density_min": 0.02,
+            "manual_signal_votes_min": 3,
+            "manual_symbol_support_min": 2,
+            "manual_score_advantage_min": -0.10,
+        }
+        admit, reason = _crypto_admission_decision(row, policy)
+        self.assertFalse(admit)
+        self.assertEqual(reason, "manual_symbol_vs_stale_low")
+
+    def test_manual_can_be_admitted_with_strong_symbol_level_evidence(self) -> None:
+        row = {
+            "predicted_confidence": 0.34,
+            "predicted_exit_trigger": "Manual",
+            "trigger_margin": 1.2,
+            "direction_margin": 1.0,
+            "manual_score": 6.4,
+            "stale_score": 5.9,
+            "trailing_score": 4.9,
+            "manual_runner_up_margin": 0.5,
+            "manual_same_symbol_support_count": 3,
+            "manual_same_symbol_stale_count": 1,
+            "manual_same_regime_support_count": 2,
+            "manual_recent_support_count": 2,
+            "manual_symbol_long_hold_ratio": 0.60,
+            "manual_symbol_vs_stale_ratio": 0.50,
+            "manual_symbol_vs_stale_long_hold_ratio": 0.60,
+            "manual_recent_density_40": 0.08,
+        }
+        policy = {
+            "manual_mode": "strict",
+            "base_conf_min": 0.50,
+            "manual_conf_min": 0.24,
+            "manual_runner_margin_min": -0.25,
+            "manual_trigger_margin_min": 0.25,
+            "manual_dir_margin_min": 0.25,
+            "manual_support_min": 2,
+            "manual_long_hold_ratio_min": 0.20,
+            "manual_vs_stale_ratio_min": 0.25,
+            "manual_vs_stale_long_hold_ratio_min": 0.35,
+            "manual_recent_density_min": 0.02,
+            "manual_signal_votes_min": 3,
+            "manual_symbol_support_min": 2,
+            "manual_score_advantage_min": -0.10,
+        }
+        admit, reason = _crypto_admission_decision(row, policy)
+        self.assertTrue(admit)
+        self.assertEqual(reason, "manual_strong")
+
+    def test_diagnostic_only_manual_mode_blocks_weak_symbol_evidence(self) -> None:
+        row = {
+            "predicted_confidence": 0.40,
+            "predicted_exit_trigger": "Manual",
+            "trigger_margin": 1.0,
+            "direction_margin": 0.8,
+            "manual_score": 6.0,
+            "stale_score": 5.8,
+            "trailing_score": 4.8,
+            "manual_runner_up_margin": 0.2,
+            "manual_same_symbol_support_count": 1,
+            "manual_same_symbol_stale_count": 4,
+            "manual_same_regime_support_count": 4,
+            "manual_recent_support_count": 2,
+            "manual_symbol_long_hold_ratio": 0.25,
+            "manual_symbol_vs_stale_ratio": 0.20,
+            "manual_symbol_vs_stale_long_hold_ratio": 0.30,
+            "manual_recent_density_40": 0.08,
+        }
+        policy = {
+            "manual_mode": "diagnostic_only",
+            "manual_diag_same_symbol_min": 2,
+            "manual_diag_vs_stale_long_hold_min": 0.45,
+            "manual_conf_min": 0.24,
+            "manual_runner_margin_min": -0.25,
+            "manual_trigger_margin_min": 0.25,
+            "manual_dir_margin_min": 0.25,
+            "manual_support_min": 2,
+            "manual_long_hold_ratio_min": 0.30,
+            "manual_vs_stale_ratio_min": 0.25,
+            "manual_vs_stale_long_hold_ratio_min": 0.35,
+            "manual_recent_density_min": 0.02,
+            "manual_signal_votes_min": 3,
+            "manual_symbol_support_min": 2,
+            "manual_score_advantage_min": -0.10,
+        }
+        admit, reason = _crypto_admission_decision(row, policy)
+        self.assertFalse(admit)
+        self.assertEqual(reason, "manual_diagnostic_only_block")
+
+    def test_crypto_policy_admits_strong_trailing(self) -> None:
+        row = {
+            "predicted_confidence": 0.33,
+            "predicted_exit_trigger": "Trailing",
+            "trigger_margin": 2.8,
+            "direction_margin": 1.5,
+            "trailing_score": 7.0,
+            "stale_score": 5.4,
+        }
+        policy = {
+            "base_conf_min": 0.50,
+            "trailing_conf_min": 0.28,
+            "trailing_trigger_margin_min": 1.75,
+            "trailing_dir_margin_min": 1.0,
+            "trailing_vs_stale_min": -0.10,
+        }
+        admit, reason = _crypto_admission_decision(row, policy)
+        self.assertTrue(admit)
+        self.assertEqual(reason, "trailing_strong")
+
+    def test_crypto_policy_admits_strong_stale(self) -> None:
+        row = {
+            "predicted_confidence": 0.57,
+            "predicted_exit_trigger": "Stale Alignment",
+            "trigger_margin": 3.0,
+            "direction_margin": 2.0,
+        }
+        policy = {
+            "base_conf_min": 0.50,
+            "stale_conf_min": 0.52,
+            "stale_trigger_margin_min": 2.0,
+            "stale_dir_margin_min": 1.25,
+        }
+        admit, reason = _crypto_admission_decision(row, policy)
+        self.assertTrue(admit)
+        self.assertEqual(reason, "stale_strong")
+
+    def test_non_crypto_threshold_behavior_remains_legacy(self) -> None:
+        rows = [
+            {"predicted_confidence": 0.61, "actual_direction": "up", "predicted_direction": "up", "actual_exit_trigger": "Unknown", "predicted_exit_trigger": "Unknown", "entry_price": 1.0, "actual_exit_price": 1.01, "predicted_exit_price": 1.01},
+            {"predicted_confidence": 0.49, "actual_direction": "down", "predicted_direction": "down", "actual_exit_trigger": "Unknown", "predicted_exit_trigger": "Unknown", "entry_price": 1.0, "actual_exit_price": 0.99, "predicted_exit_price": 0.99},
+        ]
+        scored = _score_with_threshold(rows, 0.50, "forex")
+        admitted = scored.get("admitted", [])
+        self.assertEqual(len(admitted), 1)
+        self.assertAlmostEqual(float(scored.get("coverage", 0.0)), 0.5, places=6)
+
     def test_replay_diagnostics_preserve_schema_with_crypto_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             replay_path = os.path.join(td, "openai", "crypto_historical_replay_synthetic.json")
@@ -410,6 +727,159 @@ class TestModelQualityPass(unittest.TestCase):
             headline = out.get("headline_metrics", {}) if isinstance(out.get("headline_metrics", {}), dict) else {}
             self.assertIn("trigger_scored_trades", headline)
             self.assertIn("trigger_coverage_pct", headline)
+
+    def test_policy_frontier_is_generated_and_selected_policy_is_member(self) -> None:
+        closed_rows = []
+        ts = 1_700_000_000
+        for i in range(20):
+            closed_rows.append(
+                {
+                    "symbol": "BTC-USD",
+                    "entry_price": 100.0,
+                    "exit_price": 102.0 + (i * 0.05),
+                    "actual_exit_price": 102.0 + (i * 0.05),
+                    "hold_hours": 4.0,
+                    "actual_exit_trigger": "Trailing",
+                    "entry_ts": ts + (i * 3600),
+                    "exit_ts": ts + (i * 3600) + 7200,
+                }
+            )
+        for i in range(20):
+            closed_rows.append(
+                {
+                    "symbol": "ADA-USD",
+                    "entry_price": 100.0,
+                    "exit_price": 98.0 - (i * 0.05),
+                    "actual_exit_price": 98.0 - (i * 0.05),
+                    "hold_hours": 12.0,
+                    "actual_exit_trigger": "Stale Alignment",
+                    "entry_ts": ts + 100_000 + (i * 3600),
+                    "exit_ts": ts + 100_000 + (i * 3600) + 14_400,
+                }
+            )
+        payload = build_synthetic_replay_artifact("/tmp", "crypto", closed_rows)
+        diag = payload.get("crypto_classifier_diagnostics", {}) if isinstance(payload.get("crypto_classifier_diagnostics", {}), dict) else {}
+        frontier = diag.get("crypto_policy_frontier", [])
+        selected = diag.get("selected_crypto_admission_policy", {})
+        self.assertTrue(frontier)
+        self.assertIn("policy_name", frontier[0])
+        selected_name = payload.get("abstain_policy", {}).get("selected_crypto_policy_name", "")
+        frontier_names = {row.get("policy_name", "") for row in frontier if isinstance(row, dict)}
+        self.assertIn(selected_name, frontier_names)
+        self.assertEqual(selected_name, frontier[0].get("policy_name", selected_name))
+
+    def test_prepare_forex_audit_rows_marks_explicit_stale_exit(self) -> None:
+        rows = [
+            {
+                "ts": 1_700_000_000,
+                "event": "exit",
+                "instrument": "EUR_USD",
+                "qty": 100.0,
+                "price": 1.1,
+                "source": "policy_stale_exit",
+                "msg": "Position close submitted",
+            }
+        ]
+        prepared, diag = _prepare_forex_audit_rows(rows)
+        self.assertEqual(prepared[0].get("tag"), "Stale Alignment")
+        self.assertEqual(int(diag.get("explicit_reason_count", 0)), 1)
+        self.assertEqual(int(diag.get("unknown_trigger_count_after", 0)), 0)
+
+    def test_prepare_forex_audit_rows_infers_nearby_stale_context(self) -> None:
+        rows = [
+            {
+                "ts": 1_700_000_000,
+                "event": "shadow_live_divergence",
+                "msg": "Exited 1 stale forex position(s); waiting one cycle before new entries.",
+            },
+            {
+                "ts": 1_700_000_030,
+                "event": "exit",
+                "instrument": "EUR_USD",
+                "qty": 100.0,
+                "price": 1.1,
+                "msg": "Position close submitted",
+            },
+        ]
+        prepared, diag = _prepare_forex_audit_rows(rows, window_s=120)
+        exit_row = [row for row in prepared if row.get("event") == "exit"][0]
+        self.assertEqual(exit_row.get("tag"), "policy_stale_exit")
+        self.assertEqual(int(diag.get("stale_context_matched_exits", 0)), 1)
+        self.assertEqual(int(diag.get("unknown_trigger_count_after", 0)), 0)
+
+    def test_generate_stock_historical_replay_closed_trades_with_fake_provider(self) -> None:
+        class FakeClient:
+            def get_stock_bars(
+                self,
+                symbol: str,
+                timeframe: str = "1Hour",
+                limit: int = 160,
+                feed: str = "iex",
+                start_iso: str = "",
+                end_iso: str = "",
+            ) -> list[dict]:
+                rows = []
+                base = 100.0
+                for i in range(96):
+                    if i < 24:
+                        close = base + (i * 0.02)
+                    elif i < 48:
+                        close = base + 2.0 + ((i - 24) * 0.22)
+                    elif i < 60:
+                        close = base + 7.0 - ((i - 48) * 0.30)
+                    else:
+                        close = base + 0.8 + ((i - 60) * 0.10)
+                    rows.append({"t": f"2026-05-{1 + (i // 24):02d}T{i % 24:02d}:00:00Z", "c": close})
+                return rows
+
+        with tempfile.TemporaryDirectory() as td:
+            self._write_json(os.path.join(td, "stocks", "stock_universe_cache.json"), {"symbols": ["NVDA", "AAPL"]})
+            with mock.patch("app.model_quality_pass._stock_provider_client", return_value=("alpaca", FakeClient(), {"provider": "alpaca"})):
+                out = _generate_stock_historical_replay_closed_trades(
+                    hub_dir=td,
+                    base_dir=td,
+                    settings={},
+                    existing_closed_rows=[],
+                )
+            rows = out.get("rows", [])
+            diag = out.get("diagnostics", {})
+            self.assertTrue(rows)
+            self.assertEqual(diag.get("source_type"), "historical_api_replay")
+            self.assertEqual(diag.get("provider"), "alpaca")
+            self.assertGreater(int(diag.get("rows_generated", 0)), 0)
+
+    def test_build_market_dataset_quality_reports_crypto_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            self._write_jsonl(
+                os.path.join(td, "crypto", "execution_audit.jsonl"),
+                [
+                    {
+                        "ts": 1_700_000_000,
+                        "event": "entry",
+                        "symbol": "BTC-USD",
+                        "qty": 1.0,
+                        "price": 100.0,
+                        "decision_snapshot_id": "abc123",
+                    }
+                ],
+            )
+            self._write_jsonl(
+                os.path.join(td, "crypto", "decision_snapshots.jsonl"),
+                [
+                    {
+                        "schema_version": 1,
+                        "decision_snapshot_id": "abc123",
+                        "timestamp": 1_700_000_000,
+                        "market": "crypto",
+                        "symbol": "BTC-USD",
+                        "normalized_trigger": "Unknown",
+                    }
+                ],
+            )
+            out = build_market_dataset_quality(td, "crypto")
+            snap = out.get("decision_snapshot_diagnostics", {})
+            self.assertEqual(int(snap.get("decision_snapshots_found", 0)), 1)
+            self.assertEqual(int(snap.get("decision_snapshots_joined", 0)), 1)
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ from app.credential_utils import (
 	normalize_start_allocation_pct,
 )
 from app.automation_policy import build_market_automation_policy
+from app.decision_snapshot import attach_crypto_decision_snapshot
 from app.http_utils import parse_retry_after_value
 from app.opportunity_allocator import evaluate_cross_market_allocation
 from app.path_utils import resolve_runtime_paths, resolve_settings_path, read_settings_file, log_once
@@ -961,6 +962,12 @@ class CryptoAPITrading:
             payload = dict(row or {})
             payload.setdefault("ts", int(time.time()))
             payload.setdefault("date", time.strftime("%Y-%m-%d", time.localtime()))
+            payload = attach_crypto_decision_snapshot(
+                payload,
+                hub_dir=HUB_DATA_DIR,
+                source_module="engines.pt_trader",
+                source_function="_append_execution_audit",
+            )
             os.makedirs(os.path.dirname(CRYPTO_EXECUTION_AUDIT_PATH), exist_ok=True)
             with open(CRYPTO_EXECUTION_AUDIT_PATH, "a", encoding="utf-8") as f:
                 f.write(json.dumps(payload, separators=(",", ":")) + "\n")

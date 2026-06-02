@@ -7,13 +7,16 @@ import math
 import os
 import random
 import time
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from app.confidence_calibration import build_confidence_calibration_payload
+from app.credential_utils import get_alpaca_creds, get_twelvedata_api_key
 from app.regime_classifier import build_all_market_regimes
 from app.settings_utils import sanitize_settings
 from app.shadow_scorecard import build_shadow_scorecards
 from app.walkforward_report import build_walkforward_report
+from brokers.broker_alpaca import AlpacaBrokerClient
+from brokers.broker_twelvedata import TwelveDataClient
 
 
 def _s(value: Any) -> str:
@@ -60,6 +63,166 @@ def _safe_read_jsonl(path: str, max_lines: int = 800000) -> List[Dict[str, Any]]
     except Exception:
         return []
     return out
+
+
+def _ts_from_row(row: Dict[str, Any]) -> int:
+    return int(_f(row.get("ts", row.get("timestamp", 0.0)), 0.0))
+
+
+def _join_text_fields(row: Dict[str, Any], fields: Iterable[str]) -> str:
+    vals: List[str] = []
+    for field in fields:
+        txt = _s(row.get(field, ""))
+        if txt:
+            vals.append(txt)
+    return " | ".join(vals)
+
+
+def _explicit_trigger_label(row: Dict[str, Any]) -> str:
+    reason_fields = (
+        "tag",
+        "source",
+        "exit_reason",
+        "close_reason",
+        "exit_trigger",
+        "trigger",
+        "reason",
+        "decision_reason",
+        "signal_reason",
+        "status",
+        "msg",
+        "message",
+        "note",
+        "why",
+        "normalized_trigger",
+        "raw_rule_reason",
+    )
+    txt = _join_text_fields(row, reason_fields).upper()
+    if not txt:
+        return "Unknown"
+    if "POLICY_STALE_EXIT" in txt or "STALE" in txt or "MISALIGN" in txt or "ALIGNMENT" in txt:
+        return "Stale Alignment"
+    if "TRAIL" in txt:
+        return "Trailing"
+    if "MANUAL" in txt:
+        return "Manual"
+    if "BLOCK" in txt:
+        return "Blocked"
+    if ("AI" in txt) and ("EXIT" in txt or "CLOSE" in txt):
+        return "AI Exit"
+    if ("RISK" in txt) or ("STOP" in txt):
+        return "Risk Cut"
+    if ("TAKE" in txt) or ("PROFIT" in txt):
+        return "Take Profit"
+    return "Unknown"
+
+
+def _prepare_forex_audit_rows(rows: List[Dict[str, Any]], window_s: int = 120) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    prepared: List[Dict[str, Any]] = [dict(row) for row in list(rows or []) if isinstance(row, dict)]
+    exit_rows = [row for row in prepared if _s(row.get("event", "")).lower() == "exit"]
+    stale_contexts: List[Dict[str, Any]] = []
+    explicit_reason_count = 0
+    inferred_stale_count = 0
+    generic_close_count = 0
+    unknown_before = 0
+    unknown_after = 0
+    matched_exits = 0
+
+    for row in prepared:
+        event = _s(row.get("event", "")).lower()
+        msg_txt = _join_text_fields(row, ("msg", "message", "reason", "note", "source")).lower()
+        if event == "shadow_live_divergence" and "stale forex position" in msg_txt:
+            count = 1
+            for tok in msg_txt.split():
+                if tok.isdigit():
+                    count = max(1, int(tok))
+                    break
+            stale_contexts.append({"ts": _ts_from_row(row), "remaining": count, "row": row})
+
+    for row in exit_rows:
+        label_before = _explicit_trigger_label(row)
+        if label_before == "Unknown":
+            unknown_before += 1
+        else:
+            explicit_reason_count += 1
+            row.setdefault("tag", label_before)
+            row.setdefault("event_exit_tag", f"explicit:{_s(row.get('source', '')) or _s(row.get('tag', ''))}")
+            continue
+        generic_close_count += 1
+        ts = _ts_from_row(row)
+        best_idx = -1
+        best_dist = 10**12
+        for idx, ctx in enumerate(stale_contexts):
+            if int(ctx.get("remaining", 0) or 0) <= 0:
+                continue
+            dist = abs(int(ctx.get("ts", 0) or 0) - ts)
+            if dist <= int(window_s) and dist < best_dist:
+                best_idx = idx
+                best_dist = dist
+        if best_idx >= 0:
+            stale_contexts[best_idx]["remaining"] = int(stale_contexts[best_idx].get("remaining", 0) or 0) - 1
+            row["tag"] = "policy_stale_exit"
+            row["event_exit_tag"] = "inferred: nearby stale forex exit context"
+            row["inferred_trigger_reason"] = "nearby_stale_context"
+            row["inferred_trigger_distance_s"] = int(best_dist)
+            inferred_stale_count += 1
+            matched_exits += 1
+
+    for row in exit_rows:
+        if _explicit_trigger_label(row) == "Unknown":
+            unknown_after += 1
+
+    diagnostics = {
+        "matching_window_seconds": int(window_s),
+        "forex_exit_rows": int(len(exit_rows)),
+        "forex_stale_context_rows": int(len(stale_contexts)),
+        "stale_context_matched_exits": int(matched_exits),
+        "unmatched_generic_close_count": int(max(0, generic_close_count - matched_exits)),
+        "explicit_reason_count": int(explicit_reason_count),
+        "inferred_stale_count": int(inferred_stale_count),
+        "unknown_trigger_count_before": int(unknown_before),
+        "unknown_trigger_count_after": int(unknown_after),
+    }
+    return prepared, diagnostics
+
+
+def _crypto_snapshot_diagnostics(hub_dir: str, events: List[Dict[str, Any]]) -> Dict[str, Any]:
+    path = os.path.join(hub_dir, "crypto", "decision_snapshots.jsonl")
+    rows = _safe_read_jsonl(path, max_lines=200000)
+    if not rows:
+        return {
+            "decision_snapshots_found": 0,
+            "decision_snapshots_joined": 0,
+            "snapshot_join_rate_pct": 0.0,
+            "missing_snapshot_count": int(len(events)),
+            "snapshot_schema_version": 0,
+            "top_snapshot_trigger_reasons": {},
+            "path": path,
+        }
+    schema_version = int(_f(rows[-1].get("schema_version", 0), 0.0))
+    by_id = {
+        _s(row.get("decision_snapshot_id", "")): row
+        for row in rows
+        if _s(row.get("decision_snapshot_id", ""))
+    }
+    joined = 0
+    for event in list(events or []):
+        if _s((event.get("raw", {}) if isinstance(event.get("raw", {}), dict) else {}).get("decision_snapshot_id", "")) in by_id:
+            joined += 1
+    reason_counts: Dict[str, int] = {}
+    for row in rows:
+        reason = _s(row.get("normalized_trigger", "")) or _s(row.get("raw_rule_reason", "")) or "Unknown"
+        reason_counts[reason] = int(reason_counts.get(reason, 0) + 1)
+    total = len(events)
+    return {
+        "decision_snapshots_found": int(len(rows)),
+        "decision_snapshots_joined": int(joined),
+        "snapshot_join_rate_pct": round(100.0 * float(joined) / float(max(1, total)), 4),
+        "missing_snapshot_count": int(max(0, total - joined)),
+        "snapshot_schema_version": int(schema_version),
+        "top_snapshot_trigger_reasons": _top_counter(reason_counts, limit=12),
+        "path": path,
+    }
 
 
 def _norm_exit_trigger(tag: str) -> str:
@@ -154,10 +317,13 @@ def load_market_trade_events(hub_dir: str, market: str) -> Dict[str, Any]:
         paths = [os.path.join(hub_dir, m, "execution_audit.jsonl")]
     rows: List[Dict[str, Any]] = []
     source = ""
+    diagnostics: Dict[str, Any] = {}
     for path in paths:
         src_rows = _safe_read_jsonl(path)
         if not src_rows:
             continue
+        if m == "forex":
+            src_rows, diagnostics = _prepare_forex_audit_rows(src_rows)
         if m == "crypto" and path.endswith("trade_history.jsonl"):
             # trade_history rows use side rather than event.
             converted: List[Dict[str, Any]] = []
@@ -180,7 +346,13 @@ def load_market_trade_events(hub_dir: str, market: str) -> Dict[str, Any]:
             source = path
 
     rows.sort(key=lambda r: int(r.get("ts", 0)))
-    return {"market": m, "state": "READY" if rows else "NO_DATA", "source": source, "events": rows}
+    return {
+        "market": m,
+        "state": "READY" if rows else "NO_DATA",
+        "source": source,
+        "events": rows,
+        "diagnostics": diagnostics,
+    }
 
 
 def _derive_entry_price_from_exit(row: Dict[str, Any], market: str) -> float:
@@ -322,6 +494,7 @@ def build_closed_trades(events: Iterable[Dict[str, Any]], market: str = "") -> D
 def build_market_dataset_quality(hub_dir: str, market: str) -> Dict[str, Any]:
     loaded = load_market_trade_events(hub_dir, market)
     events = loaded.get("events", []) if isinstance(loaded.get("events", []), list) else []
+    diagnostics = loaded.get("diagnostics", {}) if isinstance(loaded.get("diagnostics", {}), dict) else {}
     event_ids: Dict[str, int] = {}
     duplicate_events = 0
     entries = 0
@@ -365,7 +538,7 @@ def build_market_dataset_quality(hub_dir: str, market: str) -> Dict[str, Any]:
     closed_info = build_closed_trades(events, _s(market).lower())
     closed = closed_info.get("closed_trades", []) if isinstance(closed_info.get("closed_trades", []), list) else []
     holds_non_positive = sum(1 for r in closed if _f(r.get("hold_hours", 0.0), 0.0) <= 0.0)
-    return {
+    out = {
         "market": _s(market).lower(),
         "state": _s(loaded.get("state", "NO_DATA")) or "NO_DATA",
         "source": _s(loaded.get("source", "")),
@@ -382,6 +555,11 @@ def build_market_dataset_quality(hub_dir: str, market: str) -> Dict[str, Any]:
         "orphan_exit_qty": round(_f(closed_info.get("orphan_exit_qty", 0.0), 0.0), 8),
         "open_lot_qty": round(_f(closed_info.get("open_lot_qty", 0.0), 0.0), 8),
     }
+    if diagnostics:
+        out["context_diagnostics"] = diagnostics
+    if _s(market).lower() == "crypto":
+        out["decision_snapshot_diagnostics"] = _crypto_snapshot_diagnostics(hub_dir, events)
+    return out
 
 
 def _write_jsonl(path: str, rows: Iterable[Dict[str, Any]]) -> str:
@@ -785,11 +963,13 @@ def _crypto_manual_signals(
         "manual_recent_support_count": float(len(recent_manual_40)),
         "manual_recent80_support_count": float(len(recent_manual_80)),
         "manual_same_symbol_support_count": float(len(symbol_manual_rows)),
+        "manual_same_symbol_stale_count": float(len(symbol_stale_rows)),
         "manual_same_regime_support_count": float(len(regime_manual_rows)),
         "manual_symbol_recent_support_count": float(len(symbol_recent_manual)),
         "manual_recent_density_40": ratio(len(recent_manual_40), len(recent40)),
         "manual_recent_density_80": ratio(len(recent_manual_80), len(recent80)),
         "manual_symbol_long_hold_ratio": ratio(len(long_symbol_manual), len(long_symbol_rows)),
+        "manual_symbol_long_hold_stale_count": float(len(long_symbol_stale)),
         "manual_symbol_vs_stale_long_hold_ratio": ratio(len(long_symbol_manual), len(long_symbol_manual) + len(long_symbol_stale)),
         "manual_symbol_vs_stale_ratio": ratio(len(symbol_manual_rows), len(symbol_manual_rows) + len(symbol_stale_rows)),
     }
@@ -1051,8 +1231,16 @@ def _crypto_predict_one(
         "manual_outcome_note": ";".join(sorted(set(manual_reasons))) if manual_reasons else ("manual_won" if pred_trig == "Manual" else ""),
         "manual_prior_support_count": int(_f(manual_signals.get("manual_prior_support_count", 0.0), 0.0)),
         "manual_recent_support_count": int(_f(manual_signals.get("manual_recent_support_count", 0.0), 0.0)),
+        "manual_recent80_support_count": int(_f(manual_signals.get("manual_recent80_support_count", 0.0), 0.0)),
         "manual_same_symbol_support_count": int(_f(manual_signals.get("manual_same_symbol_support_count", 0.0), 0.0)),
+        "manual_same_symbol_stale_count": int(_f(manual_signals.get("manual_same_symbol_stale_count", 0.0), 0.0)),
         "manual_same_regime_support_count": int(_f(manual_signals.get("manual_same_regime_support_count", 0.0), 0.0)),
+        "manual_symbol_long_hold_ratio": round(_f(manual_signals.get("manual_symbol_long_hold_ratio", 0.0), 0.0), 6),
+        "manual_symbol_long_hold_stale_count": int(_f(manual_signals.get("manual_symbol_long_hold_stale_count", 0.0), 0.0)),
+        "manual_symbol_vs_stale_ratio": round(_f(manual_signals.get("manual_symbol_vs_stale_ratio", 0.0), 0.0), 6),
+        "manual_symbol_vs_stale_long_hold_ratio": round(_f(manual_signals.get("manual_symbol_vs_stale_long_hold_ratio", 0.0), 0.0), 6),
+        "manual_recent_density_40": round(_f(manual_signals.get("manual_recent_density_40", 0.0), 0.0), 6),
+        "manual_recent_density_80": round(_f(manual_signals.get("manual_recent_density_80", 0.0), 0.0), 6),
         "trigger_prototype_support": {
             k: {
                 "support_count": int(v.get("support_count", 0) or 0),
@@ -1150,6 +1338,324 @@ def _objective_score(metrics: Dict[str, Any], market: str) -> float:
     return (0.40 * d) + (0.35 * t) + (0.25 * p)
 
 
+def _bucket_probability(value: float) -> str:
+    if value < 0.25:
+        return "<0.25"
+    if value < 0.40:
+        return "0.25-0.40"
+    if value < 0.55:
+        return "0.40-0.55"
+    if value < 0.70:
+        return "0.55-0.70"
+    return "0.70+"
+
+
+def _bucket_margin_value(value: float) -> str:
+    if value < 0.5:
+        return "<0.5"
+    if value < 1.5:
+        return "0.5-1.5"
+    if value < 3.0:
+        return "1.5-3.0"
+    if value < 5.0:
+        return "3.0-5.0"
+    return "5.0+"
+
+
+def _trigger_precision(rows: List[Dict[str, Any]], trigger: str) -> Dict[str, float]:
+    preds = [r for r in rows if _s(r.get("predicted_exit_trigger", "")) == trigger]
+    correct = [r for r in preds if _s(r.get("actual_exit_trigger", "")) == trigger]
+    return {
+        "predicted_count": float(len(preds)),
+        "correct_count": float(len(correct)),
+        "incorrect_count": float(max(0, len(preds) - len(correct))),
+        "precision_pct": round(100.0 * len(correct) / max(1, len(preds)), 4),
+    }
+
+
+def _policy_name(policy: Dict[str, Any]) -> str:
+    manual_mode = _s(policy.get("manual_mode", "strict")) or "strict"
+    trailing_mode = _s(policy.get("trailing_mode", "high_margin")) or "high_margin"
+    if manual_mode == "diagnostic_only":
+        return f"stale+{trailing_mode}+manual_diagnostic_only"
+    if manual_mode == "off":
+        return f"stale+{trailing_mode}+manual_off"
+    return f"stale+{trailing_mode}+manual_strict"
+
+
+def _next_required_features() -> List[str]:
+    return [
+        "persist live decision snapshot at entry and exit time",
+        "store exit-rule reason directly on every exit row",
+        "store stale/trailing/manual scores from live strategy engine",
+        "store candle/context features at entry time",
+        "build historical candle replay using the same crypto strategy logic",
+        "retain signal-state features used by the UI/trader at the time of the decision",
+    ]
+
+
+def _manual_prediction_diagnostics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    manual_rows = [r for r in rows if _s(r.get("predicted_exit_trigger", "")) == "Manual"]
+    correct = [r for r in manual_rows if _s(r.get("actual_exit_trigger", "")) == "Manual"]
+    incorrect = [r for r in manual_rows if _s(r.get("actual_exit_trigger", "")) != "Manual"]
+
+    def bucket_counts(items: List[Dict[str, Any]], field: str, bucketer: Any) -> Dict[str, int]:
+        return _count_by(items, lambda r: bucketer(_f(r.get(field, 0.0), 0.0)))
+
+    def raw_counts(items: List[Dict[str, Any]], field: str) -> Dict[str, int]:
+        return _count_by(items, lambda r: _s(r.get(field, "")) or "0")
+
+    return {
+        "predicted_count": int(len(manual_rows)),
+        "correct_count": int(len(correct)),
+        "incorrect_count": int(len(incorrect)),
+        "precision_pct": round(100.0 * len(correct) / max(1, len(manual_rows)), 4),
+        "by_symbol": {
+            "correct": _count_by(correct, lambda r: _s(r.get("symbol", "")) or "UNKNOWN"),
+            "incorrect": _count_by(incorrect, lambda r: _s(r.get("symbol", "")) or "UNKNOWN"),
+        },
+        "by_regime": {
+            "correct": _count_by(correct, lambda r: _s(r.get("regime", "")) or "unknown"),
+            "incorrect": _count_by(incorrect, lambda r: _s(r.get("regime", "")) or "unknown"),
+        },
+        "manual_score_buckets": {
+            "correct": bucket_counts(correct, "manual_score", _bucket_margin_value),
+            "incorrect": bucket_counts(incorrect, "manual_score", _bucket_margin_value),
+        },
+        "manual_runner_up_margin_buckets": {
+            "correct": bucket_counts(correct, "manual_runner_up_margin", _bucket_margin_value),
+            "incorrect": bucket_counts(incorrect, "manual_runner_up_margin", _bucket_margin_value),
+        },
+        "trigger_margin_buckets": {
+            "correct": bucket_counts(correct, "trigger_margin", _bucket_margin_value),
+            "incorrect": bucket_counts(incorrect, "trigger_margin", _bucket_margin_value),
+        },
+        "direction_margin_buckets": {
+            "correct": bucket_counts(correct, "direction_margin", _bucket_margin_value),
+            "incorrect": bucket_counts(incorrect, "direction_margin", _bucket_margin_value),
+        },
+        "predicted_confidence_buckets": {
+            "correct": bucket_counts(correct, "predicted_confidence", _bucket_probability),
+            "incorrect": bucket_counts(incorrect, "predicted_confidence", _bucket_probability),
+        },
+        "same_symbol_support_buckets": {
+            "correct": raw_counts(correct, "manual_same_symbol_support_count"),
+            "incorrect": raw_counts(incorrect, "manual_same_symbol_support_count"),
+        },
+        "same_regime_support_buckets": {
+            "correct": raw_counts(correct, "manual_same_regime_support_count"),
+            "incorrect": raw_counts(incorrect, "manual_same_regime_support_count"),
+        },
+        "recent_support_buckets": {
+            "correct": raw_counts(correct, "manual_recent_support_count"),
+            "incorrect": raw_counts(incorrect, "manual_recent_support_count"),
+        },
+        "long_hold_ratio_buckets": {
+            "correct": bucket_counts(correct, "manual_symbol_long_hold_ratio", _bucket_probability),
+            "incorrect": bucket_counts(incorrect, "manual_symbol_long_hold_ratio", _bucket_probability),
+        },
+        "vs_stale_ratio_buckets": {
+            "correct": bucket_counts(correct, "manual_symbol_vs_stale_ratio", _bucket_probability),
+            "incorrect": bucket_counts(incorrect, "manual_symbol_vs_stale_ratio", _bucket_probability),
+        },
+        "vs_stale_long_hold_ratio_buckets": {
+            "correct": bucket_counts(correct, "manual_symbol_vs_stale_long_hold_ratio", _bucket_probability),
+            "incorrect": bucket_counts(incorrect, "manual_symbol_vs_stale_long_hold_ratio", _bucket_probability),
+        },
+        "outcome_notes": {
+            "correct": _count_by(correct, lambda r: _s(r.get("manual_outcome_note", "")) or "none"),
+            "incorrect": _count_by(incorrect, lambda r: _s(r.get("manual_outcome_note", "")) or "none"),
+        },
+    }
+
+
+def _crypto_admission_decision(row: Dict[str, Any], policy: Dict[str, Any]) -> Tuple[bool, str]:
+    pred_trigger = _s(row.get("predicted_exit_trigger", "")) or "Unknown"
+    conf = _f(row.get("predicted_confidence", 0.0), 0.0)
+    trig_margin = _f(row.get("trigger_margin", 0.0), 0.0)
+    dir_margin = _f(row.get("direction_margin", 0.0), 0.0)
+    manual_margin = _f(row.get("manual_runner_up_margin", -1e9), -1e9)
+    manual_same_symbol = int(_f(row.get("manual_same_symbol_support_count", 0.0), 0.0))
+    manual_same_symbol_stale = int(_f(row.get("manual_same_symbol_stale_count", 0.0), 0.0))
+    manual_same_regime = int(_f(row.get("manual_same_regime_support_count", 0.0), 0.0))
+    manual_recent = int(_f(row.get("manual_recent_support_count", 0.0), 0.0))
+    manual_long_hold_ratio = _f(row.get("manual_symbol_long_hold_ratio", 0.0), 0.0)
+    manual_vs_stale_ratio = _f(row.get("manual_symbol_vs_stale_ratio", 0.0), 0.0)
+    manual_vs_stale_long_hold_ratio = _f(row.get("manual_symbol_vs_stale_long_hold_ratio", 0.0), 0.0)
+    manual_recent_density = _f(row.get("manual_recent_density_40", 0.0), 0.0)
+    stale_score = _f(row.get("stale_score", 0.0), 0.0)
+    trailing_score = _f(row.get("trailing_score", 0.0), 0.0)
+    manual_score = _f(row.get("manual_score", 0.0), 0.0)
+    base_floor = _f(policy.get("base_conf_min", 0.55), 0.55)
+
+    if pred_trigger == "Stale Alignment":
+        if conf < max(base_floor, _f(policy.get("stale_conf_min", 0.56), 0.56)):
+            return False, "stale_conf_low"
+        if trig_margin < _f(policy.get("stale_trigger_margin_min", 2.5), 2.5):
+            return False, "stale_trigger_margin_low"
+        if dir_margin < _f(policy.get("stale_dir_margin_min", 1.75), 1.75):
+            return False, "stale_direction_margin_low"
+        return True, "stale_strong"
+
+    if pred_trigger == "Trailing":
+        if conf < _f(policy.get("trailing_conf_min", 0.30), 0.30):
+            return False, "trailing_conf_low"
+        if trig_margin < _f(policy.get("trailing_trigger_margin_min", 2.25), 2.25):
+            return False, "trailing_trigger_margin_low"
+        if dir_margin < _f(policy.get("trailing_dir_margin_min", 1.25), 1.25):
+            return False, "trailing_direction_margin_low"
+        if trailing_score < (stale_score + _f(policy.get("trailing_vs_stale_min", 0.0), 0.0)):
+            return False, "trailing_score_not_clear"
+        return True, "trailing_strong"
+
+    if pred_trigger == "Manual":
+        if _s(policy.get("manual_mode", "strict")) == "off":
+            return False, "manual_mode_off"
+        if _s(policy.get("manual_mode", "strict")) == "diagnostic_only":
+            diag_same_symbol_min = int(_f(policy.get("manual_diag_same_symbol_min", 2.0), 2.0))
+            diag_ratio_min = _f(policy.get("manual_diag_vs_stale_long_hold_min", 0.45), 0.45)
+            if manual_same_symbol < diag_same_symbol_min and manual_vs_stale_long_hold_ratio < diag_ratio_min:
+                return False, "manual_diagnostic_only_block"
+        if conf < _f(policy.get("manual_conf_min", 0.30), 0.30):
+            return False, "manual_conf_low"
+        if manual_margin < _f(policy.get("manual_runner_margin_min", -0.35), -0.35):
+            return False, "manual_runner_margin_low"
+        if trig_margin < _f(policy.get("manual_trigger_margin_min", 0.50), 0.50):
+            return False, "manual_trigger_margin_low"
+        if dir_margin < _f(policy.get("manual_dir_margin_min", 0.50), 0.50):
+            return False, "manual_direction_margin_low"
+        support_score = manual_same_symbol + manual_same_regime + min(2, manual_recent)
+        if support_score < int(_f(policy.get("manual_support_min", 2.0), 2.0)):
+            return False, "manual_symbol_support_low"
+        if manual_same_symbol <= 0 and manual_same_regime > 0:
+            return False, "manual_regime_only_signal"
+        if manual_long_hold_ratio < _f(policy.get("manual_long_hold_ratio_min", 0.20), 0.20):
+            return False, "manual_long_hold_signal_low"
+        if manual_vs_stale_ratio < _f(policy.get("manual_vs_stale_ratio_min", 0.10), 0.10):
+            return False, "manual_symbol_vs_stale_low"
+        if manual_vs_stale_long_hold_ratio < _f(policy.get("manual_vs_stale_long_hold_ratio_min", 0.15), 0.15):
+            return False, "manual_long_hold_vs_stale_low"
+        if manual_recent_density < _f(policy.get("manual_recent_density_min", 0.02), 0.02):
+            return False, "manual_recent_density_low"
+        if manual_vs_stale_ratio < 0.25 and manual_same_symbol < int(_f(policy.get("manual_symbol_support_min", 2.0), 2.0)):
+            return False, "manual_symbol_support_low"
+        if manual_vs_stale_ratio < 0.25 and manual_same_symbol_stale > manual_same_symbol:
+            return False, "manual_stale_symbol_dominance"
+        if manual_score < max(stale_score, trailing_score) + _f(policy.get("manual_score_advantage_min", -0.25), -0.25):
+            return False, "manual_score_not_clear"
+        independent_signals = 0
+        independent_signals += 1 if manual_same_symbol > 0 else 0
+        independent_signals += 1 if manual_same_regime > 0 else 0
+        independent_signals += 1 if manual_recent > 0 else 0
+        independent_signals += 1 if manual_long_hold_ratio >= _f(policy.get("manual_long_hold_ratio_min", 0.20), 0.20) else 0
+        independent_signals += 1 if manual_vs_stale_ratio >= _f(policy.get("manual_vs_stale_ratio_min", 0.10), 0.10) else 0
+        if independent_signals < int(_f(policy.get("manual_signal_votes_min", 3.0), 3.0)):
+            return False, "manual_precision_gate_failed"
+        return True, "manual_strong"
+
+    if conf >= base_floor:
+        return True, "fallback_confident"
+    return False, "fallback_conf_low"
+
+
+def _score_crypto_with_policy(rows: List[Dict[str, Any]], policy: Dict[str, Any]) -> Dict[str, Any]:
+    admitted: List[Dict[str, Any]] = []
+    abstained: List[Dict[str, Any]] = []
+    reason_counts: Dict[str, int] = {}
+    for row in rows:
+        admit, reason = _crypto_admission_decision(row, policy)
+        tagged = dict(row)
+        tagged["admission_reason"] = reason
+        reason_counts[reason] = int(reason_counts.get(reason, 0) + 1)
+        if admit:
+            admitted.append(tagged)
+        else:
+            abstained.append(tagged)
+    metrics = _metrics_for_rows(admitted)
+    full_metrics = _metrics_for_rows(rows)
+    abstained_metrics = _metrics_for_rows(abstained)
+    coverage = (len(admitted) / max(1, len(rows))) if rows else 0.0
+    score = _objective_score(metrics, "crypto")
+    predicted_manual = sum(1 for r in rows if _s(r.get("predicted_exit_trigger", "")) == "Manual")
+    predicted_trailing = sum(1 for r in rows if _s(r.get("predicted_exit_trigger", "")) == "Trailing")
+    admitted_manual = sum(1 for r in admitted if _s(r.get("predicted_exit_trigger", "")) == "Manual")
+    admitted_trailing = sum(1 for r in admitted if _s(r.get("predicted_exit_trigger", "")) == "Trailing")
+    manual_precision = _trigger_precision(admitted, "Manual")
+    trailing_precision = _trigger_precision(admitted, "Trailing")
+    stale_precision = _trigger_precision(admitted, "Stale Alignment")
+    worst_floor = min(
+        _f(metrics.get("directional_accuracy_pct", 0.0), 0.0),
+        _f(metrics.get("trigger_match_pct", 0.0), 0.0),
+        _f(metrics.get("pnl_trend_match_pct", 0.0), 0.0),
+    )
+    if coverage < _f(policy.get("coverage_target", 0.40), 0.40):
+        score -= (_f(policy.get("coverage_target", 0.40), 0.40) - coverage) * 110.0
+    if len(admitted) < int(_f(policy.get("min_admitted_trades", 40.0), 40.0)):
+        score -= float(int(_f(policy.get("min_admitted_trades", 40.0), 40.0)) - len(admitted)) * 0.45
+    trig_scored = _f(metrics.get("trigger_scored_trades", 0.0), 0.0)
+    if trig_scored < _f(policy.get("min_trigger_scored", 20.0), 20.0):
+        score -= (_f(policy.get("min_trigger_scored", 20.0), 20.0) - trig_scored) * 0.75
+    if predicted_manual > 0 and admitted_manual <= 0:
+        score -= 12.0
+    if admitted_manual > 0:
+        target = _f(policy.get("manual_precision_target_pct", 75.0), 75.0)
+        got = _f(manual_precision.get("precision_pct", 0.0), 0.0)
+        if got < target:
+            score -= (target - got) * 0.60
+        if admitted_manual == predicted_manual and predicted_manual >= 3 and got < 100.0:
+            score -= 6.0
+    if predicted_trailing > 0 and admitted_trailing < max(1, int(math.ceil(predicted_trailing * _f(policy.get("min_trailing_admit_ratio", 0.35), 0.35)))):
+        score -= 8.0
+    if admitted_trailing > 0:
+        target = _f(policy.get("trailing_precision_target_pct", 65.0), 65.0)
+        got = _f(trailing_precision.get("precision_pct", 0.0), 0.0)
+        if got < target:
+            score -= (target - got) * 0.35
+    worst_target = _f(policy.get("worst_window_floor_target_pct", 85.0), 85.0)
+    if worst_floor < worst_target:
+        score -= (worst_target - worst_floor) * 0.45
+    return {
+        "score": score,
+        "coverage": coverage,
+        "metrics": metrics,
+        "full_metrics": full_metrics,
+        "abstained_metrics": abstained_metrics,
+        "admitted": admitted,
+        "abstained": abstained,
+        "reason_counts": reason_counts,
+        "policy": dict(policy),
+        "class_precision": {
+            "Manual": manual_precision,
+            "Trailing": trailing_precision,
+            "Stale Alignment": stale_precision,
+        },
+    }
+
+
+def _frontier_candidate_summary(policy: Dict[str, Any], row: Dict[str, Any]) -> Dict[str, Any]:
+    metrics = row.get("metrics", {}) if isinstance(row.get("metrics", {}), dict) else {}
+    class_precision = row.get("class_precision", {}) if isinstance(row.get("class_precision", {}), dict) else {}
+    admitted = row.get("admitted", []) if isinstance(row.get("admitted", []), list) else []
+    return {
+        "policy_name": _policy_name(policy),
+        "policy": dict(policy),
+        "score": round(_f(row.get("score", 0.0), 0.0), 6),
+        "admitted_trades": int(len(admitted)),
+        "admission_rate_pct": round(100.0 * _f(row.get("coverage", 0.0), 0.0), 4),
+        "directional_accuracy_pct": _f(metrics.get("directional_accuracy_pct", 0.0), 0.0),
+        "trigger_match_pct": _f(metrics.get("trigger_match_pct", 0.0), 0.0),
+        "pnl_trend_match_pct": _f(metrics.get("pnl_trend_match_pct", 0.0), 0.0),
+        "worst_window_metrics": {},
+        "class_precision": class_precision,
+        "class_counts": {
+            "Stale Alignment": int(sum(1 for r in admitted if _s(r.get("predicted_exit_trigger", "")) == "Stale Alignment")),
+            "Trailing": int(sum(1 for r in admitted if _s(r.get("predicted_exit_trigger", "")) == "Trailing")),
+            "Manual": int(sum(1 for r in admitted if _s(r.get("predicted_exit_trigger", "")) == "Manual")),
+        },
+        "blockers": [],
+    }
+
+
 def _score_with_threshold(rows: List[Dict[str, Any]], threshold: float, market: str) -> Dict[str, Any]:
     admitted = [r for r in rows if _f(r.get("predicted_confidence", 0.0), 0.0) >= float(threshold)]
     abstained = [r for r in rows if _f(r.get("predicted_confidence", 0.0), 0.0) < float(threshold)]
@@ -1172,6 +1678,186 @@ def _score_with_threshold(rows: List[Dict[str, Any]], threshold: float, market: 
 
 
 def _calibrate_abstain_threshold(train_rows: List[Dict[str, Any]], market: str) -> Dict[str, Any]:
+    if _s(market).lower() == "crypto":
+        if len(train_rows) < 24:
+            policy = {
+                "base_conf_min": 0.50,
+                "stale_conf_min": 0.56,
+                "stale_trigger_margin_min": 2.5,
+                "stale_dir_margin_min": 1.75,
+                "trailing_conf_min": 0.30,
+                "trailing_trigger_margin_min": 2.25,
+                "trailing_dir_margin_min": 1.25,
+                "trailing_vs_stale_min": 0.0,
+                "manual_conf_min": 0.30,
+                "manual_runner_margin_min": -0.35,
+                "manual_trigger_margin_min": 0.50,
+                "manual_dir_margin_min": 0.50,
+                "manual_support_min": 2,
+                "manual_long_hold_ratio_min": 0.20,
+                "manual_vs_stale_ratio_min": 0.10,
+                "manual_vs_stale_long_hold_ratio_min": 0.15,
+                "manual_recent_density_min": 0.02,
+                "manual_signal_votes_min": 3,
+                "manual_score_advantage_min": -0.25,
+                "manual_precision_target_pct": 75.0,
+                "trailing_precision_target_pct": 65.0,
+                "worst_window_floor_target_pct": 85.0,
+                "coverage_target": 0.40,
+                "min_admitted_trades": 40,
+                "min_trigger_scored": 20,
+                "min_trailing_admit_ratio": 0.35,
+            }
+            return {"policy": policy, "coverage": 1.0, "metrics": _metrics_for_rows(train_rows)}
+        split = max(12, int(len(train_rows) * 0.70))
+        base = train_rows[:split]
+        val = train_rows[split:]
+        pred_val: List[Dict[str, Any]] = []
+        running = list(base)
+        for row in val:
+            regime = _regime_from_prior(running)
+            pred = _predict_one(train_rows=running, candidate=row, regime=regime, market=market)
+            merged = dict(row)
+            merged.update(pred)
+            pred_val.append(merged)
+            running.append(row)
+        policies: List[Dict[str, Any]] = []
+        for trailing_conf in [0.24, 0.28]:
+            policies.append(
+                {
+                    "base_conf_min": 0.50,
+                    "stale_conf_min": 0.52,
+                    "stale_trigger_margin_min": 2.0,
+                    "stale_dir_margin_min": 1.25,
+                    "trailing_conf_min": trailing_conf,
+                    "trailing_trigger_margin_min": 1.75,
+                    "trailing_dir_margin_min": 1.0,
+                    "trailing_vs_stale_min": -0.10,
+                    "manual_mode": "off",
+                    "manual_precision_target_pct": 75.0,
+                    "trailing_precision_target_pct": 65.0,
+                    "worst_window_floor_target_pct": 85.0,
+                    "coverage_target": 0.40,
+                    "min_admitted_trades": 40,
+                    "min_trigger_scored": 20,
+                    "min_trailing_admit_ratio": 0.35,
+                    "trailing_mode": "high_margin",
+                }
+            )
+            policies.append(
+                {
+                    "base_conf_min": 0.50,
+                    "stale_conf_min": 0.52,
+                    "stale_trigger_margin_min": 2.0,
+                    "stale_dir_margin_min": 1.25,
+                    "trailing_conf_min": trailing_conf,
+                    "trailing_trigger_margin_min": 1.75,
+                    "trailing_dir_margin_min": 1.0,
+                    "trailing_vs_stale_min": -0.10,
+                    "manual_mode": "diagnostic_only",
+                    "manual_diag_same_symbol_min": 2,
+                    "manual_diag_vs_stale_long_hold_min": 0.45,
+                    "manual_conf_min": 0.24,
+                    "manual_runner_margin_min": -0.25,
+                    "manual_trigger_margin_min": 0.25,
+                    "manual_dir_margin_min": 0.25,
+                    "manual_support_min": 2,
+                    "manual_long_hold_ratio_min": 0.30,
+                    "manual_vs_stale_ratio_min": 0.25,
+                    "manual_vs_stale_long_hold_ratio_min": 0.35,
+                    "manual_recent_density_min": 0.02,
+                    "manual_signal_votes_min": 3,
+                    "manual_symbol_support_min": 2,
+                    "manual_score_advantage_min": -0.10,
+                    "manual_precision_target_pct": 75.0,
+                    "trailing_precision_target_pct": 65.0,
+                    "worst_window_floor_target_pct": 85.0,
+                    "coverage_target": 0.40,
+                    "min_admitted_trades": 40,
+                    "min_trigger_scored": 20,
+                    "min_trailing_admit_ratio": 0.35,
+                    "trailing_mode": "high_margin",
+                }
+            )
+        for stale_conf in [0.52, 0.56]:
+            for trailing_conf in [0.24, 0.28]:
+                for manual_conf in [0.24, 0.28]:
+                    for manual_support in [2, 3]:
+                        for manual_margin in [-0.25, 0.0]:
+                            for manual_long_hold_min in [0.30, 0.40]:
+                                for manual_votes in [3, 4]:
+                                    policies.append(
+                                        {
+                                            "base_conf_min": 0.50,
+                                            "stale_conf_min": stale_conf,
+                                            "stale_trigger_margin_min": 2.0 if stale_conf <= 0.54 else 2.5,
+                                            "stale_dir_margin_min": 1.25 if stale_conf <= 0.54 else 1.75,
+                                            "trailing_conf_min": trailing_conf,
+                                            "trailing_trigger_margin_min": 1.75,
+                                            "trailing_dir_margin_min": 1.0,
+                                            "trailing_vs_stale_min": -0.10,
+                                            "manual_mode": "strict",
+                                            "manual_conf_min": manual_conf,
+                                            "manual_runner_margin_min": manual_margin,
+                                            "manual_trigger_margin_min": 0.25,
+                                            "manual_dir_margin_min": 0.25,
+                                            "manual_support_min": manual_support,
+                                            "manual_long_hold_ratio_min": manual_long_hold_min,
+                                            "manual_vs_stale_ratio_min": 0.25,
+                                            "manual_vs_stale_long_hold_ratio_min": 0.35,
+                                            "manual_recent_density_min": 0.02,
+                                            "manual_signal_votes_min": manual_votes,
+                                            "manual_symbol_support_min": 2,
+                                            "manual_score_advantage_min": -0.10,
+                                            "manual_precision_target_pct": 75.0,
+                                            "trailing_precision_target_pct": 65.0,
+                                            "worst_window_floor_target_pct": 85.0,
+                                            "coverage_target": 0.40,
+                                            "min_admitted_trades": 40,
+                                            "min_trigger_scored": 20,
+                                            "min_trailing_admit_ratio": 0.35,
+                                            "trailing_mode": "high_margin",
+                                        }
+                                    )
+        frontier: List[Dict[str, Any]] = []
+        best = {"score": -1e9, "coverage": 0.0, "metrics": _metrics_for_rows(pred_val), "policy": policies[0], "policy_frontier": []}
+        for policy in policies:
+            row = _score_crypto_with_policy(pred_val, policy)
+            summary = _frontier_candidate_summary(policy, row)
+            summary["worst_window_metrics"] = {
+                "directional_accuracy_pct": _f(row.get("metrics", {}).get("directional_accuracy_pct", 0.0), 0.0),
+                "trigger_match_pct": _f(row.get("metrics", {}).get("trigger_match_pct", 0.0), 0.0),
+                "pnl_trend_match_pct": _f(row.get("metrics", {}).get("pnl_trend_match_pct", 0.0), 0.0),
+            }
+            manual_prec = _f(summary["class_precision"].get("Manual", {}).get("precision_pct", 0.0), 0.0)
+            trigger_match = _f(summary.get("trigger_match_pct", 0.0), 0.0)
+            coverage_pct = _f(summary.get("admission_rate_pct", 0.0), 0.0)
+            if manual_prec < 75.0 and summary["class_counts"].get("Manual", 0) > 0:
+                summary["blockers"].append(f"manual_precision_low({manual_prec:.2f}<75.00)")
+            if trigger_match < 90.0:
+                summary["blockers"].append(f"trigger_match_low({trigger_match:.2f}<90.00)")
+            if coverage_pct < 40.0:
+                summary["blockers"].append(f"coverage_low({coverage_pct:.2f}<40.00)")
+            frontier.append(summary)
+            score = _f(row.get("score", -1e9), -1e9)
+            cov = _f(row.get("coverage", 0.0), 0.0)
+            if score > _f(best.get("score", -1e9), -1e9) or (
+                abs(score - _f(best.get("score", -1e9), -1e9)) <= 1e-9 and cov > _f(best.get("coverage", 0.0), 0.0)
+            ):
+                best = {
+                    "policy": dict(policy),
+                    "score": score,
+                    "coverage": cov,
+                    "metrics": row.get("metrics", {}),
+                    "full_metrics": row.get("full_metrics", {}),
+                    "abstained_metrics": row.get("abstained_metrics", {}),
+                    "reason_counts": row.get("reason_counts", {}),
+                    "class_precision": row.get("class_precision", {}),
+                    "policy_name": _policy_name(policy),
+                }
+        frontier_sorted = sorted(frontier, key=lambda item: (-_f(item.get("score", 0.0), 0.0), -_f(item.get("trigger_match_pct", 0.0), 0.0), -_f(item.get("admission_rate_pct", 0.0), 0.0)))
+        best["policy_frontier"] = frontier_sorted[:8]
+        return best
     if len(train_rows) < 24:
         return {"threshold": 0.6, "coverage": 1.0, "metrics": _metrics_for_rows(train_rows)}
     split = max(12, int(len(train_rows) * 0.70))
@@ -1216,6 +1902,229 @@ def _bootstrap_ci(rows: List[Dict[str, Any]], metric_key: str, rounds: int = 300
     return {"p05": round(q(0.05), 4), "p50": round(q(0.50), 4), "p95": round(q(0.95), 4)}
 
 
+def _stock_symbol_candidates(hub_dir: str, closed_rows: List[Dict[str, Any]], limit: int = 18) -> List[str]:
+    out: List[str] = []
+    for row in sorted(list(closed_rows or []), key=lambda r: int(_f(r.get("exit_ts", 0.0), 0.0)), reverse=True):
+        sym = _s(row.get("symbol", "")).upper()
+        if sym and sym not in out:
+            out.append(sym)
+        if len(out) >= limit:
+            return out
+    cache = _safe_read_json(os.path.join(hub_dir, "stocks", "stock_universe_cache.json"))
+    for sym in list(cache.get("symbols", []) or []):
+        ss = _s(sym).upper()
+        if ss and ss not in out:
+            out.append(ss)
+        if len(out) >= limit:
+            return out
+    rank_rows = _safe_read_jsonl(os.path.join(hub_dir, "stocks", "scanner_rankings.jsonl"), max_lines=120)
+    for row in reversed(rank_rows):
+        top = row.get("top", []) if isinstance(row.get("top", []), list) else []
+        for cand in top:
+            if not isinstance(cand, dict):
+                continue
+            ss = _s(cand.get("symbol", "")).upper()
+            if ss and ss not in out:
+                out.append(ss)
+            if len(out) >= limit:
+                return out
+    return out[:limit]
+
+
+def _stock_provider_client(settings: Dict[str, Any], base_dir: str) -> Tuple[str, Any, Dict[str, Any]]:
+    provider = _s(settings.get("stock_data_provider", "")).lower() or "alpaca"
+    if provider not in {"alpaca", "twelvedata"}:
+        provider = "alpaca"
+    diagnostics = {"provider": provider, "credentials_available": False}
+    if provider == "alpaca":
+        key, secret = get_alpaca_creds(settings, base_dir)
+        diagnostics["credentials_available"] = bool(key and secret)
+        if key and secret:
+            return provider, AlpacaBrokerClient(key, secret, "https://paper-api.alpaca.markets"), diagnostics
+        td = get_twelvedata_api_key(settings, base_dir)
+        if td:
+            diagnostics["provider"] = "twelvedata"
+            diagnostics["credentials_available"] = True
+            diagnostics["fallback_used"] = "twelvedata"
+            return "twelvedata", TwelveDataClient(td), diagnostics
+        diagnostics["reason"] = "missing_stock_provider_credentials"
+        return provider, None, diagnostics
+    td = get_twelvedata_api_key(settings, base_dir)
+    diagnostics["credentials_available"] = bool(td)
+    if td:
+        return provider, TwelveDataClient(td), diagnostics
+    key, secret = get_alpaca_creds(settings, base_dir)
+    if key and secret:
+        diagnostics["provider"] = "alpaca"
+        diagnostics["credentials_available"] = True
+        diagnostics["fallback_used"] = "alpaca"
+        return "alpaca", AlpacaBrokerClient(key, secret, "https://paper-api.alpaca.markets"), diagnostics
+    diagnostics["reason"] = "missing_stock_provider_credentials"
+    return provider, None, diagnostics
+
+
+def _bar_close(row: Dict[str, Any]) -> float:
+    for key in ("c", "close"):
+        val = _f(row.get(key, 0.0), 0.0)
+        if val > 0.0:
+            return val
+    return 0.0
+
+
+def _bar_ts(row: Dict[str, Any]) -> int:
+    txt = _s(row.get("t", row.get("datetime", "")))
+    if not txt:
+        return 0
+    try:
+        txt = txt.replace(" ", "T")
+        if txt.endswith("Z"):
+            txt = txt[:-1] + "+00:00"
+        return int(time.mktime(time.strptime(txt[:19], "%Y-%m-%dT%H:%M:%S")))
+    except Exception:
+        try:
+            return int(_f(txt, 0.0))
+        except Exception:
+            return 0
+
+
+def _simulate_stock_trades_from_bars(symbol: str, bars: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rows = [dict(r) for r in list(bars or []) if _bar_close(r) > 0.0]
+    rows.sort(key=_bar_ts)
+    if len(rows) < 48:
+        return []
+    out: List[Dict[str, Any]] = []
+    in_pos = False
+    entry_px = 0.0
+    entry_ts = 0
+    entry_idx = -1
+    peak_px = 0.0
+    armed = False
+    gap_pct = 0.018
+    max_hold = 18
+    for idx in range(24, len(rows)):
+        px = _bar_close(rows[idx])
+        ts = _bar_ts(rows[idx])
+        prev6 = _bar_close(rows[idx - 6])
+        prev24 = _bar_close(rows[idx - 24])
+        if prev6 <= 0.0 or prev24 <= 0.0 or px <= 0.0 or ts <= 0:
+            continue
+        mom6 = (px / prev6) - 1.0
+        mom24 = (px / prev24) - 1.0
+        if not in_pos:
+            if mom6 >= 0.012 and mom24 >= 0.02:
+                in_pos = True
+                entry_px = px
+                entry_ts = ts
+                entry_idx = idx
+                peak_px = px
+                armed = False
+            continue
+        peak_px = max(peak_px, px)
+        gain = (px / entry_px) - 1.0 if entry_px > 0.0 else 0.0
+        hold_bars = idx - max(0, entry_idx)
+        if gain >= 0.015:
+            armed = True
+        trigger = ""
+        if armed and px <= (peak_px * (1.0 - gap_pct)):
+            trigger = "Trailing"
+        elif hold_bars >= max_hold and (mom6 <= -0.004 or gain <= 0.004):
+            trigger = "Stale Alignment"
+        if not trigger:
+            continue
+        pnl_usd = px - entry_px
+        out.append(
+            {
+                "symbol": symbol,
+                "entry_ts": int(entry_ts),
+                "exit_ts": int(ts),
+                "qty": 1.0,
+                "entry_price": round(float(entry_px), 10),
+                "exit_price": round(float(px), 10),
+                "hold_hours": round(float(max(0.0, (ts - entry_ts) / 3600.0)), 6),
+                "pnl_usd": round(float(pnl_usd), 8),
+                "actual_exit_trigger": trigger,
+                "event_exit_tag": f"historical_api_replay:{trigger.lower().replace(' ', '_')}",
+            }
+        )
+        in_pos = False
+        entry_px = 0.0
+        entry_ts = 0
+        entry_idx = -1
+        peak_px = 0.0
+        armed = False
+    return out
+
+
+def _generate_stock_historical_replay_closed_trades(
+    *,
+    hub_dir: str,
+    base_dir: str,
+    settings: Dict[str, Any],
+    existing_closed_rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    provider, client, diag = _stock_provider_client(settings, base_dir)
+    diagnostics: Dict[str, Any] = {
+        "source_type": "historical_api_replay",
+        "provider": provider,
+        "symbols_covered": [],
+        "candle_timeframe": "1Hour",
+        "date_range": {},
+        "rows_generated": 0,
+        "skipped": [],
+    }
+    if client is None:
+        diagnostics["reason_unavailable"] = _s(diag.get("reason", "")) or "provider_unavailable"
+        return {"rows": list(existing_closed_rows or []), "diagnostics": diagnostics}
+    symbols = _stock_symbol_candidates(hub_dir, existing_closed_rows, limit=16)
+    generated: List[Dict[str, Any]] = []
+    ts_values: List[int] = []
+    now_ts = int(time.time())
+    start_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts - (45 * 86400)))
+    end_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts))
+    for sym in symbols:
+        try:
+            if provider == "alpaca":
+                bars = client.get_stock_bars(
+                    sym,
+                    timeframe="1Hour",
+                    limit=240,
+                    feed="iex",
+                    start_iso=start_iso,
+                    end_iso=end_iso,
+                )
+                if len(list(bars or [])) < 48:
+                    bars = client.get_stock_bars(
+                        sym,
+                        timeframe="1Day",
+                        limit=120,
+                        feed="iex",
+                        start_iso=start_iso,
+                        end_iso=end_iso,
+                    )
+            else:
+                bars_map = client.get_time_series_batch([sym], interval="1h", outputsize=240)
+                bars = list((bars_map.get(sym, []) if isinstance(bars_map, dict) else []) or [])
+        except Exception as exc:
+            diagnostics["skipped"].append({"symbol": sym, "reason": f"fetch_error:{type(exc).__name__}"})
+            continue
+        if len(list(bars or [])) < 48:
+            diagnostics["skipped"].append({"symbol": sym, "reason": "insufficient_bars", "bars": int(len(list(bars or [])))})
+            continue
+        trade_rows = _simulate_stock_trades_from_bars(sym, list(bars or []))
+        if not trade_rows:
+            diagnostics["skipped"].append({"symbol": sym, "reason": "no_replay_trades"})
+            continue
+        diagnostics["symbols_covered"].append(sym)
+        generated.extend(trade_rows)
+        ts_values.extend([int(_f(r.get("entry_ts", 0.0), 0.0)) for r in trade_rows])
+        ts_values.extend([int(_f(r.get("exit_ts", 0.0), 0.0)) for r in trade_rows])
+    generated.sort(key=lambda r: (int(_f(r.get("entry_ts", 0.0), 0.0)), _s(r.get("symbol", ""))))
+    diagnostics["rows_generated"] = int(len(generated))
+    if ts_values:
+        diagnostics["date_range"] = {"start_ts": int(min(ts_values)), "end_ts": int(max(ts_values))}
+    return {"rows": generated if generated else list(existing_closed_rows or []), "diagnostics": diagnostics}
+
+
 def build_synthetic_replay_artifact(hub_dir: str, market: str, closed_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     m = _s(market).lower()
     rows = sorted(list(closed_rows or []), key=lambda r: int(_f(r.get("exit_ts", 0), 0.0)))
@@ -1244,6 +2153,8 @@ def build_synthetic_replay_artifact(hub_dir: str, market: str, closed_rows: List
     abstained_all: List[Dict[str, Any]] = []
     preds_all: List[Dict[str, Any]] = []
     thr_values: List[float] = []
+    policy_snapshots: List[Dict[str, Any]] = []
+    validation_policy_quality: List[Dict[str, Any]] = []
     max_windows = 10
     win_count = 0
     for end in range(train_n_min, n - test_n + 1, step_n):
@@ -1254,6 +2165,19 @@ def build_synthetic_replay_artifact(hub_dir: str, market: str, closed_rows: List
         abstain = _calibrate_abstain_threshold(train, m)
         threshold = _f(abstain.get("threshold", 0.6), 0.6)
         thr_values.append(float(threshold))
+        selected_policy = abstain.get("policy", {}) if isinstance(abstain.get("policy", {}), dict) else {}
+        if selected_policy:
+            policy_snapshots.append(dict(selected_policy))
+            validation_policy_quality.append(
+                {
+                    "policy_name": _s(abstain.get("policy_name", "")) or _policy_name(selected_policy),
+                    "coverage": round(_f(abstain.get("coverage", 0.0), 0.0), 6),
+                    "metrics": abstain.get("metrics", {}),
+                    "class_precision": abstain.get("class_precision", {}),
+                    "reason_counts": abstain.get("reason_counts", {}),
+                    "policy_frontier": abstain.get("policy_frontier", []),
+                }
+            )
         test_preds: List[Dict[str, Any]] = []
         prior = list(train)
         for r in test:
@@ -1269,7 +2193,7 @@ def build_synthetic_replay_artifact(hub_dir: str, market: str, closed_rows: List
             test_preds.append(merged)
             prior.append(rr)
         preds_all.extend(test_preds)
-        scored = _score_with_threshold(test_preds, threshold, m)
+        scored = _score_crypto_with_policy(test_preds, selected_policy) if m == "crypto" else _score_with_threshold(test_preds, threshold, m)
         admitted = scored.get("admitted", []) if isinstance(scored.get("admitted", []), list) else []
         abstained = scored.get("abstained", []) if isinstance(scored.get("abstained", []), list) else []
         admitted_all.extend(admitted)
@@ -1285,6 +2209,8 @@ def build_synthetic_replay_artifact(hub_dir: str, market: str, closed_rows: List
                 "metrics": scored.get("metrics", {}),
                 "full_universe_metrics": scored.get("full_metrics", {}),
                 "abstained_metrics": scored.get("abstained_metrics", {}),
+                "admission_reason_counts": scored.get("reason_counts", {}),
+                "selected_policy": selected_policy,
             }
         )
         win_count += 1
@@ -1327,6 +2253,52 @@ def build_synthetic_replay_artifact(hub_dir: str, market: str, closed_rows: List
     crypto_diag = _crypto_replay_diagnostics(admitted_all, full_rows=preds_all, abstained_rows=abstained_all) if m == "crypto" else {}
     if crypto_diag:
         crypto_diag["population_diagnostics"] = population_diag
+        crypto_diag["selected_crypto_admission_policy"] = policy_snapshots[-1] if policy_snapshots else {}
+        crypto_diag["selected_policy_validation_quality"] = validation_policy_quality[-1] if validation_policy_quality else {}
+        crypto_diag["crypto_policy_frontier"] = (
+            validation_policy_quality[-1].get("policy_frontier", []) if validation_policy_quality else []
+        )
+        crypto_diag["admission_reason_counts"] = _count_by(
+            admitted_all + abstained_all,
+            lambda r: _s(r.get("admission_reason", "")) or "unknown",
+        )
+        crypto_diag["admitted_predicted_trigger_counts"] = _count_by(
+            admitted_all,
+            lambda r: _s(r.get("predicted_exit_trigger", "")) or "Unknown",
+        )
+        crypto_diag["abstained_predicted_trigger_counts"] = _count_by(
+            abstained_all,
+            lambda r: _s(r.get("predicted_exit_trigger", "")) or "Unknown",
+        )
+        crypto_diag["confidence_bucket_admission_counts"] = {
+            "admitted": _count_by(admitted_all, lambda r: _bucket_probability(_f(r.get("predicted_confidence", 0.0), 0.0))),
+            "abstained": _count_by(abstained_all, lambda r: _bucket_probability(_f(r.get("predicted_confidence", 0.0), 0.0))),
+        }
+        crypto_diag["trigger_margin_bucket_admission_counts"] = {
+            "admitted": _count_by(admitted_all, lambda r: _bucket_margin_value(_f(r.get("trigger_margin", 0.0), 0.0))),
+            "abstained": _count_by(abstained_all, lambda r: _bucket_margin_value(_f(r.get("trigger_margin", 0.0), 0.0))),
+        }
+        crypto_diag["direction_margin_bucket_admission_counts"] = {
+            "admitted": _count_by(admitted_all, lambda r: _bucket_margin_value(_f(r.get("direction_margin", 0.0), 0.0))),
+            "abstained": _count_by(abstained_all, lambda r: _bucket_margin_value(_f(r.get("direction_margin", 0.0), 0.0))),
+        }
+        crypto_diag["manual_separability_audit"] = {
+            "full_universe": _manual_prediction_diagnostics(preds_all),
+            "admitted": _manual_prediction_diagnostics(admitted_all),
+        }
+        best_frontier = validation_policy_quality[-1].get("policy_frontier", []) if validation_policy_quality else []
+        if best_frontier:
+            best_row = best_frontier[0]
+            if (
+                _f(best_row.get("trigger_match_pct", 0.0), 0.0) < 90.0
+                or int(best_row.get("admitted_trades", 0) or 0) < 40
+                or _f(best_row.get("worst_window_metrics", {}).get("trigger_match_pct", 0.0), 0.0) < 85.0
+            ):
+                crypto_diag["next_required_features"] = _next_required_features()
+                crypto_diag["stabilization_conclusion"] = (
+                    "Current closed-trade-only replay features are insufficient to achieve both >=90% admitted quality "
+                    "and >=40 admitted rows / 40% coverage honestly."
+                )
 
     payload = {
         "status": "ok",
@@ -1348,6 +2320,10 @@ def build_synthetic_replay_artifact(hub_dir: str, market: str, closed_rows: List
         "abstain_policy": {
             "threshold_median": round(_median([float(v) for v in thr_values], default=0.6), 4),
             "test_coverage": round(float(coverage), 6),
+            "selected_crypto_policy": policy_snapshots[-1] if policy_snapshots else {},
+            "selected_crypto_policy_name": (
+                validation_policy_quality[-1].get("policy_name", "") if validation_policy_quality else ""
+            ),
         },
         "best_test_metrics": metrics,
         "hybrid_test_metrics": metrics,
@@ -1595,6 +2571,11 @@ def _crypto_replay_diagnostics(
         "direction_confusion_matrix": dir_conf,
         "trigger_confusion_matrix": trig_conf,
         "trigger_class_prototypes_summary": proto_support,
+        "class_precision": {
+            "Manual": _trigger_precision(rows, "Manual"),
+            "Trailing": _trigger_precision(rows, "Trailing"),
+            "Stale Alignment": _trigger_precision(rows, "Stale Alignment"),
+        },
         "misses_by_symbol": _top_counter(miss_symbol),
         "misses_by_regime": _top_counter(miss_regime),
         "misses_by_actual_trigger": _top_counter(miss_actual_trigger),
@@ -1632,6 +2613,7 @@ def _crypto_replay_diagnostics(
                 max([int(_f(r.get("manual_same_regime_support_count", 0.0), 0.0)) for r in rows] or [0])
             ),
         },
+        "manual_prediction_diagnostics": _manual_prediction_diagnostics(rows),
         "stale_vs_trailing_score_margin_examples": stale_vs_trailing_examples,
         "stale_vs_manual_score_margin_examples": stale_vs_manual_examples,
         "actual_up_trailing_pred_down_stale_examples": uptrail_downstale,
@@ -1707,10 +2689,25 @@ def run_model_quality_full_pass(
     dataset_reports: Dict[str, Any] = {}
     snapshots: Dict[str, Any] = {}
     closed_by_market: Dict[str, List[Dict[str, Any]]] = {}
+    replay_generation: Dict[str, Any] = {}
     for m in markets:
         loaded = load_market_trade_events(hub_dir, m)
         events = loaded.get("events", []) if isinstance(loaded.get("events", []), list) else []
         closed = build_closed_trades(events, m).get("closed_trades", [])
+        if m == "stocks" and len(list(closed or [])) < 40:
+            stock_gen = _generate_stock_historical_replay_closed_trades(
+                hub_dir=hub_dir,
+                base_dir=base_dir,
+                settings=cfg,
+                existing_closed_rows=list(closed or []),
+            )
+            replay_generation[m] = stock_gen.get("diagnostics", {})
+            stock_rows = stock_gen.get("rows", [])
+            if isinstance(stock_rows, list) and stock_rows:
+                closed = stock_rows
+                dataset_reports.setdefault(m, {})
+        else:
+            replay_generation[m] = {"source_type": "execution_log", "rows_generated": int(len(list(closed or [])))}
         closed_by_market[m] = list(closed if isinstance(closed, list) else [])
         snap_path = os.path.join(out_dir, f"{m}_closed_trades_v1_{stamp}.jsonl")
         _write_jsonl(snap_path, closed if isinstance(closed, list) else [])
@@ -1720,6 +2717,8 @@ def run_model_quality_full_pass(
             "rows": int(len(closed) if isinstance(closed, list) else 0),
         }
         dataset_reports[m] = build_market_dataset_quality(hub_dir, m)
+        if isinstance(dataset_reports.get(m, {}), dict):
+            dataset_reports[m]["replay_source_diagnostics"] = replay_generation.get(m, {})
 
     # Build/refresh replay artifacts for all markets from normalized closed trades.
     openai_dir = os.path.join(hub_dir, "openai")
@@ -1727,6 +2726,8 @@ def run_model_quality_full_pass(
     synthetic_paths: Dict[str, str] = {}
     for m in markets:
         payload = build_synthetic_replay_artifact(hub_dir, m, closed_by_market.get(m, []))
+        if isinstance(payload, dict) and isinstance(replay_generation.get(m, {}), dict):
+            payload.setdefault("replay_source_diagnostics", replay_generation.get(m, {}))
         rpath = os.path.join(openai_dir, f"{m}_historical_replay_synthetic.json")
         with open(rpath, "w", encoding="utf-8") as f:
             json.dump(payload if isinstance(payload, dict) else {}, f, indent=2)
@@ -1814,6 +2815,7 @@ def run_model_quality_full_pass(
         "dataset_quality": dataset_reports,
         "dataset_snapshots": snapshots,
         "synthetic_replay_artifacts": synthetic_paths,
+        "replay_generation": replay_generation,
         "market_regimes": regimes,
         "walkforward_report": walk,
         "confidence_calibration": calibration,
