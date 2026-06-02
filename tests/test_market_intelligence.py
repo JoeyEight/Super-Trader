@@ -119,6 +119,32 @@ class TestMarketIntelligence(unittest.TestCase):
             self.assertEqual(str(crypto.get("market", "")), "crypto")
             self.assertTrue(isinstance(crypto.get("curve", []), list))
 
+    def test_confidence_calibration_uses_realized_exit_outcomes_only(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            rows = [
+                # Entry should not count toward calibration outcomes.
+                {"ts": 1_700_000_010, "event": "entry", "ok": True, "score": 1.20, "symbol": "BTC-USD"},
+                # Losing exit marked ok=True must still count as a loss via realized pnl fields.
+                {"ts": 1_700_000_040, "event": "exit", "ok": True, "score": 1.20, "symbol": "BTC-USD", "pnl_pct": -1.2, "realized_pnl_usd": -0.5},
+                # Winning exit marked ok=False must still count as win via realized pnl fields.
+                {"ts": 1_700_000_080, "event": "exit", "ok": False, "score": 1.20, "symbol": "ETH-USD", "pnl_pct": 1.8, "realized_pnl_usd": 0.7},
+            ]
+            self._write_jsonl(os.path.join(td, "crypto", "execution_audit.jsonl"), rows)
+            out = build_confidence_calibration_payload(
+                td,
+                {
+                    "stock_score_threshold": 0.2,
+                    "forex_score_threshold": 0.2,
+                    "crypto_dynamic_min_projected_edge_pct": 0.2,
+                    "adaptive_confidence_min_samples": 2,
+                    "adaptive_confidence_target_success_pct": 45.0,
+                },
+            )
+            crypto = out.get("crypto", {}) if isinstance(out.get("crypto", {}), dict) else {}
+            self.assertEqual(int(crypto.get("samples", 0) or 0), 2)
+            self.assertEqual(int(crypto.get("wins", 0) or 0), 1)
+            self.assertAlmostEqual(float(crypto.get("win_rate_pct", 0.0) or 0.0), 50.0, places=4)
+
     def test_shadow_scorecards(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             self._write_json(

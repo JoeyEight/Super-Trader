@@ -98,12 +98,30 @@ def _row_score(row: Dict[str, Any]) -> float:
 
 def _row_outcome(row: Dict[str, Any]) -> int:
     evt = str(row.get("event", "") or "").strip().lower()
+    if evt != "exit":
+        return -1
+    # Calibrate against realized exit outcomes (not entry admissions).
+    # Prefer explicit PnL fields because historical "ok" flags can be stale/noisy.
+    pnl_usd = row.get("pnl_usd", row.get("realized_pnl_usd", None))
+    if pnl_usd is None and isinstance(row.get("payload"), dict):
+        pnl_usd = row["payload"].get("realized_profit_usd", None)
+    pnl_pct = row.get("pnl_pct", None)
+    if pnl_pct is None and isinstance(row.get("payload"), dict):
+        pnl_pct = row["payload"].get("pnl_pct", None)
+
+    has_usd = pnl_usd is not None
+    has_pct = pnl_pct is not None
+    if has_usd or has_pct:
+        usd_v = _f(pnl_usd, 0.0) if has_usd else 0.0
+        pct_v = _f(pnl_pct, 0.0) if has_pct else 0.0
+        return 1 if ((has_usd and usd_v >= 0.0) or (has_pct and pct_v >= 0.0)) else 0
+
     ok = bool(row.get("ok", False))
-    if evt in {"entry", "exit"} and ok:
+    if ok:
         return 1
-    if evt in {"entry_fail", "exit_fail", "shadow_live_divergence"}:
+    if evt in {"exit_fail", "shadow_live_divergence"}:
         return 0
-    if evt in {"entry", "exit"} and (not ok):
+    if not ok:
         return 0
     return -1
 

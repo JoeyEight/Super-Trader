@@ -219,21 +219,57 @@ def _trim_json_object(text: str) -> str:
     return src
 
 
-def _normalize_prediction(raw: Dict[str, Any], *, entry_ts: int, entry_price: float) -> Dict[str, Any]:
-    direction = _s(raw.get("predicted_direction", "flat")).lower()
-    if direction not in {"up", "down", "flat"}:
-        direction = "flat"
-    trigger = _s(raw.get("exit_trigger", "Unknown"))
-    allowed = {
+_MODEL_TRIGGER_LABELS = {
+    "Trailing",
+    "Stale Alignment",
+    "AI Exit",
+    "Blocked",
+    "Risk Cut",
+    "Take Profit",
+    "Unknown",
+}
+
+
+def _canonical_exit_trigger(tag: str) -> str:
+    txt = _s(tag).strip()
+    if not txt:
+        return "Unknown"
+    up = txt.upper()
+    if "MANUAL" in up:
+        return "Manual"
+    if ("TRAIL" in up) or ("TRAILING" in up):
+        return "Trailing"
+    if "STALE" in up:
+        return "Stale Alignment"
+    if "BLOCK" in up:
+        return "Blocked"
+    if ("AI" in up) and ("EXIT" in up or "CLOSE" in up):
+        return "AI Exit"
+    if ("RISK" in up) or ("STOP" in up):
+        return "Risk Cut"
+    if ("TAKE" in up) or ("PROFIT" in up):
+        return "Take Profit"
+    return "Unknown"
+
+
+def _is_model_training_exit_tag(tag: str) -> bool:
+    label = _canonical_exit_trigger(tag)
+    return label in {
         "Trailing",
         "Stale Alignment",
         "AI Exit",
         "Blocked",
         "Risk Cut",
         "Take Profit",
-        "Unknown",
     }
-    if trigger not in allowed:
+
+
+def _normalize_prediction(raw: Dict[str, Any], *, entry_ts: int, entry_price: float) -> Dict[str, Any]:
+    direction = _s(raw.get("predicted_direction", "flat")).lower()
+    if direction not in {"up", "down", "flat"}:
+        direction = "flat"
+    trigger = _canonical_exit_trigger(_s(raw.get("exit_trigger", "Unknown")))
+    if trigger not in _MODEL_TRIGGER_LABELS:
         trigger = "Unknown"
 
     exit_ts = int(max(entry_ts, _f(raw.get("expected_exit_ts", entry_ts), entry_ts)))
@@ -257,17 +293,8 @@ def _normalize_prediction(raw: Dict[str, Any], *, entry_ts: int, entry_price: fl
 
 
 def _normalize_trigger_prediction(raw: Dict[str, Any], *, entry_ts: int, entry_price: float) -> Dict[str, Any]:
-    trigger = _s(raw.get("exit_trigger", "Unknown"))
-    allowed = {
-        "Trailing",
-        "Stale Alignment",
-        "AI Exit",
-        "Blocked",
-        "Risk Cut",
-        "Take Profit",
-        "Unknown",
-    }
-    if trigger not in allowed:
+    trigger = _canonical_exit_trigger(_s(raw.get("exit_trigger", "Unknown")))
+    if trigger not in _MODEL_TRIGGER_LABELS:
         trigger = "Unknown"
     return {
         "summary": _s(raw.get("summary", ""))[:220],
@@ -501,27 +528,29 @@ def _build_closed_trades(rows: List[Dict[str, Any]]) -> List[ClosedTrade]:
         exit_ts = int(_f(row.get("ts", 0), 0.0))
         exit_price = float(_f(row.get("price", 0.0), 0.0))
         exit_tag = _s(row.get("tag", ""))
+        include_exit = _is_model_training_exit_tag(exit_tag)
         while rem > 1e-12 and open_lots[sym]:
             lot = open_lots[sym][0]
             take = min(rem, float(lot.get("qty", 0.0)))
             if take <= 1e-12:
                 open_lots[sym].pop(0)
                 continue
-            out.append(
-                ClosedTrade(
-                    symbol=sym,
-                    entry_ts=int(_f(lot.get("ts", 0), 0.0)),
-                    exit_ts=exit_ts,
-                    entry_price=float(_f(lot.get("price", 0.0), 0.0)),
-                    exit_price=exit_price,
-                    qty=float(take),
-                    entry_tag=_s(lot.get("tag", "")),
-                    exit_tag=exit_tag,
-                    entry_score=float(_f(lot.get("score", 0.0), 0.0)),
-                    entry_required_score=float(_f(lot.get("required_score", 0.0), 0.0)),
-                    entry_calib_prob=float(_f(lot.get("calib_prob", 0.0), 0.0)),
+            if include_exit:
+                out.append(
+                    ClosedTrade(
+                        symbol=sym,
+                        entry_ts=int(_f(lot.get("ts", 0), 0.0)),
+                        exit_ts=exit_ts,
+                        entry_price=float(_f(lot.get("price", 0.0), 0.0)),
+                        exit_price=exit_price,
+                        qty=float(take),
+                        entry_tag=_s(lot.get("tag", "")),
+                        exit_tag=exit_tag,
+                        entry_score=float(_f(lot.get("score", 0.0), 0.0)),
+                        entry_required_score=float(_f(lot.get("required_score", 0.0), 0.0)),
+                        entry_calib_prob=float(_f(lot.get("calib_prob", 0.0), 0.0)),
+                    )
                 )
-            )
             lot["qty"] = float(lot.get("qty", 0.0)) - float(take)
             rem -= float(take)
             if float(lot.get("qty", 0.0)) <= 1e-12:
@@ -798,6 +827,20 @@ def _prediction_key(row: Dict[str, Any]) -> Tuple[str, int]:
     return _s(row.get("symbol", "")).upper(), int(_f(row.get("entry_ts", 0), 0.0))
 
 
+def _trigger_direction_conflicts(direction: str, trigger: str) -> bool:
+    pred_dir = _s(direction).lower()
+    trig = _s(trigger)
+    if pred_dir not in {"up", "down", "flat"}:
+        pred_dir = "flat"
+    # Defensive triggers should not override explicitly bullish direction calls.
+    if trig in {"Stale Alignment", "Risk Cut", "Blocked"} and pred_dir == "up":
+        return True
+    # Continuation/profit triggers should not override explicitly bearish direction calls.
+    if trig in {"Trailing", "Take Profit"} and pred_dir == "down":
+        return True
+    return False
+
+
 def _build_hybrid_predictions(
     direction_rows: List[Dict[str, Any]],
     trigger_rows: List[Dict[str, Any]],
@@ -816,10 +859,10 @@ def _build_hybrid_predictions(
         trow = trigger_map.get(_prediction_key(row), {})
         if isinstance(trow, dict) and trow:
             trig_conf = _clamp(_f(trow.get("predicted_confidence", 0.0), 0.0), 0.0, 1.0)
-            if trig_conf >= cutoff:
-                merged["predicted_exit_trigger"] = _s(
-                    trow.get("predicted_exit_trigger", merged.get("predicted_exit_trigger", "Unknown"))
-                )
+            t_trigger = _s(trow.get("predicted_exit_trigger", merged.get("predicted_exit_trigger", "Unknown")))
+            d_dir = _s(merged.get("predicted_direction", "flat")).lower()
+            if trig_conf >= cutoff and (not _trigger_direction_conflicts(d_dir, t_trigger)):
+                merged["predicted_exit_trigger"] = t_trigger
         out.append(merged)
     return out
 
@@ -1055,20 +1098,10 @@ def _apply_prediction_calibration(rows: List[Dict[str, Any]], calibration: Dict[
 
 
 def _normalize_exit_trigger(tag: str) -> str:
-    txt = _s(tag).upper()
-    if txt == "TRAIL_SELL":
-        return "Trailing"
-    if txt == "POLICY_STALE_EXIT":
-        return "Stale Alignment"
-    if txt in {"BLOCKED", "BLOCK"}:
-        return "Blocked"
-    if "AI" in txt:
-        return "AI Exit"
-    if "RISK" in txt:
-        return "Risk Cut"
-    if "TAKE" in txt:
-        return "Take Profit"
-    return "Unknown"
+    label = _canonical_exit_trigger(tag)
+    if label == "Manual":
+        return "Unknown"
+    return label
 
 
 def _predict_rows(
