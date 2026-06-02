@@ -12,10 +12,14 @@ import app.crypto_historical_replay as crypto_historical_replay
 from app.crypto_artifacts import discover_crypto_trained_artifacts, load_crypto_artifact_features
 from app.crypto_historical_replay import build_crypto_historical_strategy_replay
 from app.model_quality_pass import (
+    _completed_live_decision_rows,
     _generate_stock_historical_replay_closed_trades,
     _prepare_forex_audit_rows,
     _crypto_admission_decision,
     _predict_one,
+    _score_crypto_with_policy,
+    _simulate_stock_trades_from_bars,
+    _stock_predict_one,
     _score_with_threshold,
     build_market_dataset_quality,
     build_closed_trades,
@@ -1248,6 +1252,46 @@ class TestModelQualityPass(unittest.TestCase):
         out = _predict_one(train_rows=train_rows, candidate=candidate, regime="high_volatility", market="stocks", predictor_variant="candidate")
         self.assertEqual(str(out.get("predicted_direction", "")), "down")
         self.assertTrue(bool(out.get("stock_up_bias_guard_applied", False)))
+        self.assertEqual(str(out.get("stock_down_case_guard_reason", "")), "weak_negative_returns_high_volatility")
+        self.assertTrue(bool(out.get("stock_down_case_guard_applied", False)))
+        self.assertTrue(bool(out.get("stock_up_dampened_by_down_regime", False)))
+
+    def test_stock_trigger_separation_prefers_stale_on_weak_profile(self) -> None:
+        train_rows = []
+        for i in range(10):
+            train_rows.append(
+                {
+                    "symbol": "AAPL",
+                    "entry_price": 100.0,
+                    "actual_exit_price": 99.0,
+                    "hold_hours": 10.0,
+                    "pnl_pct": -1.0,
+                    "actual_direction": "down",
+                    "actual_exit_trigger": "Stale Alignment",
+                    "regime": "high_volatility",
+                    "source_type": "historical_api_replay",
+                    "recent_return_6": -0.6,
+                    "recent_return_24": -0.2,
+                    "recent_volatility": 0.8,
+                    "trend_momentum_score": 0.1,
+                    "signal_margin": 0.05,
+                }
+            )
+        candidate = {
+            "symbol": "AAPL",
+            "entry_price": 100.0,
+            "source_type": "historical_api_replay",
+            "recent_return_6": -0.5,
+            "recent_return_24": -0.1,
+            "recent_volatility": 0.7,
+            "trend_momentum_score": 0.1,
+            "signal_margin": 0.05,
+        }
+        out = _predict_one(train_rows=train_rows, candidate=candidate, regime="high_volatility", market="stocks", predictor_variant="candidate")
+        self.assertEqual(str(out.get("predicted_exit_trigger", "")), "Stale Alignment")
+        self.assertIn(str(out.get("stock_trigger_separation_reason", "")), {"weak_or_negative_momentum", "elevated_vol_without_follow_through"})
+        self.assertGreater(float(out.get("stock_stale_vs_trailing_margin", 0.0)), 0.0)
+        self.assertTrue(bool(out.get("stock_stale_override_applied", False)))
 
     def test_safe_selection_falls_back_to_baseline_when_crypto_candidate_regresses(self) -> None:
         closed_rows = []
@@ -1348,6 +1392,49 @@ class TestModelQualityPass(unittest.TestCase):
         self.assertTrue(bool(safe.get("fallback_to_baseline", False)))
         self.assertEqual(str(safe.get("selected_predictor_variant", "")), "baseline")
 
+    def test_crypto_backfill_env_parameters_appear_in_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            hist = {"state": "READY", "rows": [], "diagnostics": {"historical_strategy_replay_rows": 0, "replay_cache_path": os.path.join(td, "crypto", "historical_replay_cache"), "remote_rows_fetched": 12, "cache_rows_loaded": 34, "symbols_covered": ["BTC-USD"]}, "skipped": []}
+            with mock.patch.dict(os.environ, {
+                "CRYPTO_REPLAY_BACKFILL": "1",
+                "CRYPTO_REPLAY_BACKFILL_LOOKBACK_DAYS": "365",
+                "CRYPTO_REPLAY_BACKFILL_TIMEFRAME": "1hour",
+                "CRYPTO_REPLAY_BACKFILL_MAX_SYMBOLS": "20",
+            }, clear=False):
+                with mock.patch("app.model_quality_pass.build_crypto_historical_strategy_replay", return_value=hist):
+                    with mock.patch("app.model_quality_pass.build_all_market_regimes", return_value={}):
+                        with mock.patch("app.model_quality_pass.build_walkforward_report", return_value={}):
+                            with mock.patch("app.model_quality_pass.build_confidence_calibration_payload", return_value={}):
+                                with mock.patch("app.model_quality_pass.build_shadow_scorecards", return_value={}):
+                                    out = run_model_quality_full_pass(base_dir=td, hub_dir=td, settings={})
+            diag = out.get("dataset_quality", {}).get("crypto", {}).get("replay_source_diagnostics", {})
+            self.assertTrue(bool(diag.get("crypto_backfill_mode_enabled", False)))
+            self.assertEqual(int(diag.get("crypto_backfill_lookback_days", 0)), 365)
+            self.assertEqual(str(diag.get("crypto_backfill_timeframe", "")), "1hour")
+
+    def test_stock_backfill_provider_failure_nonfatal(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch("app.model_quality_pass._stock_provider_client", return_value=("alpaca", None, {"reason": "provider_down"})):
+                out = _generate_stock_historical_replay_closed_trades(hub_dir=td, base_dir=td, settings={}, existing_closed_rows=[], lookback_days=365, max_symbols=10, force_refresh=False)
+            self.assertIn("reason_unavailable", out.get("diagnostics", {}))
+
+    def test_stock_backfill_env_parameters_appear_in_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {
+                "STOCK_REPLAY_BACKFILL": "1",
+                "STOCK_REPLAY_BACKFILL_LOOKBACK_DAYS": "365",
+                "STOCK_REPLAY_BACKFILL_TIMEFRAME": "1Hour",
+                "STOCK_REPLAY_BACKFILL_MAX_SYMBOLS": "50",
+            }, clear=False):
+                with mock.patch("app.model_quality_pass.build_all_market_regimes", return_value={}):
+                    with mock.patch("app.model_quality_pass.build_walkforward_report", return_value={}):
+                        with mock.patch("app.model_quality_pass.build_confidence_calibration_payload", return_value={}):
+                            with mock.patch("app.model_quality_pass.build_shadow_scorecards", return_value={}):
+                                out = run_model_quality_full_pass(base_dir=td, hub_dir=td, settings={})
+            diag = out.get("dataset_quality", {}).get("stocks", {}).get("replay_source_diagnostics", {})
+            self.assertTrue(bool(diag.get("stock_backfill_mode_enabled", False)))
+            self.assertEqual(int(diag.get("stock_backfill_lookback_days", 0)), 365)
+
     def test_safe_selection_diagnostics_emitted_for_all_markets(self) -> None:
         rows = []
         ts = 1_700_000_000
@@ -1370,6 +1457,187 @@ class TestModelQualityPass(unittest.TestCase):
         safe = payload.get("safe_selection_diagnostics", {})
         self.assertIn("latest", safe)
         self.assertIn("windows", safe)
+
+    def test_deterministic_crypto_replay_sorts_rows_stably(self) -> None:
+        rows = [
+            {
+                "symbol": "ETH-USD",
+                "entry_price": 100.0,
+                "actual_exit_price": 101.0,
+                "exit_price": 101.0,
+                "hold_hours": 4.0,
+                "pnl_pct": 1.0,
+                "actual_direction": "up",
+                "actual_exit_trigger": "Trailing",
+                "source_type": "historical_strategy_replay",
+                "entry_ts": 200,
+                "exit_ts": 260,
+            },
+            {
+                "symbol": "BTC-USD",
+                "entry_price": 100.0,
+                "actual_exit_price": 99.0,
+                "exit_price": 99.0,
+                "hold_hours": 4.0,
+                "pnl_pct": -1.0,
+                "actual_direction": "down",
+                "actual_exit_trigger": "Risk Cut",
+                "source_type": "historical_strategy_replay",
+                "entry_ts": 100,
+                "exit_ts": 180,
+            },
+        ] * 20
+        payload_a = build_synthetic_replay_artifact(
+            "/tmp",
+            "crypto",
+            list(reversed(rows)),
+            {"enabled": True, "start_ts": 0, "cutoff_ts": 0, "locked_symbols": ["BTC-USD", "ETH-USD"]},
+        )
+        payload_b = build_synthetic_replay_artifact(
+            "/tmp",
+            "crypto",
+            list(rows),
+            {"enabled": True, "start_ts": 0, "cutoff_ts": 0, "locked_symbols": ["ETH-USD", "BTC-USD"]},
+        )
+        self.assertEqual(
+            payload_a.get("crypto_deterministic_evaluation", {}).get("rows_hash"),
+            payload_b.get("crypto_deterministic_evaluation", {}).get("rows_hash"),
+        )
+
+    def test_repeat_eval_diagnostics_mark_disagreement_without_promoting_v2(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            self._write_jsonl(
+                os.path.join(td, "crypto", "execution_audit.jsonl"),
+                [
+                    {"ts": 1_700_000_000, "event": "entry", "symbol": "BTC-USD", "qty": 1.0, "price": 100.0},
+                    {"ts": 1_700_000_100, "event": "exit", "symbol": "BTC-USD", "qty": 1.0, "price": 101.0, "tag": "Trailing"},
+                ],
+            )
+            hist = {
+                "state": "READY",
+                "rows": [],
+                "diagnostics": {
+                    "historical_strategy_replay_rows": 60,
+                    "historical_strategy_replay_symbols": ["BTC-USD", "ETH-USD", "SOL-USD"],
+                    "symbols_covered": ["BTC-USD", "ETH-USD", "SOL-USD"],
+                    "crypto_replay_eval_start_ts": 100,
+                    "crypto_replay_eval_cutoff_ts": 200,
+                    "crypto_replay_symbols_locked": True,
+                    "crypto_replay_symbol_list_hash": "abc",
+                    "crypto_replay_cache_frozen": True,
+                    "crypto_replay_rows_hash": "hash-a",
+                },
+            }
+            disagreement = [
+                {
+                    "status": "ok",
+                    "meta": {"market": "crypto", "closed_trades_total": 60, "full_test_trades": 40, "rows_hash": "hash-a"},
+                    "safe_selection_diagnostics": {
+                        "latest": {
+                            "selected_predictor_variant": "baseline",
+                            "baseline_admitted_trades": 36,
+                            "candidate_evaluations": [
+                                {"variant": "label_compatible_v2", "summary": {"admitted_trades": 38, "admission_rate_pct": 95.0, "metrics": {}}, "guardrail_failures": ["candidate_admitted_trades_below_40"]}
+                            ],
+                        }
+                    },
+                },
+                {
+                    "status": "ok",
+                    "meta": {"market": "crypto", "closed_trades_total": 60, "full_test_trades": 40, "rows_hash": "hash-b"},
+                    "safe_selection_diagnostics": {
+                        "latest": {
+                            "selected_predictor_variant": "label_compatible_v2",
+                            "baseline_admitted_trades": 36,
+                            "candidate_evaluations": [
+                                {"variant": "label_compatible_v2", "summary": {"admitted_trades": 40, "admission_rate_pct": 100.0, "metrics": {}}, "guardrail_failures": []}
+                            ],
+                        }
+                    },
+                },
+            ]
+            real_build = model_quality_pass.build_synthetic_replay_artifact
+            call_state = {"crypto": 0}
+
+            def fake_build(hub_dir, market, closed_rows, deterministic_config=None):
+                if market != "crypto":
+                    return real_build(hub_dir, market, closed_rows, deterministic_config)
+                idx = call_state["crypto"] % len(disagreement)
+                call_state["crypto"] += 1
+                payload = dict(disagreement[idx])
+                payload["crypto_classifier_diagnostics"] = {}
+                return payload
+
+            with mock.patch.dict(os.environ, {"CRYPTO_REPLAY_DETERMINISTIC": "1", "CRYPTO_REPLAY_REPEAT_EVALS": "3"}, clear=False):
+                with mock.patch("app.model_quality_pass.build_crypto_historical_strategy_replay", return_value=hist):
+                    with mock.patch("app.model_quality_pass.build_synthetic_replay_artifact", side_effect=fake_build):
+                        with mock.patch("app.model_quality_pass.build_all_market_regimes", return_value={}):
+                            with mock.patch("app.model_quality_pass.build_walkforward_report", return_value={}):
+                                with mock.patch("app.model_quality_pass.build_confidence_calibration_payload", return_value={}):
+                                    with mock.patch("app.model_quality_pass.build_shadow_scorecards", return_value={}):
+                                        out = run_model_quality_full_pass(base_dir=td, hub_dir=td, settings={})
+            diag = out.get("dataset_quality", {}).get("crypto", {}).get("replay_source_diagnostics", {})
+            self.assertFalse(bool(diag.get("crypto_replay_repeat_activation_consistent", True)))
+            self.assertFalse(bool(diag.get("crypto_replay_repeat_metrics_consistent", True)))
+            self.assertFalse(bool(diag.get("crypto_v2_promotion_eligible", True)))
+
+    def test_repeat_eval_can_mark_v2_promotion_eligible_when_consistent(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            self._write_jsonl(
+                os.path.join(td, "crypto", "execution_audit.jsonl"),
+                [
+                    {"ts": 1_700_000_000, "event": "entry", "symbol": "BTC-USD", "qty": 1.0, "price": 100.0},
+                    {"ts": 1_700_000_100, "event": "exit", "symbol": "BTC-USD", "qty": 1.0, "price": 101.0, "tag": "Trailing"},
+                ],
+            )
+            hist = {
+                "state": "READY",
+                "rows": [],
+                "diagnostics": {
+                    "historical_strategy_replay_rows": 60,
+                    "historical_strategy_replay_symbols": ["BTC-USD", "ETH-USD", "SOL-USD"],
+                    "symbols_covered": ["BTC-USD", "ETH-USD", "SOL-USD"],
+                    "crypto_replay_eval_start_ts": 100,
+                    "crypto_replay_eval_cutoff_ts": 200,
+                    "crypto_replay_symbols_locked": True,
+                    "crypto_replay_symbol_list_hash": "abc",
+                    "crypto_replay_cache_frozen": True,
+                    "crypto_replay_rows_hash": "hash-a",
+                },
+            }
+            eligible_payload = {
+                "status": "ok",
+                "meta": {"market": "crypto", "closed_trades_total": 60, "full_test_trades": 40, "rows_hash": "hash-a"},
+                "safe_selection_diagnostics": {
+                    "latest": {
+                        "selected_predictor_variant": "label_compatible_v2",
+                        "baseline_admitted_trades": 36,
+                        "candidate_evaluations": [
+                            {"variant": "label_compatible_v2", "summary": {"admitted_trades": 40, "admission_rate_pct": 100.0, "metrics": {"trigger_match_pct": 80.0}}, "guardrail_failures": []}
+                        ],
+                    }
+                },
+                "crypto_classifier_diagnostics": {},
+            }
+            real_build = model_quality_pass.build_synthetic_replay_artifact
+
+            def fake_build(hub_dir, market, closed_rows, deterministic_config=None):
+                if market != "crypto":
+                    return real_build(hub_dir, market, closed_rows, deterministic_config)
+                return dict(eligible_payload)
+
+            with mock.patch.dict(os.environ, {"CRYPTO_REPLAY_DETERMINISTIC": "1", "CRYPTO_REPLAY_REPEAT_EVALS": "3"}, clear=False):
+                with mock.patch("app.model_quality_pass.build_crypto_historical_strategy_replay", return_value=hist):
+                    with mock.patch("app.model_quality_pass.build_synthetic_replay_artifact", side_effect=fake_build):
+                        with mock.patch("app.model_quality_pass.build_all_market_regimes", return_value={}):
+                            with mock.patch("app.model_quality_pass.build_walkforward_report", return_value={}):
+                                with mock.patch("app.model_quality_pass.build_confidence_calibration_payload", return_value={}):
+                                    with mock.patch("app.model_quality_pass.build_shadow_scorecards", return_value={}):
+                                        out = run_model_quality_full_pass(base_dir=td, hub_dir=td, settings={})
+            diag = out.get("dataset_quality", {}).get("crypto", {}).get("replay_source_diagnostics", {})
+            self.assertTrue(bool(diag.get("crypto_replay_repeat_activation_consistent", False)))
+            self.assertTrue(bool(diag.get("crypto_replay_repeat_metrics_consistent", False)))
+            self.assertTrue(bool(diag.get("crypto_v2_promotion_eligible", False)))
 
     def test_prepare_forex_audit_rows_marks_explicit_stale_exit(self) -> None:
         rows = [
@@ -1924,7 +2192,7 @@ class TestModelQualityPass(unittest.TestCase):
                                 settings={"main_neural_dir": os.path.join(td, "market_data", "coins")},
                             )
             diag = out.get("crypto_feature_source_diagnostics", {})
-            self.assertEqual(diag.get("crypto_feature_source_priority", [])[0], "decision_snapshot")
+            self.assertEqual(diag.get("crypto_feature_source_priority", [])[0], "historical_strategy_replay")
             self.assertIn(diag.get("crypto_feature_source_used"), {"decision_snapshot", "trained_artifact", "closed_trade_only"})
             self.assertIn("trained_artifacts_found", out.get("crypto_trained_artifact_diagnostics", {}))
 
@@ -2080,6 +2348,334 @@ class TestModelQualityPass(unittest.TestCase):
                             with mock.patch("app.model_quality_pass.build_shadow_scorecards", return_value={}):
                                 out = run_model_quality_full_pass(base_dir=td, hub_dir=td, settings={"main_neural_dir": os.path.join(td, "market_data", "coins")})
             self.assertNotEqual(out.get("crypto_feature_source_diagnostics", {}).get("crypto_feature_source_used"), "historical_strategy_replay")
+
+    def test_completed_live_decision_rows_builds_crypto_rows(self) -> None:
+        rows, diag = _completed_live_decision_rows(
+            market="crypto",
+            events=[],
+            closed_rows=[
+                {
+                    "symbol": "BTC-USD",
+                    "entry_ts": 100,
+                    "exit_ts": 200,
+                    "entry_price": 100.0,
+                    "exit_price": 102.0,
+                    "hold_hours": 2.0,
+                    "actual_exit_trigger": "Trailing",
+                    "entry_snapshot_selected_action": "buy",
+                    "entry_snapshot_ai_confidence": 0.84,
+                    "entry_snapshot_normalized_trigger": "Trailing",
+                    "entry_snapshot_policy_mode": "shadow_live_v1",
+                }
+            ],
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].get("source_type"), "completed_live_decision_snapshot")
+        self.assertEqual(rows[0].get("predicted_direction"), "up")
+        self.assertEqual(rows[0].get("predictor_mode"), "shadow_live_v1")
+        self.assertTrue(bool(diag.get("live_decision_source_available")))
+
+    def test_model_quality_keeps_live_rows_supplemental_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            rows = []
+            for i in range(45):
+                entry_px = 100.0 + i
+                exit_px = entry_px + (2.0 if i % 2 == 0 else -1.0)
+                rows.append(
+                    {
+                        "symbol": "BTC-USD",
+                        "entry_ts": 1_700_000_000 + (i * 1000),
+                        "exit_ts": 1_700_000_000 + (i * 1000) + 3600,
+                        "entry_price": entry_px,
+                        "exit_price": exit_px,
+                        "hold_hours": 1.0,
+                        "actual_exit_trigger": "Trailing" if exit_px > entry_px else "Risk Cut",
+                        "predicted_direction": "up" if exit_px > entry_px else "down",
+                        "predicted_exit_trigger": "Trailing" if exit_px > entry_px else "Risk Cut",
+                        "predicted_confidence": 0.83,
+                        "selected_predictor_name": "live_shadow_predictor",
+                        "source_type": "completed_live_decision_snapshot",
+                    }
+                )
+            hist_rows = [
+                {
+                    "market": "crypto",
+                    "symbol": "BTC-USD",
+                    "source_type": "historical_strategy_replay",
+                    "entry_ts": 1_700_000_000 + (i * 7200),
+                    "exit_ts": 1_700_000_000 + (i * 7200) + 3600,
+                    "entry_price": 100.0 + i,
+                    "exit_price": 101.0 + i,
+                    "hold_hours": 1.0,
+                    "actual_exit_trigger": "Trailing",
+                }
+                for i in range(60)
+            ]
+            with mock.patch("app.model_quality_pass.build_crypto_historical_strategy_replay", return_value={"state": "READY", "rows": hist_rows, "diagnostics": {"historical_strategy_replay_rows": 60, "historical_strategy_replay_symbols": ["BTC-USD", "ETH-USD", "SOL-USD"]}}):
+                with mock.patch("app.model_quality_pass._completed_live_decision_rows", return_value=(rows, {"live_decision_source_available": True, "live_decision_rows_found": 45, "live_decision_rows_completed": 45, "live_decision_join_rate_pct": 100.0, "live_decision_rows_by_market": {"crypto": 45}, "live_decision_rows_by_predictor": {"live_shadow_predictor": 45}, "live_decision_missing_reason": "", "model_quality_source_priority_used": "completed_live_decision_snapshot"})):
+                    with mock.patch("app.model_quality_pass.load_market_trade_events", return_value={"events": []}):
+                        with mock.patch("app.model_quality_pass.build_closed_trades", return_value={"closed_trades": []}):
+                            with mock.patch("app.model_quality_pass.build_all_market_regimes", return_value={}):
+                                with mock.patch("app.model_quality_pass.build_walkforward_report", return_value={}):
+                                    with mock.patch("app.model_quality_pass.build_confidence_calibration_payload", return_value={}):
+                                        with mock.patch("app.model_quality_pass.build_shadow_scorecards", return_value={}):
+                                            out = run_model_quality_full_pass(base_dir=td, hub_dir=td, settings={})
+            self.assertEqual(
+                out.get("replay_generation", {}).get("crypto", {}).get("model_quality_source_priority_used"),
+                "historical_strategy_replay",
+            )
+            self.assertTrue(bool(out.get("replay_generation", {}).get("crypto", {}).get("model_quality_live_rows_supplemental_only")))
+            self.assertFalse(bool(out.get("replay_generation", {}).get("crypto", {}).get("completed_live_rows_used_as_primary")))
+            self.assertEqual(
+                out.get("crypto_feature_source_diagnostics", {}).get("crypto_feature_source_used"),
+                "historical_strategy_replay",
+            )
+            self.assertTrue(bool(out.get("crypto_feature_source_diagnostics", {}).get("completed_live_rows_used_as_supplemental")))
+
+    def test_model_quality_can_use_live_rows_as_primary_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            rows = [
+                {
+                    "symbol": "BTC-USD",
+                    "entry_ts": 1_700_000_000 + (i * 1000),
+                    "exit_ts": 1_700_000_000 + (i * 1000) + 3600,
+                    "entry_price": 100.0 + i,
+                    "exit_price": 101.0 + i,
+                    "hold_hours": 1.0,
+                    "actual_exit_trigger": "Trailing",
+                    "predicted_direction": "up",
+                    "predicted_exit_trigger": "Trailing",
+                    "predicted_confidence": 0.83,
+                    "selected_predictor_name": "live_shadow_predictor",
+                    "source_type": "completed_live_decision_snapshot",
+                }
+                for i in range(45)
+            ]
+            hist_rows = [
+                {
+                    "market": "crypto",
+                    "symbol": "BTC-USD",
+                    "source_type": "historical_strategy_replay",
+                    "entry_ts": 1_700_000_000 + (i * 7200),
+                    "exit_ts": 1_700_000_000 + (i * 7200) + 3600,
+                    "entry_price": 100.0 + i,
+                    "exit_price": 101.0 + i,
+                    "hold_hours": 1.0,
+                    "actual_exit_trigger": "Trailing",
+                }
+                for i in range(60)
+            ]
+            with mock.patch.dict(os.environ, {"MODEL_QUALITY_USE_LIVE_ROWS_AS_PRIMARY": "1"}, clear=False):
+                with mock.patch("app.model_quality_pass.build_crypto_historical_strategy_replay", return_value={"state": "READY", "rows": hist_rows, "diagnostics": {"historical_strategy_replay_rows": 60, "historical_strategy_replay_symbols": ["BTC-USD", "ETH-USD", "SOL-USD"]}}):
+                    with mock.patch("app.model_quality_pass._completed_live_decision_rows", return_value=(rows, {"live_decision_source_available": True, "live_decision_rows_found": 45, "live_decision_rows_completed": 45, "live_decision_join_rate_pct": 100.0, "live_decision_rows_by_market": {"crypto": 45}, "live_decision_rows_by_predictor": {"live_shadow_predictor": 45}, "live_decision_missing_reason": "", "model_quality_source_priority_used": "completed_live_decision_snapshot"})):
+                        with mock.patch("app.model_quality_pass.load_market_trade_events", return_value={"events": []}):
+                            with mock.patch("app.model_quality_pass.build_closed_trades", return_value={"closed_trades": []}):
+                                with mock.patch("app.model_quality_pass.build_all_market_regimes", return_value={}):
+                                    with mock.patch("app.model_quality_pass.build_walkforward_report", return_value={}):
+                                        with mock.patch("app.model_quality_pass.build_confidence_calibration_payload", return_value={}):
+                                            with mock.patch("app.model_quality_pass.build_shadow_scorecards", return_value={}):
+                                                out = run_model_quality_full_pass(base_dir=td, hub_dir=td, settings={})
+            self.assertEqual(out.get("replay_generation", {}).get("crypto", {}).get("model_quality_source_priority_used"), "completed_live_decision_snapshot")
+            self.assertTrue(bool(out.get("replay_generation", {}).get("crypto", {}).get("completed_live_rows_used_as_primary")))
+            self.assertEqual(out.get("replay_generation", {}).get("crypto", {}).get("source_selection_reason"), "live_rows_primary_override_enabled_and_sufficient")
+
+    def test_crypto_clean_expansion_diagnostics_do_not_force_activation(self) -> None:
+        rows = [
+            {
+                "symbol": f"BTC-USD-{i}",
+                "source_type": "historical_strategy_replay",
+                "predicted_direction": "down",
+                "actual_direction": "down",
+                "predicted_exit_trigger": "Risk Cut",
+                "actual_exit_trigger": "Risk Cut",
+                "predicted_confidence": 0.26,
+                "trigger_margin": 0.11,
+                "direction_margin": 0.04,
+                "trigger_scores": {"Risk Cut": 0.62, "Stale Alignment": 0.58},
+                "runner_up_trigger_score": 0.58,
+                "winning_trigger_score": 0.62,
+                "risk_cut_touched": True,
+                "take_profit_touched": False,
+                "trailing_armed": False,
+                "favorable_then_softened_flag": False,
+                "max_adverse_excursion_pct": -2.2,
+                "downside_score": 0.70,
+                "bars_in_trade": 20,
+                "trend_momentum_score": -0.10,
+            }
+            for i in range(3)
+        ]
+        policy = {
+            "source_mode": "historical_strategy_replay",
+            "enable_clean_expansion": True,
+            "base_conf_min": 0.30,
+            "base_trigger_margin_min": 0.13,
+            "base_dir_margin_min": 0.05,
+            "risk_cut_conf_min": 0.30,
+            "risk_cut_trigger_margin_min": 0.13,
+            "risk_cut_dir_margin_min": 0.05,
+            "min_admitted_trades": 40,
+            "min_trigger_scored": 20,
+        }
+        scored = _score_crypto_with_policy(rows, policy)
+        self.assertTrue(bool(scored.get("crypto_clean_expansion_attempted")))
+        self.assertEqual(int(scored.get("crypto_clean_expansion_rows_added", 0)), 3)
+        self.assertEqual(int(scored.get("crypto_clean_expansion_correct_rejected_added_estimate", 0)), 3)
+        self.assertTrue(bool(scored.get("crypto_clean_expansion_guardrails_passed")))
+
+    def test_stocks_use_historical_replay_by_default_even_if_live_rows_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            live_rows = [
+                {
+                    "symbol": "NVDA",
+                    "entry_ts": 1_700_000_000 + (i * 1000),
+                    "exit_ts": 1_700_000_000 + (i * 1000) + 3600,
+                    "entry_price": 100.0,
+                    "exit_price": 101.0,
+                    "hold_hours": 1.0,
+                    "actual_exit_trigger": "Trailing",
+                    "predicted_direction": "up",
+                    "predicted_exit_trigger": "Trailing",
+                    "predicted_confidence": 0.75,
+                    "source_type": "completed_live_decision_snapshot",
+                }
+                for i in range(45)
+            ]
+            stock_rows = [
+                {
+                    "symbol": "NVDA",
+                    "market": "stocks",
+                    "source_type": "historical_api_replay",
+                    "entry_ts": 1_700_000_000 + (i * 7200),
+                    "exit_ts": 1_700_000_000 + (i * 7200) + 3600,
+                    "entry_price": 100.0 + i,
+                    "exit_price": 101.0 + i,
+                    "hold_hours": 1.0,
+                    "actual_exit_trigger": "Trailing",
+                }
+                for i in range(50)
+            ]
+            with mock.patch("app.model_quality_pass._completed_live_decision_rows", side_effect=lambda market, events, closed_rows: (live_rows, {"live_decision_source_available": True, "live_decision_rows_found": 45, "live_decision_rows_completed": 45, "live_decision_join_rate_pct": 100.0, "live_decision_rows_by_market": {market: 45}, "live_decision_rows_by_predictor": {"live_shadow_predictor": 45}, "live_decision_missing_reason": "", "model_quality_source_priority_used": "completed_live_decision_snapshot"}) if market == "stocks" else ([], {"live_decision_source_available": False, "live_decision_rows_found": 0, "live_decision_rows_completed": 0, "live_decision_join_rate_pct": 0.0, "live_decision_rows_by_market": {market: 0}, "live_decision_rows_by_predictor": {}, "live_decision_missing_reason": "completed_live_decision_snapshots_not_available_for_market", "model_quality_source_priority_used": ""})):
+                with mock.patch("app.model_quality_pass._generate_stock_historical_replay_closed_trades", return_value={"rows": stock_rows, "diagnostics": {"source_type": "historical_api_replay", "rows_generated": 50}}):
+                    with mock.patch("app.model_quality_pass.load_market_trade_events", return_value={"events": []}):
+                        with mock.patch("app.model_quality_pass.build_closed_trades", return_value={"closed_trades": []}):
+                            with mock.patch("app.model_quality_pass.build_all_market_regimes", return_value={}):
+                                with mock.patch("app.model_quality_pass.build_walkforward_report", return_value={}):
+                                    with mock.patch("app.model_quality_pass.build_confidence_calibration_payload", return_value={}):
+                                        with mock.patch("app.model_quality_pass.build_shadow_scorecards", return_value={}):
+                                            out = run_model_quality_full_pass(base_dir=td, hub_dir=td, settings={})
+            self.assertEqual(out.get("replay_generation", {}).get("stocks", {}).get("model_quality_source_priority_used"), "historical_api_replay")
+            self.assertTrue(bool(out.get("replay_generation", {}).get("stocks", {}).get("completed_live_rows_used_as_supplemental")))
+            self.assertFalse(bool(out.get("replay_generation", {}).get("stocks", {}).get("completed_live_rows_used_as_primary")))
+
+    def test_forex_keeps_execution_log_primary(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            self._write_jsonl(
+                os.path.join(td, "forex", "execution_audit.jsonl"),
+                [
+                    {"ts": 1_700_000_000 + i, "event": "exit", "symbol": "EUR_USD", "qty": 1.0, "price": 1.01, "avg_entry_price": 1.0, "hold_s": 3600, "pnl_pct": 1.0, "tag": "Trailing"}
+                    for i in range(50)
+                ],
+            )
+            with mock.patch("app.model_quality_pass.build_all_market_regimes", return_value={}):
+                with mock.patch("app.model_quality_pass.build_walkforward_report", return_value={}):
+                    with mock.patch("app.model_quality_pass.build_confidence_calibration_payload", return_value={}):
+                        with mock.patch("app.model_quality_pass.build_shadow_scorecards", return_value={}):
+                            out = run_model_quality_full_pass(base_dir=td, hub_dir=td, settings={})
+            self.assertEqual(out.get("replay_generation", {}).get("forex", {}).get("model_quality_source_priority_used"), "execution_log")
+
+    def test_stock_exit_shape_ignores_bars_after_exit(self) -> None:
+        bars = []
+        base_ts = 1_700_000_000
+        price = 100.0
+        for i in range(24):
+            price *= 1.0015
+            bars.append({"t": base_ts + (i * 3600), "o": price, "h": price * 1.002, "l": price * 0.998, "c": price})
+        for mult in [1.02, 1.03, 1.04]:
+            price *= mult
+            bars.append({"t": base_ts + (len(bars) * 3600), "o": price, "h": price * 1.002, "l": price * 0.998, "c": price})
+        for mult in [0.97, 0.97]:
+            price *= mult
+            bars.append({"t": base_ts + (len(bars) * 3600), "o": price, "h": price * 1.002, "l": price * 0.998, "c": price})
+        exit_price = price
+        for _ in range(20):
+            price *= 1.08
+            bars.append({"t": base_ts + (len(bars) * 3600), "o": price, "h": price * 1.01, "l": price * 0.995, "c": price})
+        trades = _simulate_stock_trades_from_bars("NVDA", bars)
+        self.assertTrue(trades)
+        trade = trades[0]
+        self.assertEqual(trade.get("actual_exit_trigger"), "Trailing")
+        self.assertLess(int(trade.get("exit_ts", 0) or 0), int(bars[-1]["t"]))
+        self.assertLess(float(trade.get("peak_profit_pct", 0.0)), 20.0)
+
+    def test_stock_predictor_uses_exit_shape_for_trailing(self) -> None:
+        train_rows = []
+        for i in range(16):
+            train_rows.append(
+                {
+                    "symbol": "NVDA",
+                    "source_type": "historical_api_replay",
+                    "entry_price": 100.0,
+                    "exit_price": 105.0,
+                    "hold_hours": 18.0,
+                    "actual_exit_trigger": "Trailing",
+                    "actual_direction": "up",
+                    "peak_profit_pct": 6.0,
+                    "drawdown_from_peak_pct": -2.4,
+                    "trailing_armed": True,
+                    "favorable_then_softened_flag": True,
+                    "stale_hold_profile": False,
+                    "trend_decay_after_peak": -1.2,
+                    "recent_return_6": 0.8,
+                    "recent_return_24": 1.6,
+                    "recent_volatility": 0.6,
+                    "trend_momentum_score": 1.2,
+                    "entry_ts": 100 + i,
+                    "exit_ts": 200 + i,
+                }
+            )
+        candidate = {
+            "symbol": "NVDA",
+            "source_type": "historical_api_replay",
+            "entry_price": 100.0,
+            "peak_profit_pct": 5.5,
+            "drawdown_from_peak_pct": -2.1,
+            "trailing_armed": True,
+            "favorable_then_softened_flag": True,
+            "stale_hold_profile": False,
+            "trend_decay_after_peak": -1.1,
+            "recent_return_6": 0.6,
+            "recent_return_24": 1.3,
+            "recent_volatility": 0.55,
+            "trend_momentum_score": 1.0,
+            "entry_ts": 999,
+            "exit_ts": 1999,
+        }
+        out = _stock_predict_one(train_rows=train_rows, candidate=candidate, regime="high_volatility", predictor_variant="candidate")
+        self.assertEqual(str(out.get("predicted_exit_trigger", "")), "Trailing")
+        self.assertEqual(str(out.get("stock_exit_shape_predictive_mode", "")), "active")
+
+    def test_promotion_readiness_surfaces_controlled_rollout_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            self._write_jsonl(
+                os.path.join(td, "forex", "execution_audit.jsonl"),
+                [
+                    {"ts": 1_700_000_000 + i, "event": "exit", "symbol": "EUR_USD", "qty": 1.0, "price": 1.01, "avg_entry_price": 1.0, "hold_s": 3600, "pnl_pct": 1.0, "tag": "Trailing"}
+                    for i in range(60)
+                ],
+            )
+            with mock.patch("app.model_quality_pass.build_all_market_regimes", return_value={}):
+                with mock.patch("app.model_quality_pass.build_walkforward_report", return_value={}):
+                    with mock.patch("app.model_quality_pass.build_confidence_calibration_payload", return_value={}):
+                        with mock.patch("app.model_quality_pass.build_shadow_scorecards", return_value={}):
+                            out = run_model_quality_full_pass(base_dir=td, hub_dir=td, settings={})
+            promo = out.get("promotion_readiness", {}).get("forex", {})
+            rollout = out.get("controlled_rollout_readiness", {}).get("forex", {})
+            self.assertIn("controlled_rollout_eligible", promo)
+            self.assertIn("full_promotion_eligible", promo)
+            self.assertIn("risk_multiplier_recommended", promo)
+            self.assertIn("eligible", rollout)
+            self.assertIn("risk_multiplier_recommended", rollout)
 
 
 if __name__ == "__main__":

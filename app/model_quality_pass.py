@@ -79,6 +79,21 @@ def _safe_read_json(path: str) -> Dict[str, Any]:
         return {}
 
 
+def _env_flag(name: str) -> bool:
+    return _s(os.environ.get(name, "")).lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(float(os.environ.get(name, default)))
+    except Exception:
+        return int(default)
+
+
+def _env_str(name: str, default: str = "") -> str:
+    return _s(os.environ.get(name, default)) or default
+
+
 def _safe_read_jsonl(path: str, max_lines: int = 800000) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     try:
@@ -455,6 +470,102 @@ def _derive_entry_price_from_exit(row: Dict[str, Any], market: str) -> float:
     return float(px) if px > 0.0 else 0.0
 
 
+def _predicted_direction_from_action(action: str, market: str) -> str:
+    act = _s(action).lower()
+    mk = _s(market).lower()
+    if act in {"buy", "long"}:
+        return "up"
+    if act in {"sell", "short"}:
+        return "down" if mk == "forex" else "up"
+    return ""
+
+
+def _extract_live_prediction_field(row: Dict[str, Any], keys: Iterable[str]) -> Any:
+    for key in keys:
+        if key in row and row.get(key) not in (None, ""):
+            return row.get(key)
+    raw = row.get("raw", {})
+    if isinstance(raw, dict):
+        for key in keys:
+            if key in raw and raw.get(key) not in (None, ""):
+                return raw.get(key)
+    return None
+
+
+def _completed_live_decision_rows(
+    *,
+    market: str,
+    events: List[Dict[str, Any]],
+    closed_rows: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    mk = _s(market).lower()
+    rows_out: List[Dict[str, Any]] = []
+    by_market: Dict[str, int] = {mk: 0}
+    by_predictor: Dict[str, int] = {}
+    found = 0
+    completed = 0
+    if mk != "crypto":
+        return [], {
+            "live_decision_source_available": False,
+            "live_decision_rows_found": 0,
+            "live_decision_rows_completed": 0,
+            "live_decision_join_rate_pct": 0.0,
+            "live_decision_rows_by_market": by_market,
+            "live_decision_rows_by_predictor": {},
+            "live_decision_missing_reason": "completed_live_decision_snapshots_not_available_for_market",
+            "model_quality_source_priority_used": "",
+        }
+    for row in list(closed_rows or []):
+        if not isinstance(row, dict):
+            continue
+        pred_dir = _s(row.get("predicted_direction", "")) or _predicted_direction_from_action(_s(row.get("entry_snapshot_selected_action", "")), mk)
+        pred_trigger = _s(row.get("predicted_exit_trigger", "")) or _s(row.get("entry_snapshot_normalized_trigger", ""))
+        pred_conf = _extract_live_prediction_field(row, ("predicted_confidence", "entry_snapshot_ai_confidence", "entry_snapshot_strategy_score"))
+        predictor_name = _s(_extract_live_prediction_field(row, ("predictor_name", "entry_snapshot_policy_mode", "entry_snapshot_profile"))) or "live_snapshot"
+        predictor_variant = _s(_extract_live_prediction_field(row, ("predictor_variant", "entry_snapshot_entry_alignment_mode", "entry_snapshot_signal_gate_mode"))) or "live"
+        trigger_scores = _extract_live_prediction_field(row, ("trigger_scores",))
+        direction_scores = _extract_live_prediction_field(row, ("direction_scores",))
+        if pred_dir or pred_trigger or pred_conf is not None:
+            found += 1
+        if not pred_dir or pred_conf is None:
+            continue
+        completed += 1
+        item = dict(row)
+        item["predicted_direction"] = pred_dir
+        item["predicted_exit_trigger"] = pred_trigger or "Unknown"
+        item["predicted_confidence"] = round(_f(pred_conf, 0.0), 6)
+        if isinstance(trigger_scores, dict):
+            item["trigger_scores"] = dict(trigger_scores)
+        if isinstance(direction_scores, dict):
+            item["direction_scores"] = dict(direction_scores)
+        item["selected_predictor_name"] = predictor_name
+        item["predictor_mode"] = predictor_name
+        item["predictor_variant"] = predictor_variant
+        item["source_type"] = "completed_live_decision_snapshot"
+        item["raw_rule_reason"] = _s(row.get("entry_snapshot_raw_rule_reason", "")) or _s(row.get("raw_rule_reason", ""))
+        item["event_exit_tag"] = _s(row.get("event_exit_tag", ""))
+        item["actual_direction"] = _trade_direction(item)
+        by_predictor[predictor_name] = int(by_predictor.get(predictor_name, 0) + 1)
+        rows_out.append(item)
+    rows_out.sort(key=_stable_row_sort_key)
+    missing_reason = ""
+    if not rows_out:
+        if found <= 0:
+            missing_reason = "no_completed_live_decision_prediction_fields"
+        else:
+            missing_reason = "missing_required_predicted_direction_or_confidence"
+    return rows_out, {
+        "live_decision_source_available": bool(rows_out),
+        "live_decision_rows_found": int(found),
+        "live_decision_rows_completed": int(completed),
+        "live_decision_join_rate_pct": round(100.0 * float(completed) / float(max(1, found)), 4) if found else 0.0,
+        "live_decision_rows_by_market": by_market,
+        "live_decision_rows_by_predictor": by_predictor,
+        "live_decision_missing_reason": missing_reason,
+        "model_quality_source_priority_used": "completed_live_decision_snapshot" if rows_out else "",
+    }
+
+
 def _closed_trades_from_exits(events: Iterable[Dict[str, Any]], market: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for row in list(events or []):
@@ -630,6 +741,7 @@ def build_market_dataset_quality(hub_dir: str, market: str) -> Dict[str, Any]:
 
     closed_info = build_closed_trades(events, _s(market).lower())
     closed = closed_info.get("closed_trades", []) if isinstance(closed_info.get("closed_trades", []), list) else []
+    live_rows, live_diag = _completed_live_decision_rows(market=_s(market).lower(), events=events, closed_rows=closed)
     holds_non_positive = sum(1 for r in closed if _f(r.get("hold_hours", 0.0), 0.0) <= 0.0)
     out = {
         "market": _s(market).lower(),
@@ -647,6 +759,7 @@ def build_market_dataset_quality(hub_dir: str, market: str) -> Dict[str, Any]:
         "closed_hold_non_positive": int(holds_non_positive),
         "orphan_exit_qty": round(_f(closed_info.get("orphan_exit_qty", 0.0), 0.0), 8),
         "open_lot_qty": round(_f(closed_info.get("open_lot_qty", 0.0), 0.0), 8),
+        "live_decision_source_diagnostics": live_diag,
     }
     if diagnostics:
         out["context_diagnostics"] = diagnostics
@@ -756,15 +869,12 @@ def _attach_crypto_artifact_features(
         },
         "feature_source": {
             "crypto_feature_source_priority": [
-                "decision_snapshot",
-                "trained_artifact",
                 "historical_strategy_replay",
+                "trained_artifact",
                 "closed_trade_only",
             ],
             "crypto_feature_source_used": (
-                "decision_snapshot"
-                if snapshot_rows > 0
-                else "trained_artifact"
+                "trained_artifact"
                 if artifact_rows > 0
                 else "closed_trade_only"
             ),
@@ -798,6 +908,33 @@ def _sha256_file(path: str) -> str:
                 break
             h.update(chunk)
     return h.hexdigest()
+
+
+def _stable_row_sort_key(row: Dict[str, Any]) -> Tuple[int, int, str, str]:
+    return (
+        int(_f(row.get("entry_ts", 0.0), 0.0)),
+        int(_f(row.get("exit_ts", 0.0), 0.0)),
+        _s(row.get("symbol", "")),
+        _s(row.get("actual_exit_trigger", "")),
+    )
+
+
+def _stable_rows_hash(rows: List[Dict[str, Any]]) -> str:
+    compact = []
+    for row in list(rows or []):
+        compact.append(
+            [
+                _s(row.get("symbol", "")),
+                int(_f(row.get("entry_ts", 0.0), 0.0)),
+                int(_f(row.get("exit_ts", 0.0), 0.0)),
+                round(_f(row.get("entry_price", 0.0), 0.0), 8),
+                round(_f(row.get("exit_price", 0.0), 0.0), 8),
+                _s(row.get("actual_exit_trigger", "")),
+                _s(row.get("source_type", "")),
+            ]
+        )
+    payload = json.dumps(compact, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _latest_replay_path(hub_dir: str, market: str) -> str:
@@ -2123,24 +2260,115 @@ def _stock_predict_one(
     ret24 = _f(candidate.get("recent_return_24", 0.0), 0.0)
     vol = _f(candidate.get("recent_volatility", 0.0), 0.0)
     signal_margin = _f(candidate.get("signal_margin", 0.0), 0.0)
+    peak_profit_pct = _f(candidate.get("peak_profit_pct", 0.0), 0.0)
+    drawdown_from_peak_pct = abs(_f(candidate.get("drawdown_from_peak_pct", 0.0), 0.0))
+    trailing_armed = bool(candidate.get("trailing_armed", False))
+    favorable_then_softened = bool(candidate.get("favorable_then_softened_flag", False))
+    stale_hold_profile = bool(candidate.get("stale_hold_profile", False))
+    volatility_expansion_pct = _f(candidate.get("volatility_expansion_pct", 0.0), 0.0)
+    trend_decay_after_peak = _f(candidate.get("trend_decay_after_peak", 0.0), 0.0)
+    gap_against_position_pct = _f(candidate.get("gap_against_position_pct", 0.0), 0.0)
+    exit_m3 = _f(candidate.get("exit_momentum_3", 0.0), 0.0)
+    exit_m6 = _f(candidate.get("exit_momentum_6", 0.0), 0.0)
     stats = _weighted_trade_stats(filtered)
     up_score = (0.55 * stats.get("up_rate", 0.0)) + (0.25 * max(0.0, mom / 4.0)) + (0.15 * max(0.0, ret24 / 5.0)) + (0.05 * max(0.0, signal_margin))
     down_score = (0.55 * stats.get("down_rate", 0.0)) + (0.25 * max(0.0, -mom / 4.0)) + (0.15 * max(0.0, -ret24 / 5.0)) + (0.05 * max(0.0, vol / 2.5))
     guard_applied = False
+    up_dampened = False
     if _s(predictor_variant).lower() in {"candidate", "stabilized"}:
         down_case_score = (0.45 * stats.get("down_rate", 0.0)) + (0.20 * max(0.0, -ret6 / 3.0)) + (0.20 * max(0.0, -ret24 / 4.0)) + (0.15 * max(0.0, vol / 2.0))
         up_case_score = (0.45 * stats.get("up_rate", 0.0)) + (0.20 * max(0.0, ret6 / 3.0)) + (0.20 * max(0.0, ret24 / 4.0)) + (0.15 * max(0.0, signal_margin))
+        guard_reason = ""
+        same_symbol_up_support = sum(1 for r in symbol_rows if _s(r.get("actual_direction", "")).lower() == "up")
+        same_symbol_down_support = sum(1 for r in symbol_rows if _s(r.get("actual_direction", "")).lower() == "down")
+        same_regime_up_support = sum(1 for r in regime_rows if _s(r.get("actual_direction", "")).lower() == "up")
+        same_regime_down_support = sum(1 for r in regime_rows if _s(r.get("actual_direction", "")).lower() == "down")
         if down_case_score >= up_case_score and mom <= 0.25:
             down_score += 0.35
             guard_applied = True
+            guard_reason = "weak_negative_returns_high_volatility"
+        score_gap = abs(up_case_score - down_case_score)
+        if score_gap <= 0.18:
+            if (same_symbol_down_support + same_regime_down_support) > (same_symbol_up_support + same_regime_up_support):
+                down_score += 0.18
+                guard_applied = True
+                guard_reason = guard_reason or "close_scores_prefer_down_support"
+            elif (same_symbol_up_support + same_regime_up_support) > (same_symbol_down_support + same_regime_down_support):
+                up_score += 0.12
+        if ret6 <= 0.0 and ret24 <= 0.0 and vol >= 0.65 and same_symbol_up_support < max(3, same_symbol_down_support):
+            up_score -= 0.16
+            up_dampened = True
+            guard_applied = True
+            guard_reason = guard_reason or "up_dampened_by_down_regime"
     else:
         down_case_score = down_score
         up_case_score = up_score
+        guard_reason = ""
+    trailing_score = (0.58 * stats.get("trailing_rate", 0.0)) + (0.24 * max(0.0, ret6 / 4.0)) + (0.18 * max(0.0, vol / 2.3))
+    stale_score = (0.58 * stats.get("stale_rate", 0.0)) + (0.22 * max(0.0, -ret6 / 3.0)) + (0.20 * max(0.0, vol / 2.3 if ret24 < 0.5 else 0.0))
+    trigger_reason = "balanced"
+    stale_override_applied = False
+    trailing_override_applied = False
+    exit_shape_reason = ""
+    down_exit_shape_reason = ""
+    if ret24 <= 0.0 or mom <= 0.2:
+        stale_score += 0.20
+        trigger_reason = "weak_or_negative_momentum"
+        stale_override_applied = True
+    if ret6 <= 0.15 and ret24 <= 0.40 and vol >= 0.55 and signal_margin <= 0.22:
+        stale_score += 0.14
+        trigger_reason = "mixed_or_fading_returns"
+        stale_override_applied = True
+    if ret6 >= 0.8 and ret24 >= 1.2 and vol >= 0.35:
+        trailing_score += 0.18
+        trigger_reason = "favorable_move_profile"
+        trailing_override_applied = True
+    if ret6 >= 1.0 and ret24 >= 1.4 and mom >= 0.45 and signal_margin >= 0.24:
+        trailing_score += 0.12
+        trigger_reason = "favorable_continuation_profile"
+        trailing_override_applied = True
+    if vol >= 0.70 and (ret6 <= 0.25 or ret24 <= 0.60) and mom <= 0.30:
+        stale_score += 0.10
+        trigger_reason = "elevated_vol_without_follow_through"
+        stale_override_applied = True
+    if trailing_armed and favorable_then_softened and peak_profit_pct >= 1.5 and drawdown_from_peak_pct >= 1.2:
+        trailing_score += 0.22
+        trigger_reason = "exit_shape_trailing_pullback"
+        exit_shape_reason = "favorable_move_then_pullback"
+        trailing_override_applied = True
+    if stale_hold_profile or (peak_profit_pct < 1.0 and trend_decay_after_peak <= -0.8):
+        stale_score += 0.20
+        trigger_reason = "exit_shape_stale_hold_decay"
+        exit_shape_reason = "weak_favorable_move_or_decay"
+        stale_override_applied = True
+    if volatility_expansion_pct >= 25.0 and favorable_then_softened and drawdown_from_peak_pct >= 1.0:
+        trailing_score += 0.10
+        trigger_reason = "exit_shape_volatility_followthrough"
+        exit_shape_reason = "volatility_expansion_with_pullback"
+        trailing_override_applied = True
+    if volatility_expansion_pct >= 25.0 and not favorable_then_softened and (ret6 <= 0.2 or ret24 <= 0.5):
+        stale_score += 0.12
+        trigger_reason = "exit_shape_chop_without_followthrough"
+        exit_shape_reason = "volatility_expansion_without_followthrough"
+        stale_override_applied = True
     trigger_scores = {
-        "Trailing": (0.60 * stats.get("trailing_rate", 0.0)) + (0.25 * max(0.0, ret6 / 4.0)) + (0.15 * max(0.0, vol / 2.5)),
-        "Stale Alignment": (0.60 * stats.get("stale_rate", 0.0)) + (0.20 * max(0.0, -ret6 / 3.0)) + (0.20 * max(0.0, vol / 2.5 if ret24 < 0.5 else 0.0)),
+        "Trailing": trailing_score,
+        "Stale Alignment": stale_score,
         "Unknown": 0.10,
     }
+    pred_dir = "up" if up_score >= down_score else "down"
+    if gap_against_position_pct >= 0.35:
+        down_score += 0.12
+        down_exit_shape_reason = "gap_against_position"
+    if trend_decay_after_peak <= -1.0:
+        down_score += 0.14
+        down_exit_shape_reason = down_exit_shape_reason or "trend_decay_after_peak"
+    if volatility_expansion_pct >= 25.0 and ret6 <= 0.0 and ret24 <= 0.5:
+        down_score += 0.10
+        down_exit_shape_reason = down_exit_shape_reason or "volatility_expansion_with_weak_returns"
+    if _f(candidate.get("max_adverse_excursion_pct", 0.0), 0.0) <= -1.2:
+        down_score += 0.12
+        down_exit_shape_reason = down_exit_shape_reason or "large_adverse_excursion"
     pred_dir = "up" if up_score >= down_score else "down"
     pred_trigger = max(trigger_scores.keys(), key=lambda k: trigger_scores[k])
     hold_h = max(0.25, _median([_f(r.get("hold_hours", 0.0), 0.0) for r in filtered], default=6.0))
@@ -2165,8 +2393,20 @@ def _stock_predict_one(
         "predictor_mode": "stock_historical_replay",
         "predictor_variant": _s(predictor_variant).lower() or "candidate",
         "stock_up_bias_guard_applied": bool(guard_applied),
+        "stock_down_case_guard_reason": guard_reason,
+        "stock_down_case_guard_applied": bool(guard_applied),
+        "stock_up_dampened_by_down_regime": bool(up_dampened),
         "stock_down_case_score": round(float(down_case_score), 6),
         "stock_up_case_score": round(float(up_case_score), 6),
+        "stock_trigger_separation_reason": trigger_reason,
+        "stock_stale_vs_trailing_exit_shape_reason": exit_shape_reason,
+        "stock_trailing_score": round(float(trailing_score), 6),
+        "stock_stale_score": round(float(stale_score), 6),
+        "stock_stale_vs_trailing_margin": round(float(stale_score - trailing_score), 6),
+        "stock_stale_override_applied": bool(stale_override_applied),
+        "stock_trailing_override_applied": bool(trailing_override_applied),
+        "stock_down_case_exit_shape_reason": down_exit_shape_reason,
+        "stock_exit_shape_predictive_mode": "active",
         "winning_reason": "momentum_up" if pred_dir == "up" else "momentum_down",
     }
 
@@ -2485,6 +2725,20 @@ def _crypto_historical_replay_admission_decision(row: Dict[str, Any], policy: Di
     rescue_band = _f(policy.get("rescue_margin_band", 0.05), 0.05)
     rescue_conf_band = _f(policy.get("rescue_conf_band", 0.05), 0.05)
     rescue_dir_band = _f(policy.get("rescue_dir_band", 0.05), 0.05)
+    clean_expansion_enabled = bool(policy.get("enable_clean_expansion", False))
+
+    def clean_expansion_allowed(trigger: str) -> bool:
+        if not clean_expansion_enabled:
+            return False
+        if trigger == "Risk Cut":
+            return bool(row.get("risk_cut_touched", False)) and _f(row.get("max_adverse_excursion_pct", 0.0), 0.0) <= -1.8 and _f(row.get("downside_score", 0.0), 0.0) >= 0.55
+        if trigger == "Trailing":
+            return bool(row.get("trailing_armed", False)) and bool(row.get("favorable_then_softened_flag", False)) and _f(row.get("trailing_pullback_pct", 0.0), 0.0) >= 1.0 and not bool(row.get("risk_cut_touched", False))
+        if trigger == "Stale Alignment":
+            return (not bool(row.get("risk_cut_touched", False))) and (not bool(row.get("take_profit_touched", False))) and (not bool(row.get("trailing_armed", False))) and _f(row.get("bars_in_trade", 0.0), 0.0) >= 12.0 and _f(row.get("trend_momentum_score", 0.0), 0.0) <= 0.15
+        if trigger == "Take Profit":
+            return bool(row.get("take_profit_touched", False)) and _f(row.get("max_favorable_excursion_pct", 0.0), 0.0) >= 4.0
+        return False
 
     if pred_trigger == "Risk Cut":
         conf_min = _f(policy.get("risk_cut_conf_min", base_conf), base_conf)
@@ -2493,14 +2747,20 @@ def _crypto_historical_replay_admission_decision(row: Dict[str, Any], policy: Di
         if conf < conf_min:
             if bool(policy.get("enable_risk_cut_rescue", False)) and bool(row.get("risk_cut_touched", False)) and conf >= (conf_min - rescue_conf_band) and separation >= max(0.0, trig_min - rescue_band):
                 return True, "risk_cut_rescue"
+            if clean_expansion_allowed("Risk Cut") and conf >= (conf_min - 0.08):
+                return True, "clean_expansion_risk_cut"
             return False, "risk_cut_conf_low"
         if trig_margin < trig_min:
             if bool(policy.get("enable_risk_cut_rescue", False)) and bool(row.get("risk_cut_touched", False)) and trig_margin >= (trig_min - rescue_band):
                 return True, "risk_cut_rescue"
+            if clean_expansion_allowed("Risk Cut") and trig_margin >= (trig_min - 0.10):
+                return True, "clean_expansion_risk_cut"
             return False, "risk_cut_trigger_margin_low"
         if dir_margin < dir_min:
             if bool(policy.get("enable_risk_cut_rescue", False)) and bool(row.get("risk_cut_touched", False)) and dir_margin >= (dir_min - rescue_dir_band):
                 return True, "risk_cut_rescue"
+            if clean_expansion_allowed("Risk Cut") and dir_margin >= (dir_min - 0.10):
+                return True, "clean_expansion_risk_cut"
             return False, "risk_cut_dir_margin_low"
         return True, "risk_cut_strong"
 
@@ -2509,12 +2769,18 @@ def _crypto_historical_replay_admission_decision(row: Dict[str, Any], policy: Di
         trig_min = _f(policy.get("take_profit_trigger_margin_min", base_trig), base_trig)
         gap_min = _f(policy.get("take_profit_score_gap_min", 0.15), 0.15)
         if conf < conf_min:
+            if clean_expansion_allowed("Take Profit") and conf >= (conf_min - 0.06):
+                return True, "clean_expansion_take_profit"
             return False, "take_profit_conf_low"
         if trig_margin < trig_min:
+            if clean_expansion_allowed("Take Profit") and trig_margin >= (trig_min - 0.08):
+                return True, "clean_expansion_take_profit"
             return False, "take_profit_trigger_margin_low"
         if separation < gap_min:
             if bool(policy.get("enable_take_profit_rescue", False)) and bool(row.get("take_profit_touched", False)) and separation >= (gap_min - rescue_band):
                 return True, "take_profit_rescue"
+            if clean_expansion_allowed("Take Profit") and separation >= (gap_min - 0.10):
+                return True, "clean_expansion_take_profit"
             return False, "take_profit_score_gap_low"
         return True, "take_profit_strong"
 
@@ -2525,14 +2791,20 @@ def _crypto_historical_replay_admission_decision(row: Dict[str, Any], policy: Di
         if conf < conf_min:
             if bool(policy.get("enable_trailing_rescue", False)) and bool(row.get("trailing_armed", False)) and bool(row.get("favorable_then_softened_flag", False)) and conf >= (conf_min - rescue_conf_band):
                 return True, "trailing_rescue"
+            if clean_expansion_allowed("Trailing") and conf >= (conf_min - 0.06):
+                return True, "clean_expansion_trailing"
             return False, "trailing_conf_low"
         if trig_margin < trig_min:
             if bool(policy.get("enable_trailing_rescue", False)) and bool(row.get("trailing_armed", False)) and bool(row.get("favorable_then_softened_flag", False)) and trig_margin >= (trig_min - rescue_band):
                 return True, "trailing_rescue"
+            if clean_expansion_allowed("Trailing") and trig_margin >= (trig_min - 0.08):
+                return True, "clean_expansion_trailing"
             return False, "trailing_trigger_margin_low"
         if dir_margin < dir_min:
             if bool(policy.get("enable_trailing_rescue", False)) and bool(row.get("trailing_armed", False)) and bool(row.get("favorable_then_softened_flag", False)) and dir_margin >= (dir_min - rescue_dir_band):
                 return True, "trailing_rescue"
+            if clean_expansion_allowed("Trailing") and dir_margin >= (dir_min - 0.08):
+                return True, "clean_expansion_trailing"
             return False, "trailing_dir_margin_low"
         return True, "trailing_strong"
 
@@ -2541,12 +2813,18 @@ def _crypto_historical_replay_admission_decision(row: Dict[str, Any], policy: Di
         trig_min = _f(policy.get("stale_trigger_margin_min", base_trig), base_trig)
         dir_min = _f(policy.get("stale_dir_margin_min", base_dir), base_dir)
         if conf < conf_min:
+            if clean_expansion_allowed("Stale Alignment") and conf >= (conf_min - 0.06):
+                return True, "clean_expansion_stale"
             return False, "stale_conf_low"
         if trig_margin < trig_min:
+            if clean_expansion_allowed("Stale Alignment") and trig_margin >= (trig_min - 0.08):
+                return True, "clean_expansion_stale"
             return False, "stale_trigger_margin_low"
         if dir_margin < dir_min:
             if bool(policy.get("enable_stale_rescue", False)) and not bool(row.get("risk_cut_touched", False)) and not bool(row.get("take_profit_touched", False)) and not bool(row.get("trailing_armed", False)) and dir_margin >= (dir_min - rescue_dir_band):
                 return True, "stale_rescue"
+            if clean_expansion_allowed("Stale Alignment") and dir_margin >= (dir_min - 0.10):
+                return True, "clean_expansion_stale"
             return False, "stale_dir_margin_low"
         return True, "stale_strong"
 
@@ -2669,6 +2947,7 @@ def _score_crypto_with_policy(rows: List[Dict[str, Any]], policy: Dict[str, Any]
     predicted_take_profit = sum(1 for r in rows if _s(r.get("predicted_exit_trigger", "")) == "Take Profit")
     admitted_manual = sum(1 for r in admitted if _s(r.get("predicted_exit_trigger", "")) == "Manual")
     admitted_trailing = sum(1 for r in admitted if _s(r.get("predicted_exit_trigger", "")) == "Trailing")
+    clean_expansion_rows = [r for r in admitted if _s(r.get("admission_reason", "")).startswith("clean_expansion_")]
     manual_precision = _trigger_precision(admitted, "Manual")
     trailing_precision = _trigger_precision(admitted, "Trailing")
     stale_precision = _trigger_precision(admitted, "Stale Alignment")
@@ -2711,6 +2990,27 @@ def _score_crypto_with_policy(rows: List[Dict[str, Any]], policy: Dict[str, Any]
         act_trig = _s(r.get("actual_exit_trigger", "")) or "Unknown"
         if _s(r.get("predicted_direction", "")).lower() != _s(r.get("actual_direction", "")).lower() or pred_trig != act_trig:
             incorrect_admitted += 1
+    clean_expansion_attempted = bool(policy.get("enable_clean_expansion", False))
+    clean_expansion_rows_added = int(len(clean_expansion_rows))
+    clean_expansion_correct_added_estimate = int(
+        sum(
+            1
+            for r in clean_expansion_rows
+            if _s(r.get("predicted_direction", "")).lower() == _s(r.get("actual_direction", "")).lower()
+            and _s(r.get("predicted_exit_trigger", "")) == _s(r.get("actual_exit_trigger", ""))
+        )
+    )
+    clean_expansion_guardrails_passed = bool(
+        clean_expansion_attempted
+        and clean_expansion_rows_added > 0
+        and clean_expansion_correct_added_estimate >= clean_expansion_rows_added
+    )
+    clean_expansion_rejection_reason = ""
+    if clean_expansion_attempted and not clean_expansion_guardrails_passed:
+        if clean_expansion_rows_added <= 0:
+            clean_expansion_rejection_reason = "no_clean_expansion_rows_admitted"
+        else:
+            clean_expansion_rejection_reason = "clean_expansion_rows_not_clean_enough"
     worst_floor = min(
         _f(metrics.get("directional_accuracy_pct", 0.0), 0.0),
         _f(metrics.get("trigger_match_pct", 0.0), 0.0),
@@ -2767,6 +3067,11 @@ def _score_crypto_with_policy(rows: List[Dict[str, Any]], policy: Dict[str, Any]
             "near_miss_rows_count": int(near_miss_count),
             "correct_rejected_count": int(correct_rejected),
             "incorrect_admitted_count": int(incorrect_admitted),
+            "crypto_clean_expansion_attempted": clean_expansion_attempted,
+            "crypto_clean_expansion_rows_added": clean_expansion_rows_added,
+            "crypto_clean_expansion_correct_rejected_added_estimate": clean_expansion_correct_added_estimate,
+            "crypto_clean_expansion_guardrails_passed": clean_expansion_guardrails_passed,
+            "crypto_clean_expansion_rejection_reason": clean_expansion_rejection_reason,
         }
     if coverage < _f(policy.get("coverage_target", 0.40), 0.40):
         score -= (_f(policy.get("coverage_target", 0.40), 0.40) - coverage) * 110.0
@@ -2821,6 +3126,11 @@ def _score_crypto_with_policy(rows: List[Dict[str, Any]], policy: Dict[str, Any]
         "near_miss_rows_count": int(near_miss_count),
         "correct_rejected_count": int(correct_rejected),
         "incorrect_admitted_count": int(incorrect_admitted),
+        "crypto_clean_expansion_attempted": clean_expansion_attempted,
+        "crypto_clean_expansion_rows_added": clean_expansion_rows_added,
+        "crypto_clean_expansion_correct_rejected_added_estimate": clean_expansion_correct_added_estimate,
+        "crypto_clean_expansion_guardrails_passed": clean_expansion_guardrails_passed,
+        "crypto_clean_expansion_rejection_reason": clean_expansion_rejection_reason,
     }
 
 
@@ -2940,6 +3250,67 @@ def _safe_selection_guardrails(
         if candidate_unknown_count > baseline_unknown_count + 1:
             failures.append("forex_unknown_trigger_increased")
     return failures
+
+
+def _controlled_rollout_status(
+    *,
+    market: str,
+    metrics: Dict[str, Any],
+    ci: Dict[str, Any],
+    worst: Dict[str, Any],
+    windows: int,
+    test_trades: int,
+    trigger_scored: float,
+    trigger_cov: float,
+    admission_rate: float,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    mk = _s(market).lower()
+    thresholds = {
+        "crypto": {"directional_accuracy_pct": 75.0, "trigger_match_pct": 75.0, "pnl_trend_match_pct": 80.0, "risk_multiplier": 0.25},
+        "stocks": {"directional_accuracy_pct": 85.0, "trigger_match_pct": 80.0, "pnl_trend_match_pct": 85.0, "risk_multiplier": 0.50},
+        "forex": {"directional_accuracy_pct": 90.0, "trigger_match_pct": 95.0, "pnl_trend_match_pct": 90.0, "risk_multiplier": 1.0},
+    }.get(mk, {"directional_accuracy_pct": 85.0, "trigger_match_pct": 80.0, "pnl_trend_match_pct": 85.0, "risk_multiplier": 0.50})
+    blockers: List[str] = []
+    for key in ("directional_accuracy_pct", "trigger_match_pct", "pnl_trend_match_pct"):
+        if _f(metrics.get(key, 0.0), 0.0) < _f(thresholds.get(key, 0.0), 0.0):
+            blockers.append(f"{key}_below_controlled_rollout_target")
+    for key in ("directional_accuracy_pct", "trigger_match_pct", "pnl_trend_match_pct"):
+        ci_lb = _f((ci.get(key, {}) if isinstance(ci.get(key, {}), dict) else {}).get("p05", 0.0), 0.0)
+        if ci_lb < max(0.0, _f(thresholds.get(key, 0.0), 0.0) - 10.0):
+            blockers.append(f"{key}_ci_too_weak_for_controlled_rollout")
+        worst_val = _f(worst.get(key, 0.0), 0.0)
+        if worst_val < max(0.0, _f(thresholds.get(key, 0.0), 0.0) - 15.0):
+            blockers.append(f"{key}_worst_window_too_weak_for_controlled_rollout")
+    if windows < 3:
+        blockers.append("walkforward_windows_insufficient_for_controlled_rollout")
+    if test_trades < 40:
+        blockers.append("test_trades_insufficient_for_controlled_rollout")
+    if trigger_scored < 20:
+        blockers.append("trigger_scored_trades_insufficient_for_controlled_rollout")
+    if trigger_cov < 40.0:
+        blockers.append("trigger_coverage_insufficient_for_controlled_rollout")
+    if mk == "crypto" and admission_rate < 40.0:
+        blockers.append("admission_rate_insufficient_for_controlled_rollout")
+    if mk == "crypto":
+        latest = payload.get("safe_selection_diagnostics", {}).get("latest", {}) if isinstance(payload.get("safe_selection_diagnostics", {}), dict) else {}
+        evals = latest.get("candidate_evaluations", []) if isinstance(latest.get("candidate_evaluations", []), list) else []
+        v2 = next((ev for ev in evals if _s(ev.get("variant", "")) == "label_compatible_v2"), {})
+        v2_summary = v2.get("summary", {}) if isinstance(v2.get("summary", {}), dict) else {}
+        v2_failures = list(v2.get("guardrail_failures", []) or [])
+        v2_trades = int(v2_summary.get("admitted_trades", 0) or 0)
+        if v2_trades < 35:
+            blockers.append("crypto_v2_clean_admissions_below_rollout_floor")
+        impermissible = [f for f in v2_failures if f != "candidate_admitted_trades_below_40"]
+        if impermissible:
+            blockers.append("crypto_v2_guardrail_failures_beyond_trade_floor")
+    return {
+        "eligible": not blockers,
+        "reason": "" if not blockers else blockers[0],
+        "blockers": blockers,
+        "risk_multiplier_recommended": float(thresholds.get("risk_multiplier", 0.50)),
+        "thresholds": thresholds,
+    }
 
 
 def _calibrate_abstain_threshold(train_rows: List[Dict[str, Any]], market: str, *, predictor_variant: str = "candidate") -> Dict[str, Any]:
@@ -3085,6 +3456,37 @@ def _calibrate_abstain_threshold(train_rows: List[Dict[str, Any]], market: str, 
                             "rescue_margin_band": 0.05,
                             "rescue_conf_band": 0.05,
                             "rescue_dir_band": 0.05,
+                        },
+                        {
+                            "policy_name_override": "label_compatible_v2_clean_expansion",
+                            "source_mode": "historical_strategy_replay",
+                            "base_conf_min": 0.27,
+                            "base_trigger_margin_min": 0.13,
+                            "base_dir_margin_min": 0.00,
+                            "stale_conf_min": 0.29,
+                            "stale_trigger_margin_min": 0.13,
+                            "stale_dir_margin_min": 0.00,
+                            "trailing_conf_min": 0.26,
+                            "trailing_trigger_margin_min": 0.13,
+                            "trailing_dir_margin_min": 0.00,
+                            "risk_cut_conf_min": 0.27,
+                            "risk_cut_trigger_margin_min": 0.13,
+                            "risk_cut_dir_margin_min": 0.00,
+                            "take_profit_conf_min": 0.25,
+                            "take_profit_trigger_margin_min": 0.12,
+                            "take_profit_score_gap_min": 0.05,
+                            "coverage_target": 0.40,
+                            "min_admitted_trades": 40,
+                            "min_trigger_scored": 20,
+                            "risk_cut_precision_target_pct": 58.0,
+                            "take_profit_precision_target_pct": 52.0,
+                            "trailing_precision_target_pct": 58.0,
+                            "stale_precision_target_pct": 58.0,
+                            "worst_window_floor_target_pct": 85.0,
+                            "enable_clean_expansion": True,
+                            "rescue_margin_band": 0.04,
+                            "rescue_conf_band": 0.04,
+                            "rescue_dir_band": 0.04,
                         },
                         {
                             "policy_name_override": "label_compatible_v2_no_abstain_diagnostic",
@@ -3426,6 +3828,40 @@ def _bootstrap_ci(rows: List[Dict[str, Any]], metric_key: str, rounds: int = 300
     return {"p05": round(q(0.05), 4), "p50": round(q(0.50), 4), "p95": round(q(0.95), 4)}
 
 
+def _apply_replay_deterministic_filters(
+    rows: List[Dict[str, Any]],
+    *,
+    start_ts: int = 0,
+    cutoff_ts: int = 0,
+    locked_symbols: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    locked = {_s(s).upper() for s in list(locked_symbols or []) if _s(s)}
+    out: List[Dict[str, Any]] = []
+    for row in list(rows or []):
+        entry_ts = int(_f(row.get("entry_ts", 0.0), 0.0))
+        exit_ts = int(_f(row.get("exit_ts", 0.0), 0.0))
+        symbol = _s(row.get("symbol", "")).upper()
+        if start_ts > 0 and entry_ts < start_ts:
+            continue
+        if cutoff_ts > 0 and exit_ts > cutoff_ts:
+            continue
+        if locked and symbol not in locked:
+            continue
+        out.append(dict(row))
+    out.sort(key=_stable_row_sort_key)
+    return out
+
+
+def _load_locked_symbol_list(path: str) -> List[str]:
+    if not path or not os.path.exists(path):
+        return []
+    try:
+        payload = _safe_read_json(path)
+        return [str(s) for s in list(payload.get("symbols", []) or []) if _s(s)]
+    except Exception:
+        return []
+
+
 def _stock_symbol_candidates(hub_dir: str, closed_rows: List[Dict[str, Any]], limit: int = 18) -> List[str]:
     out: List[str] = []
     for row in sorted(list(closed_rows or []), key=lambda r: int(_f(r.get("exit_ts", 0.0), 0.0)), reverse=True):
@@ -3495,6 +3931,30 @@ def _bar_close(row: Dict[str, Any]) -> float:
     return 0.0
 
 
+def _bar_open(row: Dict[str, Any]) -> float:
+    for key in ("o", "open"):
+        val = _f(row.get(key, 0.0), 0.0)
+        if val > 0.0:
+            return val
+    return _bar_close(row)
+
+
+def _bar_high(row: Dict[str, Any]) -> float:
+    for key in ("h", "high"):
+        val = _f(row.get(key, 0.0), 0.0)
+        if val > 0.0:
+            return val
+    return _bar_close(row)
+
+
+def _bar_low(row: Dict[str, Any]) -> float:
+    for key in ("l", "low"):
+        val = _f(row.get(key, 0.0), 0.0)
+        if val > 0.0:
+            return val
+    return _bar_close(row)
+
+
 def _bar_ts(row: Dict[str, Any]) -> int:
     txt = _s(row.get("t", row.get("datetime", "")))
     if not txt:
@@ -3511,6 +3971,30 @@ def _bar_ts(row: Dict[str, Any]) -> int:
             return 0
 
 
+def _stock_cache_root(hub_dir: str) -> str:
+    return os.path.join(hub_dir, "stocks", "historical_replay_cache")
+
+
+def _stock_cache_path(hub_dir: str, symbol: str, timeframe: str) -> str:
+    safe_symbol = _s(symbol).upper().replace("/", "_")
+    return os.path.join(_stock_cache_root(hub_dir), f"{safe_symbol}_{timeframe}.json")
+
+
+def _load_stock_cached_bars(hub_dir: str, symbol: str, timeframe: str) -> List[Dict[str, Any]]:
+    payload = _safe_read_json(_stock_cache_path(hub_dir, symbol, timeframe))
+    rows = payload.get("bars", []) if isinstance(payload.get("bars", []), list) else []
+    return [dict(r) for r in rows if isinstance(r, dict)]
+
+
+def _save_stock_cached_bars(hub_dir: str, symbol: str, timeframe: str, bars: List[Dict[str, Any]]) -> None:
+    path = _stock_cache_path(hub_dir, symbol, timeframe)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"bars": list(bars or [])}, f)
+    os.replace(tmp, path)
+
+
 def _simulate_stock_trades_from_bars(symbol: str, bars: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     rows = [dict(r) for r in list(bars or []) if _bar_close(r) > 0.0]
     rows.sort(key=_bar_ts)
@@ -3525,6 +4009,11 @@ def _simulate_stock_trades_from_bars(symbol: str, bars: List[Dict[str, Any]]) ->
     armed = False
     gap_pct = 0.018
     max_hold = 18
+    stock_exit_shape_thresholds = {
+        "trailing_arm_pct": 1.5,
+        "trailing_pullback_pct": 1.8,
+        "stale_hold_bars": float(max_hold),
+    }
     for idx in range(24, len(rows)):
         px = _bar_close(rows[idx])
         ts = _bar_ts(rows[idx])
@@ -3563,6 +4052,48 @@ def _simulate_stock_trades_from_bars(symbol: str, bars: List[Dict[str, Any]]) ->
             trigger = "Stale Alignment"
         if not trigger:
             continue
+        trade_slice = rows[max(0, entry_idx): idx + 1]
+        highs = [_bar_high(r) for r in trade_slice if _bar_high(r) > 0.0]
+        lows = [_bar_low(r) for r in trade_slice if _bar_low(r) > 0.0]
+        closes = [_bar_close(r) for r in trade_slice if _bar_close(r) > 0.0]
+        opens = [_bar_open(r) for r in trade_slice if _bar_open(r) > 0.0]
+        peak_px = max(highs or [px])
+        trough_px = min(lows or [px])
+        peak_idx = 0
+        peak_profit_pct = ((peak_px / entry_px) - 1.0) * 100.0 if entry_px > 0.0 else 0.0
+        worst_drawdown_pct = ((trough_px / entry_px) - 1.0) * 100.0 if entry_px > 0.0 else 0.0
+        for local_idx, r in enumerate(trade_slice):
+            if abs(_bar_high(r) - peak_px) <= 1e-9:
+                peak_idx = local_idx
+        bars_in_trade = len(trade_slice)
+        bars_since_peak = max(0, bars_in_trade - 1 - peak_idx)
+        drawdown_from_peak_pct = ((px / peak_px) - 1.0) * 100.0 if peak_px > 0.0 else 0.0
+        trailing_armed = bool(peak_profit_pct >= stock_exit_shape_thresholds["trailing_arm_pct"])
+        trailing_pullback_pct = abs(drawdown_from_peak_pct)
+        favorable_then_softened_flag = bool(trailing_armed and trailing_pullback_pct >= stock_exit_shape_thresholds["trailing_pullback_pct"])
+        stale_hold_profile = bool(bars_in_trade >= int(stock_exit_shape_thresholds["stale_hold_bars"]) and peak_profit_pct < 2.0 and abs(mom6 * 100.0) < 1.5)
+        pre_slice = rows[max(0, entry_idx - 12): entry_idx]
+        pre_rets: List[float] = []
+        for j in range(1, len(pre_slice)):
+            prev_px = _bar_close(pre_slice[j - 1])
+            cur_px = _bar_close(pre_slice[j])
+            if prev_px > 0.0 and cur_px > 0.0:
+                pre_rets.append(((cur_px / prev_px) - 1.0) * 100.0)
+        pre_vol = _stddev_local(pre_rets)
+        volatility_expansion_pct = ((recent_volatility - pre_vol) / max(0.05, pre_vol or 0.05)) * 100.0 if recent_volatility > 0.0 else 0.0
+        peak_close = closes[peak_idx] if peak_idx < len(closes) else px
+        trend_decay_after_peak = ((px / peak_close) - 1.0) * 100.0 if peak_close > 0.0 else 0.0
+        prev_close = _bar_close(rows[idx - 1]) if idx > 0 else px
+        gap_against_position_pct = max(0.0, ((prev_close - opens[-1]) / max(1e-9, prev_close)) * 100.0)
+        gap_with_position_pct = max(0.0, ((opens[-1] - prev_close) / max(1e-9, prev_close)) * 100.0)
+        if len(closes) >= 4 and closes[-4] > 0.0:
+            exit_m3 = ((closes[-1] / closes[-4]) - 1.0) * 100.0
+        else:
+            exit_m3 = 0.0
+        if len(closes) >= 7 and closes[-7] > 0.0:
+            exit_m6 = ((closes[-1] / closes[-7]) - 1.0) * 100.0
+        else:
+            exit_m6 = 0.0
         pnl_usd = px - entry_px
         out.append(
             {
@@ -3587,6 +4118,24 @@ def _simulate_stock_trades_from_bars(symbol: str, bars: List[Dict[str, Any]]) ->
                 "trend_momentum_score": round(float(trend_momentum_score), 6),
                 "signal_side": "long",
                 "signal_margin": round(float(max(mom6, 0.0) + max(mom24, 0.0)), 6),
+                "max_favorable_excursion_pct": round(float(max(0.0, peak_profit_pct)), 6),
+                "max_adverse_excursion_pct": round(float(min(0.0, worst_drawdown_pct)), 6),
+                "peak_profit_pct": round(float(max(0.0, peak_profit_pct)), 6),
+                "worst_drawdown_pct": round(float(worst_drawdown_pct), 6),
+                "drawdown_from_peak_pct": round(float(drawdown_from_peak_pct), 6),
+                "bars_since_peak": int(bars_since_peak),
+                "bars_in_trade": int(bars_in_trade),
+                "trailing_armed": bool(trailing_armed),
+                "trailing_pullback_pct": round(float(trailing_pullback_pct), 6),
+                "favorable_then_softened_flag": bool(favorable_then_softened_flag),
+                "stale_hold_profile": bool(stale_hold_profile),
+                "volatility_expansion_pct": round(float(volatility_expansion_pct), 6),
+                "trend_decay_after_peak": round(float(trend_decay_after_peak), 6),
+                "gap_against_position_pct": round(float(gap_against_position_pct), 6),
+                "gap_with_position_pct": round(float(gap_with_position_pct), 6),
+                "exit_momentum_3": round(float(exit_m3), 6),
+                "exit_momentum_6": round(float(exit_m6), 6),
+                "stock_exit_shape_thresholds": dict(stock_exit_shape_thresholds),
             }
         )
         in_pos = False
@@ -3604,6 +4153,9 @@ def _generate_stock_historical_replay_closed_trades(
     base_dir: str,
     settings: Dict[str, Any],
     existing_closed_rows: List[Dict[str, Any]],
+    lookback_days: int = 90,
+    max_symbols: int = 24,
+    force_refresh: bool = False,
 ) -> Dict[str, Any]:
     provider, client, diag = _stock_provider_client(settings, base_dir)
     diagnostics: Dict[str, Any] = {
@@ -3611,47 +4163,90 @@ def _generate_stock_historical_replay_closed_trades(
         "provider": provider,
         "symbols_covered": [],
         "candle_timeframe": "1Hour",
-        "lookback_days": 90,
+        "lookback_days": int(lookback_days),
         "hour_bar_limit": 480,
         "daily_bar_limit": 180,
         "date_range": {},
         "rows_generated": 0,
         "skipped": [],
+        "stock_backfill_force_refresh": bool(force_refresh),
+        "stock_backfill_cache_path": _stock_cache_root(hub_dir),
+        "stock_exit_shape_features_enabled": True,
+        "stock_exit_shape_rows_with_features": 0,
+        "stock_exit_shape_rows_missing_features": 0,
+        "stock_exit_shape_feature_names": [
+            "max_favorable_excursion_pct",
+            "max_adverse_excursion_pct",
+            "peak_profit_pct",
+            "worst_drawdown_pct",
+            "drawdown_from_peak_pct",
+            "bars_since_peak",
+            "bars_in_trade",
+            "trailing_armed",
+            "trailing_pullback_pct",
+            "favorable_then_softened_flag",
+            "stale_hold_profile",
+            "volatility_expansion_pct",
+            "trend_decay_after_peak",
+            "gap_against_position_pct",
+            "gap_with_position_pct",
+            "exit_momentum_3",
+            "exit_momentum_6",
+        ],
+        "stock_exit_shape_thresholds": {
+            "trailing_arm_pct": 1.5,
+            "trailing_pullback_pct": 1.8,
+            "stale_hold_bars": 18,
+        },
     }
     if client is None:
         diagnostics["reason_unavailable"] = _s(diag.get("reason", "")) or "provider_unavailable"
         return {"rows": list(existing_closed_rows or []), "diagnostics": diagnostics}
-    symbols = _stock_symbol_candidates(hub_dir, existing_closed_rows, limit=24)
+    symbols = _stock_symbol_candidates(hub_dir, existing_closed_rows, limit=max_symbols)
     generated: List[Dict[str, Any]] = []
     ts_values: List[int] = []
     now_ts = int(time.time())
-    start_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts - (90 * 86400)))
+    start_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts - (int(lookback_days) * 86400)))
     end_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts))
+    diagnostics["stock_backfill_symbols_requested"] = int(len(symbols))
+    cache_rows_loaded = 0
+    remote_rows_fetched = 0
+    errors: List[Dict[str, Any]] = []
     for sym in symbols:
+        bars: List[Dict[str, Any]] = []
+        if not force_refresh:
+            bars = _load_stock_cached_bars(hub_dir, sym, "1Hour")
+            if bars:
+                cache_rows_loaded += len(bars)
         try:
-            if provider == "alpaca":
-                bars = client.get_stock_bars(
-                    sym,
-                    timeframe="1Hour",
-                    limit=480,
-                    feed="iex",
-                    start_iso=start_iso,
-                    end_iso=end_iso,
-                )
-                if len(list(bars or [])) < 48:
+            if len(list(bars or [])) < 48:
+                if provider == "alpaca":
                     bars = client.get_stock_bars(
                         sym,
-                        timeframe="1Day",
-                        limit=180,
+                        timeframe="1Hour",
+                        limit=max(480, int((lookback_days * 24) * 1.2)),
                         feed="iex",
                         start_iso=start_iso,
                         end_iso=end_iso,
                     )
-            else:
-                bars_map = client.get_time_series_batch([sym], interval="1h", outputsize=480)
-                bars = list((bars_map.get(sym, []) if isinstance(bars_map, dict) else []) or [])
+                    if len(list(bars or [])) < 48:
+                        bars = client.get_stock_bars(
+                            sym,
+                            timeframe="1Day",
+                            limit=max(180, int(lookback_days)),
+                            feed="iex",
+                            start_iso=start_iso,
+                            end_iso=end_iso,
+                        )
+                else:
+                    bars_map = client.get_time_series_batch([sym], interval="1h", outputsize=max(480, int((lookback_days * 24) * 1.2)))
+                    bars = list((bars_map.get(sym, []) if isinstance(bars_map, dict) else []) or [])
+                remote_rows_fetched += len(list(bars or []))
+                if bars:
+                    _save_stock_cached_bars(hub_dir, sym, "1Hour", list(bars or []))
         except Exception as exc:
             diagnostics["skipped"].append({"symbol": sym, "reason": f"fetch_error:{type(exc).__name__}"})
+            errors.append({"symbol": sym, "reason": f"fetch_error:{type(exc).__name__}"})
             continue
         if len(list(bars or [])) < 48:
             diagnostics["skipped"].append({"symbol": sym, "reason": "insufficient_bars", "bars": int(len(list(bars or [])))})
@@ -3666,14 +4261,36 @@ def _generate_stock_historical_replay_closed_trades(
         ts_values.extend([int(_f(r.get("exit_ts", 0.0), 0.0)) for r in trade_rows])
     generated.sort(key=lambda r: (int(_f(r.get("entry_ts", 0.0), 0.0)), _s(r.get("symbol", ""))))
     diagnostics["rows_generated"] = int(len(generated))
+    diagnostics["stock_exit_shape_rows_with_features"] = int(sum(1 for r in generated if "bars_in_trade" in r))
+    diagnostics["stock_exit_shape_rows_missing_features"] = int(sum(1 for r in generated if "bars_in_trade" not in r))
+    diagnostics["stock_backfill_symbols_completed"] = int(len(diagnostics["symbols_covered"]))
+    diagnostics["stock_backfill_remote_rows_fetched"] = int(remote_rows_fetched)
+    diagnostics["stock_backfill_cache_rows_loaded"] = int(cache_rows_loaded)
+    diagnostics["stock_backfill_errors"] = errors
     if ts_values:
         diagnostics["date_range"] = {"start_ts": int(min(ts_values)), "end_ts": int(max(ts_values))}
     return {"rows": generated if generated else list(existing_closed_rows or []), "diagnostics": diagnostics}
 
 
-def build_synthetic_replay_artifact(hub_dir: str, market: str, closed_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+def build_synthetic_replay_artifact(
+    hub_dir: str,
+    market: str,
+    closed_rows: List[Dict[str, Any]],
+    deterministic_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     m = _s(market).lower()
-    rows = sorted(list(closed_rows or []), key=lambda r: int(_f(r.get("exit_ts", 0), 0.0)))
+    det_cfg = dict(deterministic_config or {})
+    det_enabled = bool(det_cfg.get("enabled", False))
+    rows = list(closed_rows or [])
+    if det_enabled:
+        rows = _apply_replay_deterministic_filters(
+            rows,
+            start_ts=int(_f(det_cfg.get("start_ts", 0), 0.0)),
+            cutoff_ts=int(_f(det_cfg.get("cutoff_ts", 0), 0.0)),
+            locked_symbols=list(det_cfg.get("locked_symbols", []) or []),
+        )
+    else:
+        rows = sorted(rows, key=_stable_row_sort_key)
     # Bound per-run replay cost while keeping enough coverage for stable estimates.
     if len(rows) > 260:
         rows = rows[-260:]
@@ -3730,7 +4347,23 @@ def build_synthetic_replay_artifact(hub_dir: str, market: str, closed_rows: List
                 regime = _regime_from_prior(prior)
                 rr = dict(r)
                 rr["regime"] = regime
-                pred = _predict_one(train_rows=prior, candidate=rr, regime=regime, market=m, predictor_variant=predictor_variant)
+                if _s(rr.get("source_type", "")) == "completed_live_decision_snapshot" and _s(rr.get("predicted_direction", "")):
+                    pred = {
+                        "predicted_direction": _s(rr.get("predicted_direction", "flat")).lower() or "flat",
+                        "predicted_exit_trigger": _s(rr.get("predicted_exit_trigger", "Unknown")) or "Unknown",
+                        "predicted_hold_hours": _f(rr.get("hold_hours", 0.0), 0.0),
+                        "predicted_exit_price": _f(rr.get("exit_price", rr.get("actual_exit_price", 0.0)), 0.0),
+                        "predicted_confidence": _f(rr.get("predicted_confidence", 0.0), 0.0),
+                        "trigger_scores": dict(rr.get("trigger_scores", {}) if isinstance(rr.get("trigger_scores", {}), dict) else {}),
+                        "direction_scores": dict(rr.get("direction_scores", {}) if isinstance(rr.get("direction_scores", {}), dict) else {}),
+                        "predictor_source_mode": "completed_live_decision_snapshot",
+                        "predictor_variant": _s(rr.get("predictor_variant", "")) or predictor_variant,
+                        "predictor_mode": _s(rr.get("predictor_mode", "")) or _s(rr.get("selected_predictor_name", "")) or "live_snapshot",
+                        "trigger_margin": _f(rr.get("trigger_margin", 0.0), 0.0),
+                        "direction_margin": _f(rr.get("direction_margin", 0.0), 0.0),
+                    }
+                else:
+                    pred = _predict_one(train_rows=prior, candidate=rr, regime=regime, market=m, predictor_variant=predictor_variant)
                 merged = dict(rr)
                 merged.update(pred)
                 merged["predicted_exit_ts"] = int(
@@ -3980,6 +4613,8 @@ def build_synthetic_replay_artifact(hub_dir: str, market: str, closed_rows: List
             "abstained_test_trades": int(len(abstained_all)),
             "admitted_test_trades": int(len(admitted_all)),
             "walkforward_windows": int(len(windows)),
+            "deterministic_mode_enabled": bool(det_enabled),
+            "rows_hash": _stable_rows_hash(rows),
         },
         "abstain_policy": {
             "threshold_median": round(_median([float(v) for v in thr_values], default=0.6), 4),
@@ -4020,6 +4655,17 @@ def build_synthetic_replay_artifact(hub_dir: str, market: str, closed_rows: List
             crypto_diag["label_compatible_v2_near_miss_rows_count"] = int(summary.get("near_miss_rows_count", 0) or 0)
             crypto_diag["label_compatible_v2_correct_rejected_count"] = int(summary.get("correct_rejected_count", 0) or 0)
             crypto_diag["label_compatible_v2_incorrect_admitted_count"] = int(summary.get("incorrect_admitted_count", 0) or 0)
+            crypto_diag["crypto_clean_expansion_attempted"] = bool(summary.get("crypto_clean_expansion_attempted", False))
+            crypto_diag["crypto_clean_expansion_rows_added"] = int(summary.get("crypto_clean_expansion_rows_added", 0) or 0)
+            crypto_diag["crypto_clean_expansion_correct_rejected_added_estimate"] = int(
+                summary.get("crypto_clean_expansion_correct_rejected_added_estimate", 0) or 0
+            )
+            crypto_diag["crypto_clean_expansion_guardrails_passed"] = bool(
+                summary.get("crypto_clean_expansion_guardrails_passed", False)
+            )
+            crypto_diag["crypto_clean_expansion_rejection_reason"] = _s(
+                summary.get("crypto_clean_expansion_rejection_reason", "")
+            )
         payload["crypto_classifier_diagnostics"] = crypto_diag
     if market_diag:
         if m == "stocks":
@@ -4032,6 +4678,16 @@ def build_synthetic_replay_artifact(hub_dir: str, market: str, closed_rows: List
             payload["forex_predictor_mode"] = market_diag.get("predictor_mode", {})
             payload["forex_policy_frontier"] = validation_policy_quality[-1].get("policy_frontier", []) if validation_policy_quality else []
             payload["forex_safe_selection"] = safe_selection_snapshots[-1] if safe_selection_snapshots else {}
+    if det_enabled and m == "crypto":
+        payload["crypto_deterministic_evaluation"] = {
+            "enabled": True,
+            "start_ts": int(_f(det_cfg.get("start_ts", 0), 0.0)),
+            "cutoff_ts": int(_f(det_cfg.get("cutoff_ts", 0), 0.0)),
+            "symbols_locked": bool(det_cfg.get("symbols_locked", False)),
+            "symbol_list_hash": _s(det_cfg.get("symbol_list_hash", "")),
+            "cache_frozen": bool(det_cfg.get("cache_frozen", False)),
+            "rows_hash": _stable_rows_hash(rows),
+        }
     return payload
 
 
@@ -4529,14 +5185,26 @@ def _market_predictor_diagnostics(
     miss_side: Dict[str, int] = {}
     miss_hold: Dict[str, int] = {}
     pnl_conf: Dict[str, Dict[str, int]] = {}
+    actual_down_predicted_up_after_guard = 0
+    stale_as_trailing = 0
+    trailing_as_stale = 0
     for row in population:
         actual_dir = _s(row.get("actual_direction", "")).lower() or "unknown"
         pred_dir = _s(row.get("predicted_direction", "")).lower() or "unknown"
+        actual_trigger = _s(row.get("actual_exit_trigger", "")) or "Unknown"
+        predicted_trigger = _s(row.get("predicted_exit_trigger", "")) or "Unknown"
         actual_pnl = "up" if _trade_return_pct(row) > 1e-9 else "down" if _trade_return_pct(row) < -1e-9 else "flat"
         pred_pnl = "up" if (_f(row.get("predicted_exit_price", 0.0), 0.0) - _f(row.get("entry_price", 0.0), 0.0)) > 1e-9 else "down" if (_f(row.get("predicted_exit_price", 0.0), 0.0) - _f(row.get("entry_price", 0.0), 0.0)) < -1e-9 else "flat"
         pnl_conf.setdefault(actual_pnl, {})
         pnl_conf[actual_pnl][pred_pnl] = int(pnl_conf[actual_pnl].get(pred_pnl, 0) + 1)
-        if actual_dir != pred_dir or (_s(row.get("actual_exit_trigger", "")) or "Unknown") != (_s(row.get("predicted_exit_trigger", "")) or "Unknown"):
+        if _s(market).lower() == "stocks":
+            if actual_dir == "down" and pred_dir == "up" and bool(row.get("stock_down_case_guard_applied", False)):
+                actual_down_predicted_up_after_guard += 1
+            if actual_trigger == "Stale Alignment" and predicted_trigger == "Trailing":
+                stale_as_trailing += 1
+            if actual_trigger == "Trailing" and predicted_trigger == "Stale Alignment":
+                trailing_as_stale += 1
+        if actual_dir != pred_dir or actual_trigger != predicted_trigger:
             miss_symbol[_s(row.get("symbol", "")) or "UNKNOWN"] = int(miss_symbol.get(_s(row.get("symbol", "")) or "UNKNOWN", 0) + 1)
             miss_reason[_s(row.get("raw_rule_reason", row.get("event_exit_tag", ""))) or "unknown"] = int(miss_reason.get(_s(row.get("raw_rule_reason", row.get("event_exit_tag", ""))) or "unknown", 0) + 1)
             miss_return_bucket[_historical_replay_bucket("recent_return_24", _f(row.get("recent_return_24", _trade_return_pct(row)), _trade_return_pct(row)))] = int(miss_return_bucket.get(_historical_replay_bucket("recent_return_24", _f(row.get("recent_return_24", _trade_return_pct(row)), _trade_return_pct(row))), 0) + 1)
@@ -4544,7 +5212,7 @@ def _market_predictor_diagnostics(
             miss_vol_bucket[_historical_replay_bucket("recent_volatility", _f(row.get("recent_volatility", 0.0), 0.0))] = int(miss_vol_bucket.get(_historical_replay_bucket("recent_volatility", _f(row.get("recent_volatility", 0.0), 0.0)), 0) + 1)
             miss_side[_s(row.get("side", row.get("signal_side", ""))) or "unknown"] = int(miss_side.get(_s(row.get("side", row.get("signal_side", ""))) or "unknown", 0) + 1)
             miss_hold[_bucket_hold_hours(_f(row.get("hold_hours", 0.0), 0.0))] = int(miss_hold.get(_bucket_hold_hours(_f(row.get("hold_hours", 0.0), 0.0)), 0) + 1)
-    return {
+    out = {
         "predictor_mode": _count_by(population, lambda r: _s(r.get("predictor_mode", "")) or "generic"),
         "actual_direction_distribution": _count_by(population, lambda r: _s(r.get("actual_direction", "")).lower() or "unknown"),
         "predicted_direction_distribution": _count_by(population, lambda r: _s(r.get("predicted_direction", "")).lower() or "unknown"),
@@ -4568,6 +5236,13 @@ def _market_predictor_diagnostics(
         "feature_source_used": _count_by(population, lambda r: _s(r.get("source_type", "")) or "unknown"),
         "market": market,
     }
+    if _s(market).lower() == "stocks":
+        out["stock_actual_down_predicted_up_after_guard"] = int(actual_down_predicted_up_after_guard)
+        out["stock_stale_trailing_confusion_after_exit_shape"] = {
+            "stale_predicted_trailing": int(stale_as_trailing),
+            "trailing_predicted_stale": int(trailing_as_stale),
+        }
+    return out
 
 
 def build_replay_diagnostics(hub_dir: str, market: str) -> Dict[str, Any]:
@@ -4629,6 +5304,27 @@ def run_model_quality_full_pass(
     settings: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     cfg = sanitize_settings(settings if isinstance(settings, dict) else {})
+    crypto_backfill_enabled = _env_flag("CRYPTO_REPLAY_BACKFILL")
+    crypto_backfill_lookback_days = _env_int("CRYPTO_REPLAY_BACKFILL_LOOKBACK_DAYS", 365 if crypto_backfill_enabled else 90)
+    crypto_backfill_timeframe = _s(os.environ.get("CRYPTO_REPLAY_BACKFILL_TIMEFRAME", "1hour" if crypto_backfill_enabled else "1hour")) or "1hour"
+    crypto_backfill_max_symbols = _env_int("CRYPTO_REPLAY_BACKFILL_MAX_SYMBOLS", 20 if crypto_backfill_enabled else 12)
+    crypto_backfill_force_refresh = _env_flag("CRYPTO_REPLAY_BACKFILL_FORCE_REFRESH")
+    crypto_deterministic = _env_flag("CRYPTO_REPLAY_DETERMINISTIC")
+    crypto_freeze_symbols = _env_flag("CRYPTO_REPLAY_FREEZE_SYMBOLS")
+    crypto_freeze_cache = _env_flag("CRYPTO_REPLAY_FREEZE_CACHE")
+    crypto_repeat_evals = max(1, _env_int("CRYPTO_REPLAY_REPEAT_EVALS", 1))
+    crypto_eval_start_ts = _env_int("CRYPTO_REPLAY_EVAL_START_TS", 0)
+    crypto_eval_cutoff_ts = _env_int("CRYPTO_REPLAY_EVAL_CUTOFF_TS", 0)
+    crypto_symbols_lock_file = _env_str(
+        "CRYPTO_REPLAY_SYMBOLS_LOCK_FILE",
+        os.path.join(hub_dir, "crypto", "historical_replay_cache", "symbols.lock.json"),
+    )
+    stock_backfill_enabled = _env_flag("STOCK_REPLAY_BACKFILL")
+    stock_backfill_lookback_days = _env_int("STOCK_REPLAY_BACKFILL_LOOKBACK_DAYS", 365 if stock_backfill_enabled else 90)
+    stock_backfill_timeframe = _s(os.environ.get("STOCK_REPLAY_BACKFILL_TIMEFRAME", "1Hour" if stock_backfill_enabled else "1Hour")) or "1Hour"
+    stock_backfill_max_symbols = _env_int("STOCK_REPLAY_BACKFILL_MAX_SYMBOLS", 50 if stock_backfill_enabled else 24)
+    stock_backfill_force_refresh = _env_flag("STOCK_REPLAY_BACKFILL_FORCE_REFRESH")
+    use_live_rows_as_primary = _env_flag("MODEL_QUALITY_USE_LIVE_ROWS_AS_PRIMARY")
     ts = int(time.time())
     stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(ts))
     out_dir = os.path.join(hub_dir, "datasets")
@@ -4644,13 +5340,22 @@ def run_model_quality_full_pass(
         loaded = load_market_trade_events(hub_dir, m)
         events = loaded.get("events", []) if isinstance(loaded.get("events", []), list) else []
         closed = build_closed_trades(events, m).get("closed_trades", [])
+        live_rows, live_diag = _completed_live_decision_rows(market=m, events=events, closed_rows=list(closed or []))
         if m == "crypto":
+            crypto_rows_before = int(len(list(closed or [])))
             historical_replay = build_crypto_historical_strategy_replay(
                 hub_dir=hub_dir,
                 settings=cfg,
-                timeframe="1hour",
-                lookback_days=90,
-                max_symbols=12,
+                timeframe=crypto_backfill_timeframe,
+                lookback_days=crypto_backfill_lookback_days,
+                max_symbols=crypto_backfill_max_symbols,
+                force_refresh=crypto_backfill_force_refresh,
+                start_ts=crypto_eval_start_ts if crypto_eval_start_ts > 0 else None,
+                cutoff_ts=crypto_eval_cutoff_ts if crypto_eval_cutoff_ts > 0 else None,
+                symbols_lock_file=crypto_symbols_lock_file,
+                freeze_symbols=crypto_freeze_symbols,
+                freeze_cache=crypto_freeze_cache,
+                deterministic=crypto_deterministic,
             )
             hist_ok, hist_reason = _crypto_historical_replay_sufficient(historical_replay if isinstance(historical_replay, dict) else {})
             crypto_artifact_report = _attach_crypto_artifact_features(
@@ -4658,33 +5363,132 @@ def run_model_quality_full_pass(
                 base_dir=base_dir,
                 settings=cfg,
             )
-            if hist_ok:
+            artifact_feature_diag = crypto_artifact_report.get("feature_source", {}) if isinstance(crypto_artifact_report.get("feature_source", {}), dict) else {}
+            artifact_primary_ok = int(_f(artifact_feature_diag.get("artifact_rows", 0), 0.0)) > 0
+            live_primary_ok = bool(use_live_rows_as_primary and live_rows and len(live_rows) >= 40)
+            source_selection_reason = ""
+            primary_source_used = "closed_trade_only"
+            if live_primary_ok:
+                closed = live_rows
+                primary_source_used = "completed_live_decision_snapshot"
+                source_selection_reason = "live_rows_primary_override_enabled_and_sufficient"
+            elif hist_ok:
                 hist_rows = historical_replay.get("rows", [])
                 if isinstance(hist_rows, list) and hist_rows:
                     closed = hist_rows
+                primary_source_used = "historical_strategy_replay"
+                source_selection_reason = "historical_strategy_replay_available_and_selected_by_default"
+            elif artifact_primary_ok:
+                primary_source_used = "trained_artifact"
+                source_selection_reason = "historical_strategy_replay_insufficient_using_trained_artifact_enriched_closed_trades"
+            else:
+                source_selection_reason = "historical_strategy_replay_insufficient_falling_back_to_closed_trade_only"
             replay_generation[m] = {
-                "source_type": "historical_strategy_replay" if hist_ok else "execution_log",
+                "source_type": primary_source_used,
+                "model_quality_source_priority": [
+                    "historical_strategy_replay",
+                    "trained_artifact",
+                    "closed_trade_only",
+                ],
+                "model_quality_default_source": "historical_strategy_replay",
+                "model_quality_primary_source_used": primary_source_used,
+                "model_quality_live_rows_supplemental_only": not bool(use_live_rows_as_primary),
+                "completed_live_rows_used_as_primary": bool(primary_source_used == "completed_live_decision_snapshot"),
+                "completed_live_rows_used_as_supplemental": bool(live_rows),
+                "source_selection_reason": source_selection_reason,
                 "rows_generated": int(len(list(closed or []))),
                 "historical_strategy_replay": (historical_replay.get("diagnostics", {}) if isinstance(historical_replay, dict) else {}),
                 "historical_strategy_replay_available": bool(hist_ok),
                 "historical_strategy_replay_reason": "" if hist_ok else (hist_reason or _s((historical_replay.get("state", "") if isinstance(historical_replay, dict) else "")) or "historical_strategy_replay_unavailable"),
+                "live_decision_source_diagnostics": live_diag,
                 "trained_artifact_diagnostics": crypto_artifact_report.get("discovery", {}),
                 "crypto_feature_source_diagnostics": crypto_artifact_report.get("feature_source", {}),
+                "crypto_backfill_mode_enabled": bool(crypto_backfill_enabled),
+                "crypto_backfill_lookback_days": int(crypto_backfill_lookback_days),
+                "crypto_backfill_timeframe": crypto_backfill_timeframe,
+                "crypto_backfill_max_symbols": int(crypto_backfill_max_symbols),
+                "crypto_backfill_force_refresh": bool(crypto_backfill_force_refresh),
+                "crypto_backfill_symbols_requested": int(len(list((historical_replay.get("diagnostics", {}) if isinstance(historical_replay, dict) else {}).get("historical_strategy_replay_symbols", []) or []))) if hist_ok else 0,
+                "crypto_backfill_symbols_completed": int(len(list((historical_replay.get("diagnostics", {}) if isinstance(historical_replay, dict) else {}).get("symbols_covered", []) or []))),
+                "crypto_backfill_remote_rows_fetched": int(_f((historical_replay.get("diagnostics", {}) if isinstance(historical_replay, dict) else {}).get("remote_rows_fetched", 0), 0.0)),
+                "crypto_backfill_cache_rows_loaded": int(_f((historical_replay.get("diagnostics", {}) if isinstance(historical_replay, dict) else {}).get("cache_rows_loaded", 0), 0.0)),
+                "crypto_backfill_cache_path": _s((historical_replay.get("diagnostics", {}) if isinstance(historical_replay, dict) else {}).get("replay_cache_path", "")),
+                "crypto_backfill_provider": "kucoin",
+                "crypto_backfill_errors": list((historical_replay.get("skipped", []) if isinstance(historical_replay, dict) else []) or []),
+                "crypto_replay_rows_before": int(crypto_rows_before),
+                "crypto_replay_rows_after": int(len(list(closed or []))),
+                "crypto_replay_deterministic_mode_enabled": bool(crypto_deterministic),
+                "crypto_replay_eval_start_ts": int(_f((historical_replay.get("diagnostics", {}) if isinstance(historical_replay, dict) else {}).get("crypto_replay_eval_start_ts", crypto_eval_start_ts), 0.0)),
+                "crypto_replay_eval_cutoff_ts": int(_f((historical_replay.get("diagnostics", {}) if isinstance(historical_replay, dict) else {}).get("crypto_replay_eval_cutoff_ts", crypto_eval_cutoff_ts), 0.0)),
+                "crypto_replay_symbols_locked": bool((historical_replay.get("diagnostics", {}) if isinstance(historical_replay, dict) else {}).get("crypto_replay_symbols_locked", crypto_freeze_symbols)),
+                "crypto_replay_symbol_list_hash": _s((historical_replay.get("diagnostics", {}) if isinstance(historical_replay, dict) else {}).get("crypto_replay_symbol_list_hash", "")),
+                "crypto_replay_cache_frozen": bool((historical_replay.get("diagnostics", {}) if isinstance(historical_replay, dict) else {}).get("crypto_replay_cache_frozen", crypto_freeze_cache)),
+                "crypto_replay_rows_hash": _s((historical_replay.get("diagnostics", {}) if isinstance(historical_replay, dict) else {}).get("crypto_replay_rows_hash", "")),
+                "crypto_replay_repeat_evals": int(crypto_repeat_evals),
             }
-        if m == "stocks" and len(list(closed or [])) < 40:
+            replay_generation[m]["model_quality_source_priority_used"] = primary_source_used
+        if m == "stocks" and (stock_backfill_enabled or len(list(closed or [])) < 40):
+            stock_rows_before = int(len(list(closed or [])))
             stock_gen = _generate_stock_historical_replay_closed_trades(
                 hub_dir=hub_dir,
                 base_dir=base_dir,
                 settings=cfg,
                 existing_closed_rows=list(closed or []),
+                lookback_days=stock_backfill_lookback_days,
+                max_symbols=stock_backfill_max_symbols,
+                force_refresh=stock_backfill_force_refresh,
             )
             replay_generation[m] = stock_gen.get("diagnostics", {})
             stock_rows = stock_gen.get("rows", [])
-            if isinstance(stock_rows, list) and stock_rows:
+            live_primary_ok = bool(use_live_rows_as_primary and live_rows and len(live_rows) >= 40)
+            if live_primary_ok:
+                closed = live_rows
+                primary_source_used = "completed_live_decision_snapshot"
+                source_selection_reason = "live_rows_primary_override_enabled_and_sufficient"
+            elif isinstance(stock_rows, list) and stock_rows:
                 closed = stock_rows
+                primary_source_used = "historical_api_replay"
+                source_selection_reason = "historical_stock_replay_available_and_selected_by_default"
                 dataset_reports.setdefault(m, {})
+            else:
+                primary_source_used = "closed_trade_only"
+                source_selection_reason = "historical_stock_replay_unavailable_falling_back_to_closed_trade_only"
+            replay_generation[m]["stock_backfill_mode_enabled"] = bool(stock_backfill_enabled)
+            replay_generation[m]["stock_backfill_lookback_days"] = int(stock_backfill_lookback_days)
+            replay_generation[m]["stock_backfill_timeframe"] = stock_backfill_timeframe
+            replay_generation[m]["stock_backfill_max_symbols"] = int(stock_backfill_max_symbols)
+            replay_generation[m]["stock_backfill_force_refresh"] = bool(stock_backfill_force_refresh)
+            replay_generation[m]["stock_replay_rows_before"] = int(stock_rows_before)
+            replay_generation[m]["stock_replay_rows_after"] = int(len(list(closed or [])))
+            replay_generation[m]["live_decision_source_diagnostics"] = live_diag
+            replay_generation[m]["model_quality_source_priority"] = [
+                "historical_api_replay",
+                "closed_trade_only",
+            ]
+            replay_generation[m]["model_quality_default_source"] = "historical_api_replay"
+            replay_generation[m]["model_quality_primary_source_used"] = primary_source_used
+            replay_generation[m]["model_quality_live_rows_supplemental_only"] = not bool(use_live_rows_as_primary)
+            replay_generation[m]["completed_live_rows_used_as_primary"] = bool(primary_source_used == "completed_live_decision_snapshot")
+            replay_generation[m]["completed_live_rows_used_as_supplemental"] = bool(live_rows)
+            replay_generation[m]["source_selection_reason"] = source_selection_reason
+            replay_generation[m]["model_quality_source_priority_used"] = primary_source_used
         elif m != "crypto":
-            replay_generation[m] = {"source_type": "execution_log", "rows_generated": int(len(list(closed or [])))}
+            replay_generation[m] = {
+                "source_type": "execution_log",
+                "rows_generated": int(len(list(closed or []))),
+                "live_decision_source_diagnostics": live_diag,
+                "model_quality_source_priority": [
+                    "completed_live_decision_snapshot",
+                    "execution_log",
+                ],
+                "model_quality_default_source": "execution_log",
+                "model_quality_primary_source_used": "execution_log",
+                "model_quality_live_rows_supplemental_only": True,
+                "completed_live_rows_used_as_primary": False,
+                "completed_live_rows_used_as_supplemental": bool(live_rows),
+                "source_selection_reason": "forex_execution_log_default_primary",
+                "model_quality_source_priority_used": "execution_log",
+            }
         closed_by_market[m] = list(closed if isinstance(closed, list) else [])
         snap_path = os.path.join(out_dir, f"{m}_closed_trades_v1_{stamp}.jsonl")
         _write_jsonl(snap_path, closed if isinstance(closed, list) else [])
@@ -4701,20 +5505,33 @@ def run_model_quality_full_pass(
                 feature_diag = dict(crypto_artifact_report.get("feature_source", {}) if isinstance(crypto_artifact_report.get("feature_source", {}), dict) else {})
                 hist_diag = replay_generation.get(m, {}).get("historical_strategy_replay", {}) if isinstance(replay_generation.get(m, {}), dict) else {}
                 hist_used = bool(replay_generation.get(m, {}).get("historical_strategy_replay_available", False))
+                primary_source_used = _s(replay_generation.get(m, {}).get("model_quality_primary_source_used", "closed_trade_only")) or "closed_trade_only"
                 feature_diag["crypto_feature_source_priority"] = [
-                    "decision_snapshot",
                     "historical_strategy_replay",
                     "trained_artifact",
                     "closed_trade_only",
                 ]
-                if hist_used:
+                feature_diag["completed_live_rows_available"] = bool(live_rows)
+                feature_diag["completed_live_rows_used_as_primary"] = bool(replay_generation.get(m, {}).get("completed_live_rows_used_as_primary", False))
+                feature_diag["completed_live_rows_used_as_supplemental"] = bool(replay_generation.get(m, {}).get("completed_live_rows_used_as_supplemental", False))
+                feature_diag["model_quality_live_rows_supplemental_only"] = bool(replay_generation.get(m, {}).get("model_quality_live_rows_supplemental_only", True))
+                feature_diag["model_quality_default_source"] = _s(replay_generation.get(m, {}).get("model_quality_default_source", "historical_strategy_replay"))
+                feature_diag["model_quality_primary_source_used"] = primary_source_used
+                feature_diag["source_selection_reason"] = _s(replay_generation.get(m, {}).get("source_selection_reason", ""))
+                feature_diag["feature_source_rows"] = {
+                    "decision_snapshot": int(_f(feature_diag.get("feature_source_rows", {}).get("decision_snapshot", 0), 0.0)) if isinstance(feature_diag.get("feature_source_rows", {}), dict) else 0,
+                    "historical_strategy_replay": int(_f(hist_diag.get("historical_strategy_replay_rows", 0), 0.0)),
+                    "trained_artifact": int(_f(feature_diag.get("feature_source_rows", {}).get("trained_artifact", 0), 0.0)) if isinstance(feature_diag.get("feature_source_rows", {}), dict) else 0,
+                    "closed_trade_only": int(_f(feature_diag.get("feature_source_rows", {}).get("closed_trade_only", 0), 0.0)) if isinstance(feature_diag.get("feature_source_rows", {}), dict) else 0,
+                }
+                if primary_source_used == "completed_live_decision_snapshot":
+                    feature_diag["crypto_feature_source_used"] = "completed_live_decision_snapshot"
+                elif primary_source_used == "historical_strategy_replay" and hist_used:
                     feature_diag["crypto_feature_source_used"] = "historical_strategy_replay"
-                    feature_diag["feature_source_rows"] = {
-                        "decision_snapshot": int(_f(feature_diag.get("feature_source_rows", {}).get("decision_snapshot", 0), 0.0)) if isinstance(feature_diag.get("feature_source_rows", {}), dict) else 0,
-                        "historical_strategy_replay": int(_f(hist_diag.get("historical_strategy_replay_rows", 0), 0.0)),
-                        "trained_artifact": int(_f(feature_diag.get("feature_source_rows", {}).get("trained_artifact", 0), 0.0)) if isinstance(feature_diag.get("feature_source_rows", {}), dict) else 0,
-                        "closed_trade_only": int(_f(feature_diag.get("feature_source_rows", {}).get("closed_trade_only", 0), 0.0)) if isinstance(feature_diag.get("feature_source_rows", {}), dict) else 0,
-                    }
+                elif primary_source_used == "trained_artifact":
+                    feature_diag["crypto_feature_source_used"] = "trained_artifact"
+                else:
+                    feature_diag["crypto_feature_source_used"] = "closed_trade_only"
                     feature_diag["historical_strategy_replay_reason"] = ""
                 feature_diag["historical_strategy_replay_available"] = bool(hist_used)
                 feature_diag["historical_strategy_replay_rows"] = int(_f(hist_diag.get("historical_strategy_replay_rows", 0), 0.0))
@@ -4740,9 +5557,99 @@ def run_model_quality_full_pass(
     os.makedirs(openai_dir, exist_ok=True)
     synthetic_paths: Dict[str, str] = {}
     for m in markets:
-        payload = build_synthetic_replay_artifact(hub_dir, m, closed_by_market.get(m, []))
+        deterministic_cfg = None
+        if m == "crypto" and crypto_deterministic:
+            replay_diag = replay_generation.get(m, {}) if isinstance(replay_generation.get(m, {}), dict) else {}
+            deterministic_cfg = {
+                "enabled": True,
+                "start_ts": int(_f(replay_diag.get("crypto_replay_eval_start_ts", crypto_eval_start_ts), 0.0)),
+                "cutoff_ts": int(_f(replay_diag.get("crypto_replay_eval_cutoff_ts", crypto_eval_cutoff_ts), 0.0)),
+                "locked_symbols": list(
+                    ((replay_diag.get("historical_strategy_replay", {}) if isinstance(replay_diag.get("historical_strategy_replay", {}), dict) else {}).get("historical_strategy_replay_symbols", []))
+                    or _load_locked_symbol_list(crypto_symbols_lock_file)
+                ),
+                "symbols_locked": bool(replay_diag.get("crypto_replay_symbols_locked", crypto_freeze_symbols)),
+                "symbol_list_hash": _s(replay_diag.get("crypto_replay_symbol_list_hash", "")),
+                "cache_frozen": bool(replay_diag.get("crypto_replay_cache_frozen", crypto_freeze_cache)),
+            }
+        payload = build_synthetic_replay_artifact(hub_dir, m, closed_by_market.get(m, []), deterministic_cfg)
+        if m == "crypto" and crypto_deterministic and isinstance(payload, dict):
+            repeat_results: List[Dict[str, Any]] = []
+            for idx in range(max(1, crypto_repeat_evals)):
+                rep = build_synthetic_replay_artifact(hub_dir, m, closed_by_market.get(m, []), deterministic_cfg)
+                latest = rep.get("safe_selection_diagnostics", {}).get("latest", {}) if isinstance(rep.get("safe_selection_diagnostics", {}), dict) else {}
+                evals = latest.get("candidate_evaluations", []) if isinstance(latest.get("candidate_evaluations", []), list) else []
+                v2_summary = {}
+                baseline_summary = {
+                    "admitted_trades": int(latest.get("baseline_admitted_trades", 0) or 0),
+                    "metrics": latest.get("baseline_metrics", {}),
+                    "full_metrics": latest.get("baseline_full_metrics", {}),
+                }
+                for ev in evals:
+                    if _s(ev.get("variant", "")) == "label_compatible_v2":
+                        v2_summary = ev.get("summary", {}) if isinstance(ev.get("summary", {}), dict) else {}
+                        break
+                repeat_results.append(
+                    {
+                        "repeat": int(idx + 1),
+                        "rows_hash": _s(rep.get("meta", {}).get("rows_hash", "")) if isinstance(rep.get("meta", {}), dict) else "",
+                        "replay_rows": int(rep.get("meta", {}).get("closed_trades_total", 0) or 0) if isinstance(rep.get("meta", {}), dict) else 0,
+                        "full_test_trades": int(rep.get("meta", {}).get("full_test_trades", 0) or 0) if isinstance(rep.get("meta", {}), dict) else 0,
+                        "selected_mode": _s(latest.get("selected_predictor_variant", "")),
+                        "selection_result": "v2" if _s(latest.get("selected_predictor_variant", "")) == "label_compatible_v2" else "baseline",
+                        "guardrail_failures": list(next((ev.get("guardrail_failures", []) for ev in evals if _s(ev.get("variant", "")) == "label_compatible_v2"), [])),
+                        "baseline_metrics": baseline_summary.get("metrics", {}),
+                        "v2_metrics": v2_summary.get("metrics", {}),
+                        "baseline_admitted_trades": int(baseline_summary.get("admitted_trades", 0) or 0),
+                        "v2_admitted_trades": int(v2_summary.get("admitted_trades", 0) or 0),
+                        "v2_admission_rate_pct": _f(v2_summary.get("admission_rate_pct", 0.0), 0.0),
+                    }
+                )
+            selected_modes = {_s(r.get("selected_mode", "")) for r in repeat_results}
+            rows_hashes = {_s(r.get("rows_hash", "")) for r in repeat_results}
+            metric_signatures = {
+                json.dumps(
+                    {
+                        "selected_mode": _s(r.get("selected_mode", "")),
+                        "v2_admitted_trades": int(r.get("v2_admitted_trades", 0) or 0),
+                        "v2_admission_rate_pct": round(_f(r.get("v2_admission_rate_pct", 0.0), 0.0), 6),
+                        "guardrail_failures": list(r.get("guardrail_failures", [])),
+                    },
+                    sort_keys=True,
+                )
+                for r in repeat_results
+            }
+            payload.setdefault("crypto_classifier_diagnostics", {})
+            payload["crypto_classifier_diagnostics"]["crypto_replay_repeat_evals"] = int(crypto_repeat_evals)
+            payload["crypto_classifier_diagnostics"]["crypto_replay_repeat_eval_results"] = repeat_results
+            payload["crypto_classifier_diagnostics"]["crypto_replay_repeat_activation_consistent"] = bool(len(selected_modes) == 1)
+            payload["crypto_classifier_diagnostics"]["crypto_replay_repeat_metrics_consistent"] = bool(len(rows_hashes) == 1 and len(metric_signatures) == 1)
+            payload["crypto_classifier_diagnostics"]["crypto_v2_promotion_eligible"] = bool(
+                repeat_results
+                and len(selected_modes) == 1
+                and "label_compatible_v2" in selected_modes
+                and len(rows_hashes) == 1
+                and len(metric_signatures) == 1
+            )
+            payload.setdefault("replay_source_diagnostics", {})
+            payload["replay_source_diagnostics"]["crypto_replay_repeat_evals"] = int(crypto_repeat_evals)
+            payload["replay_source_diagnostics"]["crypto_replay_repeat_eval_results"] = repeat_results
+            payload["replay_source_diagnostics"]["crypto_replay_repeat_activation_consistent"] = bool(len(selected_modes) == 1)
+            payload["replay_source_diagnostics"]["crypto_replay_repeat_metrics_consistent"] = bool(len(rows_hashes) == 1 and len(metric_signatures) == 1)
+            payload["replay_source_diagnostics"]["crypto_v2_promotion_eligible"] = bool(
+                repeat_results
+                and len(selected_modes) == 1
+                and "label_compatible_v2" in selected_modes
+                and len(rows_hashes) == 1
+                and len(metric_signatures) == 1
+            )
         if isinstance(payload, dict) and isinstance(replay_generation.get(m, {}), dict):
-            payload.setdefault("replay_source_diagnostics", replay_generation.get(m, {}))
+            merged_replay_diag = dict(replay_generation.get(m, {}))
+            if isinstance(payload.get("replay_source_diagnostics", {}), dict):
+                merged_replay_diag.update(payload.get("replay_source_diagnostics", {}))
+            payload["replay_source_diagnostics"] = merged_replay_diag
+            if isinstance(dataset_reports.get(m, {}), dict):
+                dataset_reports[m]["replay_source_diagnostics"] = dict(merged_replay_diag)
         if m == "crypto" and isinstance(payload, dict):
             payload["trained_artifact_diagnostics"] = crypto_artifact_report.get("discovery", {})
             payload["feature_source_diagnostics"] = (
@@ -4783,6 +5690,7 @@ def run_model_quality_full_pass(
         "min_trigger_scored_trades": 20,
         "min_trigger_coverage_pct": 40.0,
     }
+    controlled_rollout_readiness: Dict[str, Any] = {}
     promotion_readiness: Dict[str, Any] = {}
     for m in markets:
         row = replay_diag.get(m, {}) if isinstance(replay_diag.get(m, {}), dict) else {}
@@ -4831,6 +5739,25 @@ def run_model_quality_full_pass(
                 f"admission_rate_low({admission_rate:.2f}%<{float(promotion_minima['min_trigger_coverage_pct']):.2f}%)"
             )
         state = "PASS" if not blockers and _s(row.get("state", "")) == "READY" else "BLOCK"
+        rollout = _controlled_rollout_status(
+            market=m,
+            metrics=metrics,
+            ci=ci,
+            worst=worst,
+            windows=n_windows,
+            test_trades=n_test,
+            trigger_scored=trig_scored,
+            trigger_cov=trig_cov,
+            admission_rate=admission_rate,
+            payload=payload,
+        )
+        controlled_rollout_readiness[m] = {
+            "eligible": bool(rollout.get("eligible", False)),
+            "reason": _s(rollout.get("reason", "")),
+            "blockers": list(rollout.get("blockers", []) or []),
+            "risk_multiplier_recommended": float(_f(rollout.get("risk_multiplier_recommended", 0.0), 0.0)),
+            "thresholds": dict(rollout.get("thresholds", {}) if isinstance(rollout.get("thresholds", {}), dict) else {}),
+        }
         promotion_readiness[m] = {
             "state": state,
             "blockers": blockers,
@@ -4840,6 +5767,11 @@ def run_model_quality_full_pass(
             "test_trades": int(n_test),
             "full_test_trades": int(n_full_test),
             "admission_rate_pct": round(float(admission_rate), 4),
+            "controlled_rollout_eligible": bool(rollout.get("eligible", False)),
+            "controlled_rollout_reason": _s(rollout.get("reason", "")),
+            "risk_multiplier_recommended": float(_f(rollout.get("risk_multiplier_recommended", 0.0), 0.0)),
+            "full_promotion_eligible": bool(state == "PASS"),
+            "full_promotion_blockers": list(blockers),
         }
 
     return {
@@ -4864,5 +5796,6 @@ def run_model_quality_full_pass(
         ),
         "promotion_thresholds": promotion_thresholds,
         "promotion_minima": promotion_minima,
+        "controlled_rollout_readiness": controlled_rollout_readiness,
         "promotion_readiness": promotion_readiness,
     }
