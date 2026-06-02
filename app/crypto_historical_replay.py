@@ -231,6 +231,8 @@ def _simulate_strategy_rows(
     take_profit_touched = False
     risk_cut_touched = False
     bars_since_peak = 0
+    label_rule_version = "historical_replay_v2"
+    exit_condition_priority = ["Risk Cut", "Take Profit", "Trailing", "Stale Alignment"]
     for idx in range(24, len(candles)):
         ts_ms, open_px, close_px, high_px, low_px, _vol = candles[idx]
         prev3 = candles[idx - 3][2]
@@ -320,15 +322,30 @@ def _simulate_strategy_rows(
         exit_momentum_3 = recent_return_3
         exit_momentum_6 = recent_return_6
         favorable_then_softened = bool(mfe_pct >= thresholds["trailing_arm_pct"] and trailing_pullback_pct >= max(0.35, thresholds["trailing_drawdown_pct"] * 0.50))
+        risk_cut_now = bool(low_px <= (entry_px * (1.0 - (thresholds["risk_cut_pct"] / 100.0))))
+        take_profit_now = bool(high_px >= (entry_px * (1.0 + (thresholds["take_profit_pct"] / 100.0))))
+        trailing_now = bool(trailing_armed and trailing_pullback_pct >= thresholds["trailing_drawdown_pct"])
+        stale_now = bool(hold_hours >= thresholds["stale_hold_hours"] and trend_momentum_score <= thresholds["stale_trend_score_max"])
+        conditions = [
+            ("Risk Cut", risk_cut_now),
+            ("Take Profit", take_profit_now),
+            ("Trailing", trailing_now),
+            ("Stale Alignment", stale_now),
+        ]
+        same_candle_multi_exit_condition_count = int(sum(1 for _name, active in conditions if active))
         reason = ""
-        if pnl_pct <= -thresholds["risk_cut_pct"]:
-            reason = "risk_cut"
-        elif pnl_pct >= thresholds["take_profit_pct"] and recent_return_3 <= 0.0:
-            reason = "take_profit"
-        elif pnl_pct >= thresholds["trailing_arm_pct"] and drawdown_from_peak_pct <= -thresholds["trailing_drawdown_pct"]:
-            reason = "trailing"
-        elif hold_hours >= thresholds["stale_hold_hours"] and trend_momentum_score <= thresholds["stale_trend_score_max"]:
-            reason = "stale_alignment"
+        for trigger_name, active in conditions:
+            if not active:
+                continue
+            if trigger_name == "Risk Cut":
+                reason = "risk_cut"
+            elif trigger_name == "Take Profit":
+                reason = "take_profit"
+            elif trigger_name == "Trailing":
+                reason = "trailing"
+            elif trigger_name == "Stale Alignment":
+                reason = "stale_alignment"
+            break
         if not reason:
             continue
         normalized_trigger = normalize_exit_trigger(reason)
@@ -364,6 +381,9 @@ def _simulate_strategy_rows(
                 "exit_momentum_3": round(float(exit_momentum_3), 6),
                 "exit_momentum_6": round(float(exit_momentum_6), 6),
                 "favorable_then_softened_flag": bool(favorable_then_softened),
+                "label_rule_version": label_rule_version,
+                "exit_condition_priority_used": list(exit_condition_priority),
+                "same_candle_multi_exit_condition_count": int(same_candle_multi_exit_condition_count),
             }
         )
         rows.append(row)

@@ -1524,6 +1524,26 @@ _CRYPTO_HISTORICAL_REPLAY_FEATURES: Tuple[Tuple[str, float], ...] = (
     ("active_timeframe_count", 0.35),
 )
 
+_CRYPTO_EXIT_SHAPE_KEYS: Tuple[str, ...] = (
+    "risk_cut_touched",
+    "take_profit_touched",
+    "trailing_armed",
+    "favorable_then_softened_flag",
+    "max_favorable_excursion_pct",
+    "max_adverse_excursion_pct",
+    "drawdown_from_peak_pct",
+    "trailing_pullback_pct",
+    "bars_in_trade",
+    "exit_momentum_3",
+    "exit_momentum_6",
+    "trend_momentum_score",
+    "recent_return_3",
+    "recent_return_6",
+    "recent_return_12",
+    "recent_return_24",
+    "signal_margin",
+)
+
 
 def _is_historical_strategy_replay_row(row: Dict[str, Any]) -> bool:
     return _s(row.get("source_type", "")) == "historical_strategy_replay"
@@ -1618,6 +1638,83 @@ def _boundary_distance_score(candidate: Dict[str, Any]) -> Tuple[float, float]:
     return up * 100.0, down * 100.0
 
 
+def _crypto_label_feature_alignment_diagnostics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    replay_rows = [r for r in rows if _is_historical_strategy_replay_row(r)]
+    if not replay_rows:
+        return {}
+    feature_distributions: Dict[str, Dict[str, Any]] = {}
+    mismatch_counters = {
+        "actual_risk_cut_but_risk_cut_touched_false": 0,
+        "actual_take_profit_but_take_profit_touched_false": 0,
+        "actual_trailing_but_trailing_armed_false": 0,
+        "actual_trailing_but_favorable_then_softened_false": 0,
+        "actual_stale_but_any_hard_exit_shape_flag_true": 0,
+        "hard_exit_shape_flag_true_but_actual_label_is_stale": 0,
+        "hard_exit_shape_flag_true_but_predictor_not_corresponding_trigger": 0,
+    }
+    multi_exit_count = 0
+    priority_used = None
+    rule_versions: Dict[str, int] = {}
+    for trig in _CRYPTO_HISTORICAL_REPLAY_TRIGGER_CLASSES:
+        cls_rows = [r for r in replay_rows if _s(r.get("actual_exit_trigger", "")) == trig]
+        if not cls_rows:
+            continue
+        feat_diag: Dict[str, Any] = {"count": int(len(cls_rows))}
+        for key in _CRYPTO_EXIT_SHAPE_KEYS:
+            vals = [_f(r.get(key, 0.0), 0.0) for r in cls_rows]
+            if key.endswith("_touched") or key.endswith("_flag") or key == "trailing_armed":
+                feat_diag[key] = {
+                    "true_count": int(sum(1 for r in cls_rows if bool(r.get(key, False)))),
+                    "false_count": int(sum(1 for r in cls_rows if not bool(r.get(key, False)))),
+                    "true_rate_pct": round(100.0 * sum(1 for r in cls_rows if bool(r.get(key, False))) / max(1, len(cls_rows)), 4),
+                }
+            else:
+                feat_diag[key] = {
+                    "median": round(_median(vals, default=0.0), 6),
+                    "p25": round(_quantile(vals, 0.25, default=0.0), 6),
+                    "p75": round(_quantile(vals, 0.75, default=0.0), 6),
+                }
+        feature_distributions[trig] = feat_diag
+    for row in replay_rows:
+        act = _s(row.get("actual_exit_trigger", ""))
+        pred = _s(row.get("predicted_exit_trigger", ""))
+        hard_risk = bool(row.get("risk_cut_touched", False))
+        hard_tp = bool(row.get("take_profit_touched", False))
+        hard_trail = bool(row.get("trailing_armed", False))
+        soft_trail = bool(row.get("favorable_then_softened_flag", False))
+        hard_any = hard_risk or hard_tp or hard_trail
+        if act == "Risk Cut" and not hard_risk:
+            mismatch_counters["actual_risk_cut_but_risk_cut_touched_false"] += 1
+        if act == "Take Profit" and not hard_tp:
+            mismatch_counters["actual_take_profit_but_take_profit_touched_false"] += 1
+        if act == "Trailing" and not hard_trail:
+            mismatch_counters["actual_trailing_but_trailing_armed_false"] += 1
+        if act == "Trailing" and not soft_trail:
+            mismatch_counters["actual_trailing_but_favorable_then_softened_false"] += 1
+        if act == "Stale Alignment" and hard_any:
+            mismatch_counters["actual_stale_but_any_hard_exit_shape_flag_true"] += 1
+            mismatch_counters["hard_exit_shape_flag_true_but_actual_label_is_stale"] += 1
+        if hard_risk and pred != "Risk Cut":
+            mismatch_counters["hard_exit_shape_flag_true_but_predictor_not_corresponding_trigger"] += 1
+        elif hard_tp and pred != "Take Profit":
+            mismatch_counters["hard_exit_shape_flag_true_but_predictor_not_corresponding_trigger"] += 1
+        elif hard_trail and soft_trail and pred != "Trailing":
+            mismatch_counters["hard_exit_shape_flag_true_but_predictor_not_corresponding_trigger"] += 1
+        if int(_f(row.get("same_candle_multi_exit_condition_count", 0.0), 0.0)) > 1:
+            multi_exit_count += 1
+        if priority_used is None and isinstance(row.get("exit_condition_priority_used"), list):
+            priority_used = list(row.get("exit_condition_priority_used"))
+        rule_version = _s(row.get("label_rule_version", "")) or "unknown"
+        rule_versions[rule_version] = int(rule_versions.get(rule_version, 0) + 1)
+    return {
+        "feature_distributions_by_actual_trigger": feature_distributions,
+        "mismatch_counters": mismatch_counters,
+        "same_candle_multi_exit_condition_count": int(multi_exit_count),
+        "exit_condition_priority_used": priority_used or [],
+        "label_rule_version": _top_counter(rule_versions, limit=5),
+    }
+
+
 def _historical_replay_upside_score(
     candidate: Dict[str, Any],
     train_rows: List[Dict[str, Any]],
@@ -1696,6 +1793,7 @@ def _crypto_predict_historical_replay_one(
     train_rows: List[Dict[str, Any]],
     candidate: Dict[str, Any],
     regime: str,
+    predictor_variant: str = "candidate",
 ) -> Dict[str, Any]:
     working = [dict(r) for r in (train_rows[-260:] if len(train_rows) > 260 else train_rows) if _is_historical_strategy_replay_row(r)]
     sym = _s(candidate.get("symbol", "")).upper()
@@ -1788,6 +1886,9 @@ def _crypto_predict_historical_replay_one(
                 proto_bonus += 1.0 / (1.0 + abs(_f(candidate.get(key, 0.0), 0.0) - median) / scale)
             trigger_scores[trigger] += 0.40 * (proto_bonus / max(1, len(_CRYPTO_HISTORICAL_REPLAY_FEATURES)))
 
+    variant = _s(predictor_variant).lower() or "candidate"
+    use_exit_shape = variant in {"candidate", "active", "exit_shape_enhanced", "label_compatible_v2"}
+    use_label_compatible_v2 = variant == "label_compatible_v2"
     momentum = _f(candidate.get("trend_momentum_score", 0.0), 0.0)
     volatility = _f(candidate.get("recent_volatility", 0.0), 0.0)
     signal_margin = _f(candidate.get("signal_margin", 0.0), 0.0)
@@ -1803,77 +1904,118 @@ def _crypto_predict_historical_replay_one(
     take_profit_candidate = False
     stale_override_reason = ""
 
-    if momentum >= 2.6 and volatility >= 0.55 and signal_margin >= 0.43 and move_12 >= 2.5:
-        trigger_scores["Risk Cut"] += 0.75
-        if downside_score >= upside_score:
-            stale_override_reason = "stale_overridden_by_risk_cut"
-    if momentum >= 2.1 and momentum <= 2.8 and volatility >= 0.45 and volatility <= 0.80 and candle_move >= 0.9:
-        trigger_scores["Trailing"] += 0.65
-        if upside_score >= 0.75:
-            stale_override_reason = "stale_overridden_by_trailing"
-    if momentum <= 2.45 and signal_margin <= 0.46 and volatility <= 0.72 and move_6 >= 1.8:
-        trigger_scores["Take Profit"] += 0.55
-        take_profit_candidate = True
-    if move_24 >= 2.0 and signal_margin <= 0.52:
-        trigger_scores["Stale Alignment"] += 0.35
-    if signal_margin >= 0.50 and momentum >= 2.7:
-        trigger_scores["Stale Alignment"] -= 0.10
-        trigger_scores["Risk Cut"] += 0.20
-    if upside_score >= 1.10 and downside_score <= 0.40:
-        trigger_scores["Trailing"] += 0.45
-        up_recovery_applied = True
-        up_recovery_reason = "strong_upside_recovery"
-    if take_profit_candidate and upside_score >= 1.05 and volatility <= 0.58 and move_24 <= 2.5:
-        trigger_scores["Take Profit"] += 0.50
-        up_recovery_applied = True
-        up_recovery_reason = "take_profit_recovery"
-    if up_gap >= 0.32 and upside_score >= 1.0 and downside_score <= 0.35 and trigger_scores["Stale Alignment"] >= max(trigger_scores["Trailing"], trigger_scores["Take Profit"]):
-        trigger_scores["Stale Alignment"] -= 0.35
-        trigger_scores["Trailing"] += 0.20
-        stale_override_reason = "stale_overridden_by_upside"
-    elif trigger_scores["Stale Alignment"] > max(trigger_scores["Risk Cut"], trigger_scores["Trailing"], trigger_scores["Take Profit"]) and symbol_trigger_counts.get("Stale Alignment", 0) <= 0:
-        stale_override_reason = "stale_global_prior_only"
+    if use_label_compatible_v2:
+        risk_cut_touched = bool(candidate.get("risk_cut_touched", False))
+        take_profit_touched = bool(candidate.get("take_profit_touched", False))
+        trailing_armed = bool(candidate.get("trailing_armed", False))
+        softened = bool(candidate.get("favorable_then_softened_flag", False))
+        mfe_pct = _f(candidate.get("max_favorable_excursion_pct", 0.0), 0.0)
+        mae_pct = abs(_f(candidate.get("max_adverse_excursion_pct", 0.0), 0.0))
+        dd_peak = abs(_f(candidate.get("drawdown_from_peak_pct", 0.0), 0.0))
+        pullback = _f(candidate.get("trailing_pullback_pct", 0.0), 0.0)
+        bars_in_trade = _f(candidate.get("bars_in_trade", 0.0), 0.0)
+        exit_m3 = _f(candidate.get("exit_momentum_3", 0.0), 0.0)
+        exit_m6 = _f(candidate.get("exit_momentum_6", 0.0), 0.0)
+        risk_support = sum(1 for r in working if _s(r.get("actual_exit_trigger", "")) == "Risk Cut")
+        tp_support = sum(1 for r in working if _s(r.get("actual_exit_trigger", "")) == "Take Profit")
+        trailing_support = sum(1 for r in working if _s(r.get("actual_exit_trigger", "")) == "Trailing")
+        trigger_scores["Risk Cut"] += (1.25 if risk_cut_touched else 0.0) + (0.35 * max(0.0, (mae_pct - 1.6) / 1.2)) + (0.25 * max(0.0, -exit_m3 / 1.5)) + (0.20 * max(0.0, -exit_m6 / 1.5))
+        trigger_scores["Take Profit"] += (1.10 if take_profit_touched else 0.0) + (0.30 * max(0.0, (mfe_pct - 3.0) / 2.0)) + (0.15 * max(0.0, -exit_m3 / 1.2))
+        if tp_support < 10:
+            trigger_scores["Take Profit"] *= 0.70
+        trigger_scores["Trailing"] += (1.10 if trailing_armed else 0.0) + (0.90 if softened else 0.0) + (0.25 * max(0.0, (pullback - 0.8) / 1.0)) + (0.20 * max(0.0, (dd_peak - 0.8) / 1.0))
+        if trailing_support < 14:
+            trigger_scores["Trailing"] *= 0.85
+        if not risk_cut_touched and not take_profit_touched and not (trailing_armed and softened):
+            trigger_scores["Stale Alignment"] += 1.05
+        trigger_scores["Stale Alignment"] += 0.22 * max(0.0, (bars_in_trade - 14.0) / 8.0)
+        trigger_scores["Stale Alignment"] += 0.20 * max(0.0, (0.10 - momentum) / 0.30)
+        trigger_scores["Stale Alignment"] += 0.15 * max(0.0, (0.18 - signal_margin) / 0.20)
+        if risk_cut_touched:
+            trigger_scores["Stale Alignment"] -= 0.55
+        if take_profit_touched:
+            trigger_scores["Stale Alignment"] -= 0.40
+        if trailing_armed and softened:
+            trigger_scores["Stale Alignment"] -= 0.45
+        if upside_score >= 1.0 and trailing_armed and softened:
+            up_recovery_applied = True
+            up_recovery_reason = "label_compatible_trailing_recovery"
+        if take_profit_touched and mfe_pct >= 4.0:
+            take_profit_candidate = True
+    else:
+        if use_exit_shape and momentum >= 2.6 and volatility >= 0.55 and signal_margin >= 0.43 and move_12 >= 2.5:
+            trigger_scores["Risk Cut"] += 0.75
+            if downside_score >= upside_score:
+                stale_override_reason = "stale_overridden_by_risk_cut"
+        if use_exit_shape and momentum >= 2.1 and momentum <= 2.8 and volatility >= 0.45 and volatility <= 0.80 and candle_move >= 0.9:
+            trigger_scores["Trailing"] += 0.65
+            if upside_score >= 0.75:
+                stale_override_reason = "stale_overridden_by_trailing"
+        if use_exit_shape and momentum <= 2.45 and signal_margin <= 0.46 and volatility <= 0.72 and move_6 >= 1.8:
+            trigger_scores["Take Profit"] += 0.55
+            take_profit_candidate = True
+        if use_exit_shape and move_24 >= 2.0 and signal_margin <= 0.52:
+            trigger_scores["Stale Alignment"] += 0.35
+        if use_exit_shape and signal_margin >= 0.50 and momentum >= 2.7:
+            trigger_scores["Stale Alignment"] -= 0.10
+            trigger_scores["Risk Cut"] += 0.20
+        if use_exit_shape and upside_score >= 1.10 and downside_score <= 0.40:
+            trigger_scores["Trailing"] += 0.45
+            up_recovery_applied = True
+            up_recovery_reason = "strong_upside_recovery"
+        if use_exit_shape and take_profit_candidate and upside_score >= 1.05 and volatility <= 0.58 and move_24 <= 2.5:
+            trigger_scores["Take Profit"] += 0.50
+            up_recovery_applied = True
+            up_recovery_reason = "take_profit_recovery"
+        if use_exit_shape and up_gap >= 0.32 and upside_score >= 1.0 and downside_score <= 0.35 and trigger_scores["Stale Alignment"] >= max(trigger_scores["Trailing"], trigger_scores["Take Profit"]):
+            trigger_scores["Stale Alignment"] -= 0.35
+            trigger_scores["Trailing"] += 0.20
+            stale_override_reason = "stale_overridden_by_upside"
+        elif trigger_scores["Stale Alignment"] > max(trigger_scores["Risk Cut"], trigger_scores["Trailing"], trigger_scores["Take Profit"]) and symbol_trigger_counts.get("Stale Alignment", 0) <= 0:
+            stale_override_reason = "stale_global_prior_only"
 
     top_triggers = sorted(trigger_scores.items(), key=lambda kv: kv[1], reverse=True)
     pred_trigger = top_triggers[0][0] if top_triggers else "Unknown"
     trigger_margin = (top_triggers[0][1] - top_triggers[1][1]) if len(top_triggers) > 1 else top_triggers[0][1]
 
+    direction_forced_by_trigger = False
+    trigger_direction_prior_applied = 0.0
+    stale_up_score = 0.0
+    stale_down_score = 0.0
+    if move_24 <= 2.7:
+        stale_up_score += 0.45
+    if move_12 <= 2.9:
+        stale_up_score += 0.35
+    if momentum <= 2.35:
+        stale_up_score += 0.45
+    if volatility <= 0.55:
+        stale_up_score += 0.25
+    if candle_move <= 0.75:
+        stale_up_score += 0.20
+    if signal_margin <= 0.42:
+        stale_up_score += 0.20
+    if move_6 >= 2.6:
+        stale_down_score += 0.35
+    if move_24 >= 3.0:
+        stale_down_score += 0.30
+    if momentum >= 2.55:
+        stale_down_score += 0.40
+    if signal_margin >= 0.48:
+        stale_down_score += 0.25
+    if volatility >= 0.60:
+        stale_down_score += 0.20
+    direction_scores["up"] += stale_up_score
+    direction_scores["down"] += stale_down_score
+    direction_scores["up"] += 0.35 * upside_score
+    direction_scores["down"] += 0.60 * downside_score
+    trigger_direction_prior_weight = 0.10 if not use_exit_shape else (0.12 if use_label_compatible_v2 else 0.25)
     if pred_trigger == "Risk Cut":
-        pred_dir = "down"
-        direction_scores["down"] += 0.75
+        trigger_direction_prior_applied = -trigger_direction_prior_weight
+        direction_scores["down"] += abs(trigger_direction_prior_applied)
     elif pred_trigger in {"Trailing", "Take Profit"}:
-        pred_dir = "up"
-        direction_scores["up"] += 0.75
-    else:
-        stale_up_score = 0.0
-        stale_down_score = 0.0
-        if move_24 <= 2.7:
-            stale_up_score += 0.45
-        if move_12 <= 2.9:
-            stale_up_score += 0.35
-        if momentum <= 2.35:
-            stale_up_score += 0.45
-        if volatility <= 0.55:
-            stale_up_score += 0.25
-        if candle_move <= 0.75:
-            stale_up_score += 0.20
-        if signal_margin <= 0.42:
-            stale_up_score += 0.20
-        if move_6 >= 2.6:
-            stale_down_score += 0.35
-        if move_24 >= 3.0:
-            stale_down_score += 0.30
-        if momentum >= 2.55:
-            stale_down_score += 0.40
-        if signal_margin >= 0.48:
-            stale_down_score += 0.25
-        if volatility >= 0.60:
-            stale_down_score += 0.20
-        direction_scores["up"] += stale_up_score
-        direction_scores["down"] += stale_down_score
-        direction_scores["up"] += 0.35 * upside_score
-        direction_scores["down"] += 0.60 * downside_score
-        pred_dir = "up" if direction_scores["up"] >= direction_scores["down"] else "down"
+        trigger_direction_prior_applied = trigger_direction_prior_weight
+        direction_scores["up"] += trigger_direction_prior_applied
+    pred_dir = "up" if direction_scores["up"] >= direction_scores["down"] else "down"
     if pred_trigger in {"Stale Alignment", "Risk Cut"} and up_gap >= 0.55 and upside_score >= 1.20 and downside_score <= 0.35 and signal_margin <= 0.46:
         pred_dir = "up"
         direction_scores["up"] += 0.65
@@ -1926,9 +2068,18 @@ def _crypto_predict_historical_replay_one(
         "stale_score": round(float(trigger_scores.get("Stale Alignment", 0.0)), 6),
         "trailing_score": round(float(trigger_scores.get("Trailing", 0.0)), 6),
         "take_profit_candidate_flag": bool(take_profit_candidate),
+        "direction_forced_by_trigger": bool(direction_forced_by_trigger),
+        "trigger_direction_prior_applied": round(float(trigger_direction_prior_applied), 6),
+        "trigger_direction_prior_weight": round(float(abs(trigger_direction_prior_weight)), 6),
+        "direction_independent_score_up": round(float(direction_scores.get("up", 0.0) - max(0.0, trigger_direction_prior_applied)), 6),
+        "direction_independent_score_down": round(float(direction_scores.get("down", 0.0) - max(0.0, -trigger_direction_prior_applied)), 6),
+        "independent_direction_score_up": round(float(direction_scores.get("up", 0.0) - max(0.0, trigger_direction_prior_applied)), 6),
+        "independent_direction_score_down": round(float(direction_scores.get("down", 0.0) - max(0.0, -trigger_direction_prior_applied)), 6),
+        "exit_shape_predictive_mode": "active" if variant == "label_compatible_v2" else ("active" if use_exit_shape else "diagnostic_only"),
         "upside_boundary_distance_pct": round(float(_f(upside_diag.get("upside_boundary_distance_pct", 0.0), 0.0)), 6),
         "downside_boundary_distance_pct": round(float(_f(upside_diag.get("downside_boundary_distance_pct", 0.0), 0.0)), 6),
         "predictor_source_mode": "historical_strategy_replay",
+        "predictor_variant": variant,
         "historical_replay_similarity_support": {
             cls: {
                 "same_symbol_support_count": int(len([r for r in symbol_rows if _s(r.get('actual_exit_trigger', '')) == cls])),
@@ -1946,6 +2097,7 @@ def _stock_predict_one(
     train_rows: List[Dict[str, Any]],
     candidate: Dict[str, Any],
     regime: str,
+    predictor_variant: str = "candidate",
 ) -> Dict[str, Any]:
     working = list(train_rows[-220:]) if len(train_rows) > 220 else list(train_rows)
     sym = _s(candidate.get("symbol", "")).upper()
@@ -1974,6 +2126,16 @@ def _stock_predict_one(
     stats = _weighted_trade_stats(filtered)
     up_score = (0.55 * stats.get("up_rate", 0.0)) + (0.25 * max(0.0, mom / 4.0)) + (0.15 * max(0.0, ret24 / 5.0)) + (0.05 * max(0.0, signal_margin))
     down_score = (0.55 * stats.get("down_rate", 0.0)) + (0.25 * max(0.0, -mom / 4.0)) + (0.15 * max(0.0, -ret24 / 5.0)) + (0.05 * max(0.0, vol / 2.5))
+    guard_applied = False
+    if _s(predictor_variant).lower() in {"candidate", "stabilized"}:
+        down_case_score = (0.45 * stats.get("down_rate", 0.0)) + (0.20 * max(0.0, -ret6 / 3.0)) + (0.20 * max(0.0, -ret24 / 4.0)) + (0.15 * max(0.0, vol / 2.0))
+        up_case_score = (0.45 * stats.get("up_rate", 0.0)) + (0.20 * max(0.0, ret6 / 3.0)) + (0.20 * max(0.0, ret24 / 4.0)) + (0.15 * max(0.0, signal_margin))
+        if down_case_score >= up_case_score and mom <= 0.25:
+            down_score += 0.35
+            guard_applied = True
+    else:
+        down_case_score = down_score
+        up_case_score = up_score
     trigger_scores = {
         "Trailing": (0.60 * stats.get("trailing_rate", 0.0)) + (0.25 * max(0.0, ret6 / 4.0)) + (0.15 * max(0.0, vol / 2.5)),
         "Stale Alignment": (0.60 * stats.get("stale_rate", 0.0)) + (0.20 * max(0.0, -ret6 / 3.0)) + (0.20 * max(0.0, vol / 2.5 if ret24 < 0.5 else 0.0)),
@@ -2001,6 +2163,10 @@ def _stock_predict_one(
         "stock_direction_score_down": round(float(down_score), 6),
         "stock_direction_score_gap": round(float(up_score - down_score), 6),
         "predictor_mode": "stock_historical_replay",
+        "predictor_variant": _s(predictor_variant).lower() or "candidate",
+        "stock_up_bias_guard_applied": bool(guard_applied),
+        "stock_down_case_score": round(float(down_case_score), 6),
+        "stock_up_case_score": round(float(up_case_score), 6),
         "winning_reason": "momentum_up" if pred_dir == "up" else "momentum_down",
     }
 
@@ -2010,6 +2176,7 @@ def _forex_predict_one(
     train_rows: List[Dict[str, Any]],
     candidate: Dict[str, Any],
     regime: str,
+    predictor_variant: str = "candidate",
 ) -> Dict[str, Any]:
     working = list(train_rows[-260:]) if len(train_rows) > 260 else list(train_rows)
     sym = _s(candidate.get("symbol", "")).upper()
@@ -2033,8 +2200,17 @@ def _forex_predict_one(
     vol_ret = math.sqrt(sum((r - mean_ret) ** 2 for r in returns) / max(1, len(returns)))
     hold_h = _f(candidate.get("hold_hours", 0.0), 0.0)
     hold_med = _median([_f(r.get("hold_hours", 0.0), 0.0) for r in filtered], default=8.0)
-    up_score = 0.55 * max(0.0, mean_ret / 0.20) + 0.20 * max(0.0, (hold_med - hold_h) / max(1.0, hold_med))
-    down_score = 0.55 * max(0.0, -mean_ret / 0.20) + 0.20 * max(0.0, (hold_h - hold_med) / max(1.0, hold_med)) + 0.10 * max(0.0, vol_ret / 0.30)
+    variant = _s(predictor_variant).lower() or "candidate"
+    if variant == "baseline":
+        sym_stats = _weighted_trade_stats(symbol_rows or filtered)
+        side_stats = _weighted_trade_stats(side_rows or filtered)
+        regime_stats = _weighted_trade_stats(regime_rows or filtered)
+        cohorts = [(0.50, sym_stats), (0.30, side_stats), (0.20, regime_stats)]
+        up_score = (0.70 * _blend_probability(cohorts, "up_rate")) + (0.15 * max(0.0, mean_ret / 0.25)) + (0.15 * max(0.0, -vol_ret / 0.50))
+        down_score = (0.70 * _blend_probability(cohorts, "down_rate")) + (0.15 * max(0.0, -mean_ret / 0.25)) + (0.15 * max(0.0, vol_ret / 0.40))
+    else:
+        up_score = 0.55 * max(0.0, mean_ret / 0.20) + 0.20 * max(0.0, (hold_med - hold_h) / max(1.0, hold_med))
+        down_score = 0.55 * max(0.0, -mean_ret / 0.20) + 0.20 * max(0.0, (hold_h - hold_med) / max(1.0, hold_med)) + 0.10 * max(0.0, vol_ret / 0.30)
     if side == "short":
         down_score += 0.10
     elif side == "long":
@@ -2054,6 +2230,7 @@ def _forex_predict_one(
         "direction_scores": {"up": round(float(up_score), 6), "down": round(float(down_score), 6)},
         "direction_margin": round(float(abs(up_score - down_score)), 6),
         "predictor_mode": "forex_execution_log",
+        "predictor_variant": variant,
         "forex_pair_return_mean_pct": round(float(mean_ret), 6),
         "forex_pair_return_volatility_pct": round(float(vol_ret), 6),
     }
@@ -2065,15 +2242,16 @@ def _predict_one(
     candidate: Dict[str, Any],
     regime: str,
     market: str = "",
+    predictor_variant: str = "candidate",
 ) -> Dict[str, Any]:
     if _s(market).lower() == "crypto":
         if _is_historical_strategy_replay_row(candidate):
-            return _crypto_predict_historical_replay_one(train_rows=train_rows, candidate=candidate, regime=regime)
+            return _crypto_predict_historical_replay_one(train_rows=train_rows, candidate=candidate, regime=regime, predictor_variant=predictor_variant)
         return _crypto_predict_one(train_rows=train_rows, candidate=candidate, regime=regime)
     if _s(market).lower() == "stocks" and _s(candidate.get("source_type", "")) == "historical_api_replay":
-        return _stock_predict_one(train_rows=train_rows, candidate=candidate, regime=regime)
+        return _stock_predict_one(train_rows=train_rows, candidate=candidate, regime=regime, predictor_variant=predictor_variant)
     if _s(market).lower() == "forex":
-        return _forex_predict_one(train_rows=train_rows, candidate=candidate, regime=regime)
+        return _forex_predict_one(train_rows=train_rows, candidate=candidate, regime=regime, predictor_variant=predictor_variant)
     # Keep predictor bounded in cost for large historical sets.
     working = list(train_rows[-220:]) if len(train_rows) > 220 else list(train_rows)
     sym = _s(candidate.get("symbol", "")).upper()
@@ -2283,6 +2461,8 @@ def _manual_prediction_diagnostics(rows: List[Dict[str, Any]]) -> Dict[str, Any]
 
 
 def _historical_replay_policy_name(policy: Dict[str, Any]) -> str:
+    if _s(policy.get("policy_name_override", "")):
+        return _s(policy.get("policy_name_override", ""))
     mode = _s(policy.get("source_mode", "historical_strategy_replay")) or "historical_strategy_replay"
     conf = _f(policy.get("base_conf_min", 0.36), 0.36)
     trig = _f(policy.get("base_trigger_margin_min", 0.25), 0.25)
@@ -2302,40 +2482,71 @@ def _crypto_historical_replay_admission_decision(row: Dict[str, Any], policy: Di
     top = _f(trigger_scores.get(pred_trigger, 0.0), 0.0)
     runner = _f(row.get("runner_up_trigger_score", 0.0), 0.0)
     separation = top - runner
+    rescue_band = _f(policy.get("rescue_margin_band", 0.05), 0.05)
+    rescue_conf_band = _f(policy.get("rescue_conf_band", 0.05), 0.05)
+    rescue_dir_band = _f(policy.get("rescue_dir_band", 0.05), 0.05)
 
     if pred_trigger == "Risk Cut":
-        if conf < _f(policy.get("risk_cut_conf_min", base_conf), base_conf):
+        conf_min = _f(policy.get("risk_cut_conf_min", base_conf), base_conf)
+        trig_min = _f(policy.get("risk_cut_trigger_margin_min", base_trig), base_trig)
+        dir_min = _f(policy.get("risk_cut_dir_margin_min", base_dir), base_dir)
+        if conf < conf_min:
+            if bool(policy.get("enable_risk_cut_rescue", False)) and bool(row.get("risk_cut_touched", False)) and conf >= (conf_min - rescue_conf_band) and separation >= max(0.0, trig_min - rescue_band):
+                return True, "risk_cut_rescue"
             return False, "risk_cut_conf_low"
-        if trig_margin < _f(policy.get("risk_cut_trigger_margin_min", base_trig), base_trig):
+        if trig_margin < trig_min:
+            if bool(policy.get("enable_risk_cut_rescue", False)) and bool(row.get("risk_cut_touched", False)) and trig_margin >= (trig_min - rescue_band):
+                return True, "risk_cut_rescue"
             return False, "risk_cut_trigger_margin_low"
-        if dir_margin < _f(policy.get("risk_cut_dir_margin_min", base_dir), base_dir):
+        if dir_margin < dir_min:
+            if bool(policy.get("enable_risk_cut_rescue", False)) and bool(row.get("risk_cut_touched", False)) and dir_margin >= (dir_min - rescue_dir_band):
+                return True, "risk_cut_rescue"
             return False, "risk_cut_dir_margin_low"
         return True, "risk_cut_strong"
 
     if pred_trigger == "Take Profit":
-        if conf < _f(policy.get("take_profit_conf_min", base_conf), base_conf):
+        conf_min = _f(policy.get("take_profit_conf_min", base_conf), base_conf)
+        trig_min = _f(policy.get("take_profit_trigger_margin_min", base_trig), base_trig)
+        gap_min = _f(policy.get("take_profit_score_gap_min", 0.15), 0.15)
+        if conf < conf_min:
             return False, "take_profit_conf_low"
-        if trig_margin < _f(policy.get("take_profit_trigger_margin_min", base_trig), base_trig):
+        if trig_margin < trig_min:
             return False, "take_profit_trigger_margin_low"
-        if separation < _f(policy.get("take_profit_score_gap_min", 0.15), 0.15):
+        if separation < gap_min:
+            if bool(policy.get("enable_take_profit_rescue", False)) and bool(row.get("take_profit_touched", False)) and separation >= (gap_min - rescue_band):
+                return True, "take_profit_rescue"
             return False, "take_profit_score_gap_low"
         return True, "take_profit_strong"
 
     if pred_trigger == "Trailing":
-        if conf < _f(policy.get("trailing_conf_min", base_conf), base_conf):
+        conf_min = _f(policy.get("trailing_conf_min", base_conf), base_conf)
+        trig_min = _f(policy.get("trailing_trigger_margin_min", base_trig), base_trig)
+        dir_min = _f(policy.get("trailing_dir_margin_min", base_dir), base_dir)
+        if conf < conf_min:
+            if bool(policy.get("enable_trailing_rescue", False)) and bool(row.get("trailing_armed", False)) and bool(row.get("favorable_then_softened_flag", False)) and conf >= (conf_min - rescue_conf_band):
+                return True, "trailing_rescue"
             return False, "trailing_conf_low"
-        if trig_margin < _f(policy.get("trailing_trigger_margin_min", base_trig), base_trig):
+        if trig_margin < trig_min:
+            if bool(policy.get("enable_trailing_rescue", False)) and bool(row.get("trailing_armed", False)) and bool(row.get("favorable_then_softened_flag", False)) and trig_margin >= (trig_min - rescue_band):
+                return True, "trailing_rescue"
             return False, "trailing_trigger_margin_low"
-        if dir_margin < _f(policy.get("trailing_dir_margin_min", base_dir), base_dir):
+        if dir_margin < dir_min:
+            if bool(policy.get("enable_trailing_rescue", False)) and bool(row.get("trailing_armed", False)) and bool(row.get("favorable_then_softened_flag", False)) and dir_margin >= (dir_min - rescue_dir_band):
+                return True, "trailing_rescue"
             return False, "trailing_dir_margin_low"
         return True, "trailing_strong"
 
     if pred_trigger == "Stale Alignment":
-        if conf < _f(policy.get("stale_conf_min", base_conf), base_conf):
+        conf_min = _f(policy.get("stale_conf_min", base_conf), base_conf)
+        trig_min = _f(policy.get("stale_trigger_margin_min", base_trig), base_trig)
+        dir_min = _f(policy.get("stale_dir_margin_min", base_dir), base_dir)
+        if conf < conf_min:
             return False, "stale_conf_low"
-        if trig_margin < _f(policy.get("stale_trigger_margin_min", base_trig), base_trig):
+        if trig_margin < trig_min:
             return False, "stale_trigger_margin_low"
-        if dir_margin < _f(policy.get("stale_dir_margin_min", base_dir), base_dir):
+        if dir_margin < dir_min:
+            if bool(policy.get("enable_stale_rescue", False)) and not bool(row.get("risk_cut_touched", False)) and not bool(row.get("take_profit_touched", False)) and not bool(row.get("trailing_armed", False)) and dir_margin >= (dir_min - rescue_dir_band):
+                return True, "stale_rescue"
             return False, "stale_dir_margin_low"
         return True, "stale_strong"
 
@@ -2463,6 +2674,43 @@ def _score_crypto_with_policy(rows: List[Dict[str, Any]], policy: Dict[str, Any]
     stale_precision = _trigger_precision(admitted, "Stale Alignment")
     risk_cut_precision = _trigger_precision(admitted, "Risk Cut")
     take_profit_precision = _trigger_precision(admitted, "Take Profit")
+    by_pred_trigger_reject: Dict[str, int] = {}
+    by_actual_trigger_reject: Dict[str, int] = {}
+    by_symbol_reject: Dict[str, int] = {}
+    by_conf_bucket_reject: Dict[str, int] = {}
+    by_trig_margin_bucket_reject: Dict[str, int] = {}
+    by_dir_margin_bucket_reject: Dict[str, int] = {}
+    by_score_gap_bucket_reject: Dict[str, int] = {}
+    near_miss_count = 0
+    correct_rejected = 0
+    incorrect_admitted = 0
+    for r in abstained:
+        pred_trig = _s(r.get("predicted_exit_trigger", "")) or "Unknown"
+        act_trig = _s(r.get("actual_exit_trigger", "")) or "Unknown"
+        by_pred_trigger_reject[pred_trig] = int(by_pred_trigger_reject.get(pred_trig, 0) + 1)
+        by_actual_trigger_reject[act_trig] = int(by_actual_trigger_reject.get(act_trig, 0) + 1)
+        sym = _s(r.get("symbol", "")) or "UNKNOWN"
+        by_symbol_reject[sym] = int(by_symbol_reject.get(sym, 0) + 1)
+        conf = _f(r.get("predicted_confidence", 0.0), 0.0)
+        trig_margin = _f(r.get("trigger_margin", 0.0), 0.0)
+        dir_margin = _f(r.get("direction_margin", 0.0), 0.0)
+        gap = abs(_f(r.get("winning_trigger_score", 0.0), 0.0) - _f(r.get("runner_up_trigger_score", 0.0), 0.0))
+        by_conf_bucket_reject[_bucket_probability(conf)] = int(by_conf_bucket_reject.get(_bucket_probability(conf), 0) + 1)
+        by_trig_margin_bucket_reject[_bucket_margin_value(trig_margin)] = int(by_trig_margin_bucket_reject.get(_bucket_margin_value(trig_margin), 0) + 1)
+        by_dir_margin_bucket_reject[_bucket_margin_value(dir_margin)] = int(by_dir_margin_bucket_reject.get(_bucket_margin_value(dir_margin), 0) + 1)
+        by_score_gap_bucket_reject[_bucket_margin_value(gap)] = int(by_score_gap_bucket_reject.get(_bucket_margin_value(gap), 0) + 1)
+        base_conf = _f(policy.get("base_conf_min", 0.0), 0.0)
+        base_trig = _f(policy.get("base_trigger_margin_min", 0.0), 0.0)
+        base_dir = _f(policy.get("base_dir_margin_min", 0.0), 0.0)
+        if conf >= (base_conf - 0.05) or trig_margin >= (base_trig - 0.05) or dir_margin >= (base_dir - 0.05):
+            near_miss_count += 1
+        if _s(r.get("predicted_direction", "")).lower() == _s(r.get("actual_direction", "")).lower() and pred_trig == act_trig:
+            correct_rejected += 1
+    for r in admitted:
+        pred_trig = _s(r.get("predicted_exit_trigger", "")) or "Unknown"
+        act_trig = _s(r.get("actual_exit_trigger", "")) or "Unknown"
+        if _s(r.get("predicted_direction", "")).lower() != _s(r.get("actual_direction", "")).lower() or pred_trig != act_trig:
+            incorrect_admitted += 1
     worst_floor = min(
         _f(metrics.get("directional_accuracy_pct", 0.0), 0.0),
         _f(metrics.get("trigger_match_pct", 0.0), 0.0),
@@ -2507,6 +2755,18 @@ def _score_crypto_with_policy(rows: List[Dict[str, Any]], policy: Dict[str, Any]
                 "Trailing": trailing_precision,
                 "Stale Alignment": stale_precision,
             },
+            "rejection_diagnostics": {
+                "by_predicted_trigger": _top_counter(by_pred_trigger_reject, limit=12),
+                "by_actual_trigger": _top_counter(by_actual_trigger_reject, limit=12),
+                "by_symbol": _top_counter(by_symbol_reject, limit=12),
+                "by_confidence_bucket": _top_counter(by_conf_bucket_reject, limit=12),
+                "by_trigger_margin_bucket": _top_counter(by_trig_margin_bucket_reject, limit=12),
+                "by_direction_margin_bucket": _top_counter(by_dir_margin_bucket_reject, limit=12),
+                "by_class_score_gap_bucket": _top_counter(by_score_gap_bucket_reject, limit=12),
+            },
+            "near_miss_rows_count": int(near_miss_count),
+            "correct_rejected_count": int(correct_rejected),
+            "incorrect_admitted_count": int(incorrect_admitted),
         }
     if coverage < _f(policy.get("coverage_target", 0.40), 0.40):
         score -= (_f(policy.get("coverage_target", 0.40), 0.40) - coverage) * 110.0
@@ -2549,6 +2809,18 @@ def _score_crypto_with_policy(rows: List[Dict[str, Any]], policy: Dict[str, Any]
             "Trailing": trailing_precision,
             "Stale Alignment": stale_precision,
         },
+        "rejection_diagnostics": {
+            "by_predicted_trigger": _top_counter(by_pred_trigger_reject, limit=12),
+            "by_actual_trigger": _top_counter(by_actual_trigger_reject, limit=12),
+            "by_symbol": _top_counter(by_symbol_reject, limit=12),
+            "by_confidence_bucket": _top_counter(by_conf_bucket_reject, limit=12),
+            "by_trigger_margin_bucket": _top_counter(by_trig_margin_bucket_reject, limit=12),
+            "by_direction_margin_bucket": _top_counter(by_dir_margin_bucket_reject, limit=12),
+            "by_class_score_gap_bucket": _top_counter(by_score_gap_bucket_reject, limit=12),
+        },
+        "near_miss_rows_count": int(near_miss_count),
+        "correct_rejected_count": int(correct_rejected),
+        "incorrect_admitted_count": int(incorrect_admitted),
     }
 
 
@@ -2598,7 +2870,79 @@ def _score_with_threshold(rows: List[Dict[str, Any]], threshold: float, market: 
     }
 
 
-def _calibrate_abstain_threshold(train_rows: List[Dict[str, Any]], market: str) -> Dict[str, Any]:
+def _score_without_abstain(rows: List[Dict[str, Any]], market: str, policy_name: str) -> Dict[str, Any]:
+    metrics = _metrics_for_rows(rows)
+    return {
+        "score": _objective_score(metrics, market),
+        "coverage": 1.0 if rows else 0.0,
+        "metrics": metrics,
+        "full_metrics": metrics,
+        "abstained_metrics": _metrics_for_rows([]),
+        "admitted": list(rows),
+        "abstained": [],
+        "policy_name": policy_name,
+    }
+
+
+def _selection_option_summary(name: str, scored: Dict[str, Any], *, predictor_variant: str, policy: Any = None) -> Dict[str, Any]:
+    metrics = scored.get("metrics", {}) if isinstance(scored.get("metrics", {}), dict) else {}
+    full_metrics = scored.get("full_metrics", {}) if isinstance(scored.get("full_metrics", {}), dict) else {}
+    admitted = scored.get("admitted", []) if isinstance(scored.get("admitted", []), list) else []
+    return {
+        "policy_name": name,
+        "predictor_variant": predictor_variant,
+        "policy": policy if isinstance(policy, dict) else {},
+        "admitted_trades": int(len(admitted)),
+        "admission_rate_pct": round(100.0 * _f(scored.get("coverage", 0.0), 0.0), 4),
+        "metrics": metrics,
+        "full_metrics": full_metrics,
+        "trigger_scored_trades": _f(metrics.get("trigger_scored_trades", 0.0), 0.0),
+        "score": round(_f(scored.get("score", 0.0), 0.0), 6),
+        "rejection_diagnostics": scored.get("rejection_diagnostics", {}) if isinstance(scored.get("rejection_diagnostics", {}), dict) else {},
+        "near_miss_rows_count": int(scored.get("near_miss_rows_count", 0) or 0),
+        "correct_rejected_count": int(scored.get("correct_rejected_count", 0) or 0),
+        "incorrect_admitted_count": int(scored.get("incorrect_admitted_count", 0) or 0),
+    }
+
+
+def _safe_selection_guardrails(
+    *,
+    market: str,
+    baseline: Dict[str, Any],
+    candidate: Dict[str, Any],
+    full_test_rows: int,
+    baseline_unknown_count: int = 0,
+    candidate_unknown_count: int = 0,
+) -> List[str]:
+    failures: List[str] = []
+    base_full = baseline.get("full_metrics", {}) if isinstance(baseline.get("full_metrics", {}), dict) else {}
+    cand_full = candidate.get("full_metrics", {}) if isinstance(candidate.get("full_metrics", {}), dict) else {}
+    base_metrics = baseline.get("metrics", {}) if isinstance(baseline.get("metrics", {}), dict) else {}
+    cand_metrics = candidate.get("metrics", {}) if isinstance(candidate.get("metrics", {}), dict) else {}
+    for key in ("directional_accuracy_pct", "pnl_trend_match_pct"):
+        if _f(cand_full.get(key, 0.0), 0.0) < _f(base_full.get(key, 0.0), 0.0) - 2.0:
+            failures.append(f"{key}_regressed")
+    if _f(cand_full.get("trigger_match_pct", 0.0), 0.0) < _f(base_full.get("trigger_match_pct", 0.0), 0.0) - 2.0:
+        dir_gain = _f(cand_full.get("directional_accuracy_pct", 0.0), 0.0) - _f(base_full.get("directional_accuracy_pct", 0.0), 0.0)
+        pnl_gain = _f(cand_full.get("pnl_trend_match_pct", 0.0), 0.0) - _f(base_full.get("pnl_trend_match_pct", 0.0), 0.0)
+        if max(dir_gain, pnl_gain) < 4.0:
+            failures.append("trigger_match_regressed")
+    if full_test_rows >= 40:
+        if int(candidate.get("admitted_trades", 0) or 0) < 40:
+            failures.append("candidate_admitted_trades_below_40")
+        if _f(candidate.get("admission_rate_pct", 0.0), 0.0) < 40.0:
+            failures.append("candidate_admission_rate_below_40")
+    if int(candidate.get("admitted_trades", 0) or 0) < 20 and int(baseline.get("admitted_trades", 0) or 0) >= 40:
+        failures.append("candidate_low_trade_count_vs_broader_baseline")
+    if _s(market).lower() == "forex":
+        if _f(cand_metrics.get("trigger_match_pct", 0.0), 0.0) < _f(base_metrics.get("trigger_match_pct", 0.0), 0.0) - 1.0:
+            failures.append("forex_trigger_match_regressed")
+        if candidate_unknown_count > baseline_unknown_count + 1:
+            failures.append("forex_unknown_trigger_increased")
+    return failures
+
+
+def _calibrate_abstain_threshold(train_rows: List[Dict[str, Any]], market: str, *, predictor_variant: str = "candidate") -> Dict[str, Any]:
     if _s(market).lower() == "crypto":
         hist_rows = [r for r in train_rows if _is_historical_strategy_replay_row(r)]
         if hist_rows and len(hist_rows) >= max(20, int(len(train_rows) * 0.60)):
@@ -2645,43 +2989,164 @@ def _calibrate_abstain_threshold(train_rows: List[Dict[str, Any]], market: str) 
             running = list(base)
             for row in val:
                 regime = _regime_from_prior(running)
-                pred = _predict_one(train_rows=running, candidate=row, regime=regime, market=market)
+                pred = _predict_one(train_rows=running, candidate=row, regime=regime, market=market, predictor_variant=predictor_variant)
                 merged = dict(row)
                 merged.update(pred)
                 pred_val.append(merged)
                 running.append(row)
             policies: List[Dict[str, Any]] = []
-            for base_conf in [0.30, 0.34, 0.38]:
-                for base_trig in [0.12, 0.18, 0.26]:
-                    for base_dir in [0.00, 0.04, 0.08]:
-                        policies.append(
-                            {
-                                "source_mode": "historical_strategy_replay",
-                                "base_conf_min": base_conf,
-                                "base_trigger_margin_min": base_trig,
-                                "base_dir_margin_min": base_dir,
-                                "stale_conf_min": base_conf + 0.01,
-                                "stale_trigger_margin_min": base_trig,
-                                "stale_dir_margin_min": max(0.0, base_dir - 0.02),
-                                "trailing_conf_min": max(0.24, base_conf - 0.02),
-                                "trailing_trigger_margin_min": max(0.10, base_trig - 0.02),
-                                "trailing_dir_margin_min": base_dir,
-                                "risk_cut_conf_min": base_conf,
-                                "risk_cut_trigger_margin_min": max(0.10, base_trig - 0.02),
-                                "risk_cut_dir_margin_min": max(0.0, base_dir - 0.02),
-                                "take_profit_conf_min": max(0.24, base_conf - 0.02),
-                                "take_profit_trigger_margin_min": max(0.10, base_trig - 0.02),
-                                "take_profit_score_gap_min": 0.08 if base_conf <= 0.34 else 0.12,
-                                "coverage_target": 0.40,
-                                "min_admitted_trades": 40,
-                                "min_trigger_scored": 20,
-                                "risk_cut_precision_target_pct": 60.0,
-                                "take_profit_precision_target_pct": 55.0,
-                                "trailing_precision_target_pct": 60.0,
-                                "stale_precision_target_pct": 60.0,
-                                "worst_window_floor_target_pct": 85.0,
-                            }
-                        )
+            if _s(predictor_variant).lower() == "label_compatible_v2":
+                policies.extend(
+                    [
+                        {
+                            "policy_name_override": "label_compatible_v2_strict",
+                            "source_mode": "historical_strategy_replay",
+                            "base_conf_min": 0.30,
+                            "base_trigger_margin_min": 0.18,
+                            "base_dir_margin_min": 0.00,
+                            "stale_conf_min": 0.31,
+                            "stale_trigger_margin_min": 0.18,
+                            "stale_dir_margin_min": 0.00,
+                            "trailing_conf_min": 0.28,
+                            "trailing_trigger_margin_min": 0.16,
+                            "trailing_dir_margin_min": 0.00,
+                            "risk_cut_conf_min": 0.30,
+                            "risk_cut_trigger_margin_min": 0.16,
+                            "risk_cut_dir_margin_min": 0.00,
+                            "take_profit_conf_min": 0.28,
+                            "take_profit_trigger_margin_min": 0.16,
+                            "take_profit_score_gap_min": 0.08,
+                            "coverage_target": 0.40,
+                            "min_admitted_trades": 40,
+                            "min_trigger_scored": 20,
+                            "risk_cut_precision_target_pct": 60.0,
+                            "take_profit_precision_target_pct": 55.0,
+                            "trailing_precision_target_pct": 60.0,
+                            "stale_precision_target_pct": 60.0,
+                            "worst_window_floor_target_pct": 85.0,
+                        },
+                        {
+                            "policy_name_override": "label_compatible_v2_balanced",
+                            "source_mode": "historical_strategy_replay",
+                            "base_conf_min": 0.28,
+                            "base_trigger_margin_min": 0.14,
+                            "base_dir_margin_min": 0.00,
+                            "stale_conf_min": 0.29,
+                            "stale_trigger_margin_min": 0.14,
+                            "stale_dir_margin_min": 0.00,
+                            "trailing_conf_min": 0.26,
+                            "trailing_trigger_margin_min": 0.14,
+                            "trailing_dir_margin_min": 0.00,
+                            "risk_cut_conf_min": 0.28,
+                            "risk_cut_trigger_margin_min": 0.14,
+                            "risk_cut_dir_margin_min": 0.00,
+                            "take_profit_conf_min": 0.26,
+                            "take_profit_trigger_margin_min": 0.14,
+                            "take_profit_score_gap_min": 0.06,
+                            "coverage_target": 0.40,
+                            "min_admitted_trades": 40,
+                            "min_trigger_scored": 20,
+                            "risk_cut_precision_target_pct": 58.0,
+                            "take_profit_precision_target_pct": 52.0,
+                            "trailing_precision_target_pct": 58.0,
+                            "stale_precision_target_pct": 58.0,
+                            "worst_window_floor_target_pct": 85.0,
+                        },
+                        {
+                            "policy_name_override": "label_compatible_v2_coverage_rescue",
+                            "source_mode": "historical_strategy_replay",
+                            "base_conf_min": 0.26,
+                            "base_trigger_margin_min": 0.12,
+                            "base_dir_margin_min": 0.00,
+                            "stale_conf_min": 0.28,
+                            "stale_trigger_margin_min": 0.12,
+                            "stale_dir_margin_min": 0.00,
+                            "trailing_conf_min": 0.25,
+                            "trailing_trigger_margin_min": 0.12,
+                            "trailing_dir_margin_min": 0.00,
+                            "risk_cut_conf_min": 0.26,
+                            "risk_cut_trigger_margin_min": 0.12,
+                            "risk_cut_dir_margin_min": 0.00,
+                            "take_profit_conf_min": 0.25,
+                            "take_profit_trigger_margin_min": 0.12,
+                            "take_profit_score_gap_min": 0.05,
+                            "coverage_target": 0.40,
+                            "min_admitted_trades": 40,
+                            "min_trigger_scored": 20,
+                            "risk_cut_precision_target_pct": 56.0,
+                            "take_profit_precision_target_pct": 50.0,
+                            "trailing_precision_target_pct": 56.0,
+                            "stale_precision_target_pct": 56.0,
+                            "worst_window_floor_target_pct": 85.0,
+                            "enable_risk_cut_rescue": True,
+                            "enable_trailing_rescue": True,
+                            "enable_stale_rescue": True,
+                            "enable_take_profit_rescue": True,
+                            "rescue_margin_band": 0.05,
+                            "rescue_conf_band": 0.05,
+                            "rescue_dir_band": 0.05,
+                        },
+                        {
+                            "policy_name_override": "label_compatible_v2_no_abstain_diagnostic",
+                            "source_mode": "historical_strategy_replay",
+                            "base_conf_min": 0.0,
+                            "base_trigger_margin_min": 0.0,
+                            "base_dir_margin_min": 0.0,
+                            "stale_conf_min": 0.0,
+                            "stale_trigger_margin_min": 0.0,
+                            "stale_dir_margin_min": 0.0,
+                            "trailing_conf_min": 0.0,
+                            "trailing_trigger_margin_min": 0.0,
+                            "trailing_dir_margin_min": 0.0,
+                            "risk_cut_conf_min": 0.0,
+                            "risk_cut_trigger_margin_min": 0.0,
+                            "risk_cut_dir_margin_min": 0.0,
+                            "take_profit_conf_min": 0.0,
+                            "take_profit_trigger_margin_min": 0.0,
+                            "take_profit_score_gap_min": 0.0,
+                            "coverage_target": 0.40,
+                            "min_admitted_trades": 40,
+                            "min_trigger_scored": 20,
+                            "risk_cut_precision_target_pct": 50.0,
+                            "take_profit_precision_target_pct": 45.0,
+                            "trailing_precision_target_pct": 50.0,
+                            "stale_precision_target_pct": 50.0,
+                            "worst_window_floor_target_pct": 85.0,
+                        },
+                    ]
+                )
+            else:
+                for base_conf in [0.30, 0.34, 0.38]:
+                    for base_trig in [0.12, 0.18, 0.26]:
+                        for base_dir in [0.00, 0.04, 0.08]:
+                            policies.append(
+                                {
+                                    "source_mode": "historical_strategy_replay",
+                                    "base_conf_min": base_conf,
+                                    "base_trigger_margin_min": base_trig,
+                                    "base_dir_margin_min": base_dir,
+                                    "stale_conf_min": base_conf + 0.01,
+                                    "stale_trigger_margin_min": base_trig,
+                                    "stale_dir_margin_min": max(0.0, base_dir - 0.02),
+                                    "trailing_conf_min": max(0.24, base_conf - 0.02),
+                                    "trailing_trigger_margin_min": max(0.10, base_trig - 0.02),
+                                    "trailing_dir_margin_min": base_dir,
+                                    "risk_cut_conf_min": base_conf,
+                                    "risk_cut_trigger_margin_min": max(0.10, base_trig - 0.02),
+                                    "risk_cut_dir_margin_min": max(0.0, base_dir - 0.02),
+                                    "take_profit_conf_min": max(0.24, base_conf - 0.02),
+                                    "take_profit_trigger_margin_min": max(0.10, base_trig - 0.02),
+                                    "take_profit_score_gap_min": 0.08 if base_conf <= 0.34 else 0.12,
+                                    "coverage_target": 0.40,
+                                    "min_admitted_trades": 40,
+                                    "min_trigger_scored": 20,
+                                    "risk_cut_precision_target_pct": 60.0,
+                                    "take_profit_precision_target_pct": 55.0,
+                                    "trailing_precision_target_pct": 60.0,
+                                    "stale_precision_target_pct": 60.0,
+                                    "worst_window_floor_target_pct": 85.0,
+                                }
+                            )
             frontier: List[Dict[str, Any]] = []
             default_policy = policies[0] if policies else {}
             best = {
@@ -2702,6 +3167,8 @@ def _calibrate_abstain_threshold(train_rows: List[Dict[str, Any]], market: str) 
                     "trigger_match_pct": _f(row.get("metrics", {}).get("trigger_match_pct", 0.0), 0.0),
                     "pnl_trend_match_pct": _f(row.get("metrics", {}).get("pnl_trend_match_pct", 0.0), 0.0),
                 }
+                summary["correct_rejected_count"] = int(row.get("correct_rejected_count", 0) or 0)
+                summary["incorrect_admitted_count"] = int(row.get("incorrect_admitted_count", 0) or 0)
                 frontier.append(summary)
                 if _f(row.get("score", -1e9), -1e9) > _f(best.get("score", -1e9), -1e9):
                     best = {
@@ -2754,7 +3221,7 @@ def _calibrate_abstain_threshold(train_rows: List[Dict[str, Any]], market: str) 
         running = list(base)
         for row in val:
             regime = _regime_from_prior(running)
-            pred = _predict_one(train_rows=running, candidate=row, regime=regime, market=market)
+            pred = _predict_one(train_rows=running, candidate=row, regime=regime, market=market, predictor_variant=predictor_variant)
             merged = dict(row)
             merged.update(pred)
             pred_val.append(merged)
@@ -2905,20 +3372,39 @@ def _calibrate_abstain_threshold(train_rows: List[Dict[str, Any]], market: str) 
     running = list(base)
     for row in val:
         regime = _regime_from_prior(running)
-        pred = _predict_one(train_rows=running, candidate=row, regime=regime, market=market)
+        pred = _predict_one(train_rows=running, candidate=row, regime=regime, market=market, predictor_variant=predictor_variant)
         merged = dict(row)
         merged.update(pred)
         pred_val.append(merged)
         running.append(row)
-    best = {"threshold": 0.6, "score": -1e9, "coverage": 0.0, "metrics": _metrics_for_rows(pred_val)}
-    for thr in [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85]:
+    if _s(market).lower() == "stocks":
+        thresholds = [
+            ("no_abstain_full_universe", 0.0),
+            ("low_threshold", 0.45),
+            ("balanced_threshold", 0.55),
+            ("high_confidence_threshold", 0.70),
+        ]
+    elif _s(market).lower() == "forex":
+        thresholds = [
+            ("no_abstain_full_universe", 0.0),
+            ("balanced_threshold", 0.55),
+            ("high_confidence_threshold", 0.70),
+        ]
+    else:
+        thresholds = [(f"threshold_{thr:.2f}", thr) for thr in [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85]]
+    best = {"threshold": 0.6, "score": -1e9, "coverage": 0.0, "metrics": _metrics_for_rows(pred_val), "policy_frontier": []}
+    frontier: List[Dict[str, Any]] = []
+    for policy_name, thr in thresholds:
         row = _score_with_threshold(pred_val, thr, market)
+        summary = _selection_option_summary(policy_name, row, predictor_variant=predictor_variant)
+        frontier.append(summary)
         score = _f(row.get("score", -1e9), -1e9)
         cov = _f(row.get("coverage", 0.0), 0.0)
         if score > _f(best.get("score", -1e9), -1e9) or (
             abs(score - _f(best.get("score", -1e9), -1e9)) <= 1e-9 and cov > _f(best.get("coverage", 0.0), 0.0)
         ):
-            best = {"threshold": thr, "score": score, "coverage": cov, "metrics": row.get("metrics", {})}
+            best = {"threshold": thr, "score": score, "coverage": cov, "metrics": row.get("metrics", {}), "policy_name": policy_name}
+    best["policy_frontier"] = frontier
     return best
 
 
@@ -3217,43 +3703,134 @@ def build_synthetic_replay_artifact(hub_dir: str, market: str, closed_rows: List
     validation_policy_quality: List[Dict[str, Any]] = []
     max_windows = 10
     win_count = 0
+    safe_selection_snapshots: List[Dict[str, Any]] = []
     for end in range(train_n_min, n - test_n + 1, step_n):
         train = rows[:end]
         test = rows[end : end + test_n]
         if len(test) < 4:
             continue
-        abstain = _calibrate_abstain_threshold(train, m)
-        threshold = _f(abstain.get("threshold", 0.6), 0.6)
-        thr_values.append(float(threshold))
-        selected_policy = abstain.get("policy", {}) if isinstance(abstain.get("policy", {}), dict) else {}
-        if selected_policy:
-            policy_snapshots.append(dict(selected_policy))
-            validation_policy_quality.append(
+        predictor_variants = ["candidate"]
+        if m == "crypto" and any(_is_historical_strategy_replay_row(r) for r in train):
+            predictor_variants = ["baseline", "candidate", "label_compatible_v2"]
+        elif m == "forex":
+            predictor_variants = ["baseline", "candidate"]
+        elif m == "stocks":
+            predictor_variants = ["candidate"]
+        variant_predictions: Dict[str, List[Dict[str, Any]]] = {}
+        variant_abstain: Dict[str, Dict[str, Any]] = {}
+        variant_scored: Dict[str, Dict[str, Any]] = {}
+        variant_summaries: Dict[str, Dict[str, Any]] = {}
+        for predictor_variant in predictor_variants:
+            abstain = _calibrate_abstain_threshold(train, m, predictor_variant=predictor_variant)
+            threshold = _f(abstain.get("threshold", 0.6), 0.6)
+            selected_policy = abstain.get("policy", {}) if isinstance(abstain.get("policy", {}), dict) else {}
+            test_preds: List[Dict[str, Any]] = []
+            prior = list(train)
+            for r in test:
+                regime = _regime_from_prior(prior)
+                rr = dict(r)
+                rr["regime"] = regime
+                pred = _predict_one(train_rows=prior, candidate=rr, regime=regime, market=m, predictor_variant=predictor_variant)
+                merged = dict(rr)
+                merged.update(pred)
+                merged["predicted_exit_ts"] = int(
+                    _f(rr.get("entry_ts", 0.0), 0.0) + int(round(_f(pred.get("predicted_hold_hours", 0.0), 0.0) * 3600.0))
+                )
+                test_preds.append(merged)
+                prior.append(rr)
+            scored = _score_crypto_with_policy(test_preds, selected_policy) if m == "crypto" else _score_with_threshold(test_preds, threshold, m)
+            variant_predictions[predictor_variant] = test_preds
+            variant_abstain[predictor_variant] = abstain
+            variant_scored[predictor_variant] = scored
+            policy_name = (
+                _s(abstain.get("policy_name", ""))
+                or _s(scored.get("policy_name", ""))
+                or ("no_abstain_full_universe" if threshold <= 0.0 else f"threshold_{threshold:.2f}")
+            )
+            variant_summaries[predictor_variant] = _selection_option_summary(
+                policy_name,
+                scored,
+                predictor_variant=predictor_variant,
+                policy=selected_policy,
+            )
+        baseline_variant = "baseline" if "baseline" in variant_predictions else predictor_variants[0]
+        baseline_summary = variant_summaries[baseline_variant]
+        candidate_variants = [v for v in predictor_variants if v != baseline_variant]
+        candidate_evaluations: List[Dict[str, Any]] = []
+        selected_variant = baseline_variant
+        selected_scored = variant_scored[baseline_variant]
+        selected_preds = variant_predictions[baseline_variant]
+        selected_abstain = variant_abstain[baseline_variant]
+        selected_failures: List[str] = []
+        winning_candidate_summary: Dict[str, Any] = {}
+        baseline_unknown = len([r for r in variant_predictions[baseline_variant] if _s(r.get("predicted_exit_trigger", "")) == "Unknown"])
+        for cand_variant in candidate_variants:
+            cand_summary = variant_summaries[cand_variant]
+            candidate_unknown = len([r for r in variant_predictions[cand_variant] if _s(r.get("predicted_exit_trigger", "")) == "Unknown"])
+            guardrail_failures = _safe_selection_guardrails(
+                market=m,
+                baseline=baseline_summary,
+                candidate=cand_summary,
+                full_test_rows=len(variant_predictions[cand_variant]),
+                baseline_unknown_count=baseline_unknown,
+                candidate_unknown_count=candidate_unknown,
+            )
+            candidate_evaluations.append(
                 {
-                    "policy_name": _s(abstain.get("policy_name", "")) or _policy_name(selected_policy),
-                    "coverage": round(_f(abstain.get("coverage", 0.0), 0.0), 6),
-                    "metrics": abstain.get("metrics", {}),
-                    "class_precision": abstain.get("class_precision", {}),
-                    "reason_counts": abstain.get("reason_counts", {}),
-                    "policy_frontier": abstain.get("policy_frontier", []),
+                    "variant": cand_variant,
+                    "summary": cand_summary,
+                    "guardrail_failures": list(guardrail_failures),
                 }
             )
-        test_preds: List[Dict[str, Any]] = []
-        prior = list(train)
-        for r in test:
-            regime = _regime_from_prior(prior)
-            rr = dict(r)
-            rr["regime"] = regime
-            pred = _predict_one(train_rows=prior, candidate=rr, regime=regime, market=m)
-            merged = dict(rr)
-            merged.update(pred)
-            merged["predicted_exit_ts"] = int(
-                _f(rr.get("entry_ts", 0.0), 0.0) + int(round(_f(pred.get("predicted_hold_hours", 0.0), 0.0) * 3600.0))
-            )
-            test_preds.append(merged)
-            prior.append(rr)
-        preds_all.extend(test_preds)
-        scored = _score_crypto_with_policy(test_preds, selected_policy) if m == "crypto" else _score_with_threshold(test_preds, threshold, m)
+        passing_candidates = [c for c in candidate_evaluations if not c.get("guardrail_failures")]
+        if passing_candidates:
+            passing_candidates.sort(key=lambda c: (_f(c["summary"].get("score", 0.0), 0.0), _f(c["summary"].get("admission_rate_pct", 0.0), 0.0)), reverse=True)
+            winner = passing_candidates[0]
+            selected_variant = _s(winner.get("variant", "")) or baseline_variant
+            selected_scored = variant_scored[selected_variant]
+            selected_preds = variant_predictions[selected_variant]
+            selected_abstain = variant_abstain[selected_variant]
+            winning_candidate_summary = winner.get("summary", {})
+        else:
+            selected_failures = list(candidate_evaluations[0].get("guardrail_failures", [])) if candidate_evaluations else []
+        threshold = _f(selected_abstain.get("threshold", 0.6), 0.6)
+        thr_values.append(float(threshold))
+        selected_policy = selected_abstain.get("policy", {}) if isinstance(selected_abstain.get("policy", {}), dict) else {}
+        if selected_policy:
+            policy_snapshots.append(dict(selected_policy))
+        validation_policy_quality.append(
+            {
+                "policy_name": _s(selected_abstain.get("policy_name", "")) or _s(selected_scored.get("policy_name", "")),
+                "coverage": round(_f(selected_scored.get("coverage", 0.0), 0.0), 6),
+                "metrics": selected_scored.get("metrics", {}),
+                "class_precision": selected_scored.get("class_precision", {}),
+                "reason_counts": selected_scored.get("reason_counts", {}),
+                "policy_frontier": selected_abstain.get("policy_frontier", []),
+            }
+        )
+        safe_selection_snapshots.append(
+            {
+                "candidate_policy_evaluated": bool(candidate_evaluations),
+                "candidate_policy_selected": bool(selected_variant != baseline_variant),
+                "fallback_to_baseline": bool(selected_variant == baseline_variant and bool(candidate_evaluations)),
+                "fallback_reason": ",".join(selected_failures) if selected_failures else "",
+                "baseline_metrics": baseline_summary.get("metrics", {}),
+                "candidate_metrics": (winning_candidate_summary or (candidate_evaluations[0].get("summary", {}) if candidate_evaluations else {})).get("metrics", {}),
+                "baseline_full_metrics": baseline_summary.get("full_metrics", {}),
+                "candidate_full_metrics": (winning_candidate_summary or (candidate_evaluations[0].get("summary", {}) if candidate_evaluations else {})).get("full_metrics", {}),
+                "baseline_admitted_trades": int(baseline_summary.get("admitted_trades", 0)),
+                "candidate_admitted_trades": int((winning_candidate_summary or (candidate_evaluations[0].get("summary", {}) if candidate_evaluations else {})).get("admitted_trades", 0)),
+                "baseline_admission_rate_pct": _f(baseline_summary.get("admission_rate_pct", 0.0), 0.0),
+                "candidate_admission_rate_pct": _f((winning_candidate_summary or (candidate_evaluations[0].get("summary", {}) if candidate_evaluations else {})).get("admission_rate_pct", 0.0), 0.0),
+                "selection_guardrails_failed": list(selected_failures),
+                "selected_predictor_variant": selected_variant,
+                "baseline_policy_name": baseline_summary.get("policy_name", ""),
+                "candidate_policy_name": (winning_candidate_summary or (candidate_evaluations[0].get("summary", {}) if candidate_evaluations else {})).get("policy_name", ""),
+                "candidate_evaluations": candidate_evaluations,
+            }
+        )
+        preds_all.extend(selected_preds)
+        scored = selected_scored
         admitted = scored.get("admitted", []) if isinstance(scored.get("admitted", []), list) else []
         abstained = scored.get("abstained", []) if isinstance(scored.get("abstained", []), list) else []
         admitted_all.extend(admitted)
@@ -3271,6 +3848,7 @@ def build_synthetic_replay_artifact(hub_dir: str, market: str, closed_rows: List
                 "abstained_metrics": scored.get("abstained_metrics", {}),
                 "admission_reason_counts": scored.get("reason_counts", {}),
                 "selected_policy": selected_policy,
+                "safe_selection": safe_selection_snapshots[-1],
             }
         )
         win_count += 1
@@ -3314,6 +3892,7 @@ def build_synthetic_replay_artifact(hub_dir: str, market: str, closed_rows: List
     market_diag = _market_predictor_diagnostics(m, admitted_all, full_rows=preds_all, abstained_rows=abstained_all) if m in {"stocks", "forex"} else {}
     if crypto_diag:
         crypto_diag["population_diagnostics"] = population_diag
+        crypto_diag["crypto_label_feature_alignment_diagnostics"] = _crypto_label_feature_alignment_diagnostics(preds_all)
         crypto_diag["selected_crypto_admission_policy"] = policy_snapshots[-1] if policy_snapshots else {}
         crypto_diag["selected_policy_validation_quality"] = validation_policy_quality[-1] if validation_policy_quality else {}
         crypto_diag["crypto_policy_frontier"] = (
@@ -3413,6 +3992,10 @@ def build_synthetic_replay_artifact(hub_dir: str, market: str, closed_rows: List
         "best_test_metrics": metrics,
         "hybrid_test_metrics": metrics,
         "population_diagnostics": population_diag,
+        "safe_selection_diagnostics": {
+            "windows": safe_selection_snapshots,
+            "latest": safe_selection_snapshots[-1] if safe_selection_snapshots else {},
+        },
         "worst_window_metrics": worst,
         "confidence_intervals": ci,
         "walkforward_windows": windows,
@@ -3421,16 +4004,34 @@ def build_synthetic_replay_artifact(hub_dir: str, market: str, closed_rows: List
         "iterations": [{"iteration": 1, "test_predictions": admitted_all}],
     }
     if crypto_diag:
+        latest_selection = safe_selection_snapshots[-1] if safe_selection_snapshots else {}
+        crypto_diag["safe_selection"] = latest_selection
+        crypto_diag["exit_shape_predictive_mode"] = (
+            "active" if _s(latest_selection.get("selected_predictor_variant", "")) == "label_compatible_v2" else "diagnostic_only"
+        )
+        label_v2_eval = {}
+        for ev in latest_selection.get("candidate_evaluations", []) if isinstance(latest_selection.get("candidate_evaluations", []), list) else []:
+            if _s(ev.get("variant", "")) == "label_compatible_v2":
+                label_v2_eval = ev
+                break
+        if label_v2_eval:
+            summary = label_v2_eval.get("summary", {}) if isinstance(label_v2_eval.get("summary", {}), dict) else {}
+            crypto_diag["label_compatible_v2_rejection_diagnostics"] = summary.get("rejection_diagnostics", {})
+            crypto_diag["label_compatible_v2_near_miss_rows_count"] = int(summary.get("near_miss_rows_count", 0) or 0)
+            crypto_diag["label_compatible_v2_correct_rejected_count"] = int(summary.get("correct_rejected_count", 0) or 0)
+            crypto_diag["label_compatible_v2_incorrect_admitted_count"] = int(summary.get("incorrect_admitted_count", 0) or 0)
         payload["crypto_classifier_diagnostics"] = crypto_diag
     if market_diag:
         if m == "stocks":
             payload["stock_predictor_diagnostics"] = market_diag
             payload["stock_predictor_mode"] = market_diag.get("predictor_mode", {})
             payload["stock_policy_frontier"] = validation_policy_quality[-1].get("policy_frontier", []) if validation_policy_quality else []
+            payload["stock_safe_selection"] = safe_selection_snapshots[-1] if safe_selection_snapshots else {}
         if m == "forex":
             payload["forex_predictor_diagnostics"] = market_diag
             payload["forex_predictor_mode"] = market_diag.get("predictor_mode", {})
             payload["forex_policy_frontier"] = validation_policy_quality[-1].get("policy_frontier", []) if validation_policy_quality else []
+            payload["forex_safe_selection"] = safe_selection_snapshots[-1] if safe_selection_snapshots else {}
     return payload
 
 

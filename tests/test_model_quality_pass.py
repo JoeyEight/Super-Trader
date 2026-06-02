@@ -1165,6 +1165,212 @@ class TestModelQualityPass(unittest.TestCase):
         self.assertIn(selected_name, frontier_names)
         self.assertEqual(selected_name, frontier[0].get("policy_name", selected_name))
 
+    def test_crypto_historical_replay_direction_not_forced_by_trigger(self) -> None:
+        train_rows = []
+        for i in range(8):
+            train_rows.append(
+                {
+                    "symbol": "ADA-USD",
+                    "entry_price": 1.0,
+                    "exit_price": 0.98,
+                    "actual_exit_price": 0.98,
+                    "hold_hours": 10.0,
+                    "pnl_pct": -2.0,
+                    "actual_direction": "down",
+                    "actual_exit_trigger": "Risk Cut",
+                    "regime": "high_volatility",
+                    "source_type": "historical_strategy_replay",
+                    "strategy_adapter_used": "minimal_artifact_replay_v1",
+                    "signal_side": "long",
+                    "current_candle_pct_move": 0.4,
+                    "recent_return_3": 1.0,
+                    "recent_return_6": 1.1,
+                    "recent_return_12": 1.2,
+                    "recent_return_24": 1.4,
+                    "recent_volatility": 0.35,
+                    "trend_momentum_score": 1.6,
+                    "signal_margin": 0.32,
+                    "active_timeframe_count": 6,
+                }
+            )
+        candidate = {
+            "symbol": "ADA-USD",
+            "entry_price": 1.0,
+            "source_type": "historical_strategy_replay",
+            "strategy_adapter_used": "minimal_artifact_replay_v1",
+            "signal_side": "long",
+            "current_candle_pct_move": 0.2,
+            "recent_return_3": 0.8,
+            "recent_return_6": 0.9,
+            "recent_return_12": 1.0,
+            "recent_return_24": 1.1,
+            "recent_volatility": 0.30,
+            "trend_momentum_score": 1.4,
+            "signal_margin": 0.28,
+            "active_timeframe_count": 6,
+        }
+        out = _predict_one(train_rows=train_rows, candidate=candidate, regime="high_volatility", market="crypto", predictor_variant="baseline")
+        self.assertIn("direction_independent_score_up", out)
+        self.assertIn("direction_independent_score_down", out)
+        self.assertFalse(bool(out.get("direction_forced_by_trigger", False)))
+
+    def test_stock_predictor_applies_down_case_guard(self) -> None:
+        train_rows = []
+        for i in range(10):
+            train_rows.append(
+                {
+                    "symbol": "NVDA",
+                    "entry_price": 100.0,
+                    "actual_exit_price": 97.0,
+                    "hold_hours": 6.0,
+                    "pnl_pct": -3.0,
+                    "actual_direction": "down",
+                    "actual_exit_trigger": "Stale Alignment",
+                    "regime": "high_volatility",
+                    "source_type": "historical_api_replay",
+                    "recent_return_6": -2.0,
+                    "recent_return_24": -3.0,
+                    "recent_volatility": 1.2,
+                    "trend_momentum_score": -0.2,
+                    "signal_margin": 0.1,
+                }
+            )
+        candidate = {
+            "symbol": "NVDA",
+            "entry_price": 100.0,
+            "source_type": "historical_api_replay",
+            "recent_return_6": -1.5,
+            "recent_return_24": -2.5,
+            "recent_volatility": 1.0,
+            "trend_momentum_score": -0.1,
+            "signal_margin": 0.1,
+        }
+        out = _predict_one(train_rows=train_rows, candidate=candidate, regime="high_volatility", market="stocks", predictor_variant="candidate")
+        self.assertEqual(str(out.get("predicted_direction", "")), "down")
+        self.assertTrue(bool(out.get("stock_up_bias_guard_applied", False)))
+
+    def test_safe_selection_falls_back_to_baseline_when_crypto_candidate_regresses(self) -> None:
+        closed_rows = []
+        ts = 1_700_000_000
+        for i in range(30):
+            closed_rows.append(
+                {
+                    "symbol": "BTC-USD",
+                    "entry_price": 100.0,
+                    "actual_exit_price": 102.0,
+                    "hold_hours": 6.0,
+                    "pnl_pct": 2.0,
+                    "actual_direction": "up",
+                    "actual_exit_trigger": "Trailing",
+                    "source_type": "historical_strategy_replay",
+                    "entry_ts": ts + (i * 7200),
+                    "exit_ts": ts + (i * 7200) + 3600,
+                }
+            )
+        def fake_predict(*, predictor_variant: str = "candidate", **kwargs):
+            if predictor_variant == "baseline":
+                return {
+                    "predicted_direction": "up",
+                    "predicted_exit_trigger": "Trailing",
+                    "predicted_hold_hours": 6.0,
+                    "predicted_exit_price": 102.0,
+                    "predicted_confidence": 0.9,
+                    "trigger_margin": 1.0,
+                    "direction_margin": 1.0,
+                    "predictor_source_mode": "historical_strategy_replay",
+                    "exit_shape_predictive_mode": "diagnostic_only",
+                }
+            return {
+                "predicted_direction": "down",
+                "predicted_exit_trigger": "Risk Cut",
+                "predicted_hold_hours": 6.0,
+                "predicted_exit_price": 98.0,
+                "predicted_confidence": 0.9,
+                "trigger_margin": 1.0,
+                "direction_margin": 1.0,
+                "predictor_source_mode": "historical_strategy_replay",
+                "exit_shape_predictive_mode": "active",
+            }
+
+        with mock.patch.object(model_quality_pass, "_predict_one", side_effect=fake_predict):
+            payload = build_synthetic_replay_artifact("/tmp", "crypto", closed_rows)
+        safe = payload.get("safe_selection_diagnostics", {}).get("latest", {})
+        crypto_diag = payload.get("crypto_classifier_diagnostics", {})
+        self.assertTrue(bool(safe.get("fallback_to_baseline", False)))
+        self.assertEqual(str(safe.get("selected_predictor_variant", "")), "baseline")
+        self.assertEqual(str(crypto_diag.get("exit_shape_predictive_mode", "")), "diagnostic_only")
+
+    def test_forex_safe_selection_falls_back_to_baseline(self) -> None:
+        closed_rows = []
+        ts = 1_700_000_000
+        for i in range(30):
+            closed_rows.append(
+                {
+                    "symbol": "EUR_USD",
+                    "entry_price": 1.1,
+                    "actual_exit_price": 1.101,
+                    "hold_hours": 4.0,
+                    "pnl_pct": 0.1,
+                    "actual_direction": "up",
+                    "actual_exit_trigger": "Stale Alignment",
+                    "source_type": "execution_log",
+                    "entry_ts": ts + (i * 7200),
+                    "exit_ts": ts + (i * 7200) + 3600,
+                    "side": "long",
+                }
+            )
+        original_predict = model_quality_pass._predict_one
+
+        def fake_predict(*, market: str = "", predictor_variant: str = "candidate", candidate: dict, **kwargs):
+            if market == "forex" and predictor_variant == "baseline":
+                return {
+                    "predicted_direction": "up",
+                    "predicted_exit_trigger": candidate.get("actual_exit_trigger", "Unknown"),
+                    "predicted_hold_hours": 4.0,
+                    "predicted_exit_price": 1.101,
+                    "predicted_confidence": 0.8,
+                    "predictor_mode": "forex_execution_log",
+                }
+            if market == "forex":
+                return {
+                    "predicted_direction": "down",
+                    "predicted_exit_trigger": candidate.get("actual_exit_trigger", "Unknown"),
+                    "predicted_hold_hours": 4.0,
+                    "predicted_exit_price": 1.099,
+                    "predicted_confidence": 0.8,
+                    "predictor_mode": "forex_execution_log",
+                }
+            return original_predict(train_rows=kwargs["train_rows"], candidate=candidate, regime=kwargs["regime"], market=market, predictor_variant=predictor_variant)
+
+        with mock.patch.object(model_quality_pass, "_predict_one", side_effect=fake_predict):
+            payload = build_synthetic_replay_artifact("/tmp", "forex", closed_rows)
+        safe = payload.get("forex_safe_selection", {})
+        self.assertTrue(bool(safe.get("fallback_to_baseline", False)))
+        self.assertEqual(str(safe.get("selected_predictor_variant", "")), "baseline")
+
+    def test_safe_selection_diagnostics_emitted_for_all_markets(self) -> None:
+        rows = []
+        ts = 1_700_000_000
+        for i in range(30):
+            rows.append(
+                {
+                    "symbol": "SPY",
+                    "entry_price": 100.0,
+                    "actual_exit_price": 101.0,
+                    "hold_hours": 4.0,
+                    "pnl_pct": 1.0,
+                    "actual_direction": "up",
+                    "actual_exit_trigger": "Trailing",
+                    "source_type": "historical_api_replay",
+                    "entry_ts": ts + (i * 7200),
+                    "exit_ts": ts + (i * 7200) + 3600,
+                }
+            )
+        payload = build_synthetic_replay_artifact("/tmp", "stocks", rows)
+        safe = payload.get("safe_selection_diagnostics", {})
+        self.assertIn("latest", safe)
+        self.assertIn("windows", safe)
+
     def test_prepare_forex_audit_rows_marks_explicit_stale_exit(self) -> None:
         rows = [
             {
@@ -1379,8 +1585,219 @@ class TestModelQualityPass(unittest.TestCase):
         self.assertIn("bars_in_trade", row)
         self.assertIn("trailing_armed", row)
         self.assertIn("favorable_then_softened_flag", row)
+        self.assertIn("label_rule_version", row)
+        self.assertIn("exit_condition_priority_used", row)
         self.assertGreaterEqual(int(row.get("bars_in_trade", 0) or 0), 1)
         self.assertIn(row.get("actual_exit_trigger"), {"Trailing", "Stale Alignment", "Risk Cut", "Take Profit"})
+
+    def test_crypto_historical_replay_trailing_label_aligns_with_flags(self) -> None:
+        candles = []
+        ts = 1_700_000_000_000
+        px = 100.0
+        for i in range(60):
+            if i < 28:
+                px *= 1.003
+            elif i < 34:
+                px *= 1.012
+            elif i < 38:
+                px *= 0.988
+            else:
+                px *= 1.0002
+            candles.append([ts + (i * 3_600_000), px, px, px * 1.004, px * 0.996, 1000.0])
+        artifact_ctx = {
+            "usable": True,
+            "active_timeframe_count": 6,
+            "predicted_low_boundary": 99.0,
+            "predicted_high_boundary": 110.0,
+            "trained_artifacts_fresh": True,
+            "artifact_training_time": 1_700_000_000,
+            "signal_margin": 0.5,
+        }
+        thresholds = {
+            "entry_signal_margin_min": 0.35,
+            "entry_trend_score_min": 0.12,
+            "entry_return6_min": -0.25,
+            "risk_cut_pct": 2.25,
+            "take_profit_pct": 20.0,
+            "trailing_arm_pct": 1.6,
+            "trailing_drawdown_pct": 1.1,
+            "stale_hold_hours": 18.0,
+            "stale_trend_score_max": 0.05,
+        }
+        rows = crypto_historical_replay._simulate_strategy_rows("BTC-USD", candles, artifact_ctx, "1hour", thresholds)
+        self.assertTrue(rows)
+        trailing = [r for r in rows if r.get("actual_exit_trigger") == "Trailing"]
+        self.assertTrue(trailing)
+        self.assertTrue(bool(trailing[0].get("trailing_armed", False)))
+        self.assertTrue(bool(trailing[0].get("favorable_then_softened_flag", False)))
+
+    def test_crypto_historical_replay_risk_cut_label_aligns_with_flag(self) -> None:
+        candles = []
+        ts = 1_700_000_000_000
+        px = 100.0
+        for i in range(60):
+            if i < 28:
+                px *= 1.002
+            elif i < 33:
+                px *= 0.972
+            else:
+                px *= 1.0001
+            candles.append([ts + (i * 3_600_000), px, px, px * 1.002, px * 0.97, 1000.0])
+        artifact_ctx = {
+            "usable": True,
+            "active_timeframe_count": 6,
+            "predicted_low_boundary": 96.0,
+            "predicted_high_boundary": 104.0,
+            "trained_artifacts_fresh": True,
+            "artifact_training_time": 1_700_000_000,
+            "signal_margin": 0.5,
+        }
+        thresholds = {
+            "entry_signal_margin_min": 0.35,
+            "entry_trend_score_min": 0.12,
+            "entry_return6_min": -0.25,
+            "risk_cut_pct": 2.25,
+            "take_profit_pct": 6.0,
+            "trailing_arm_pct": 1.6,
+            "trailing_drawdown_pct": 1.1,
+            "stale_hold_hours": 18.0,
+            "stale_trend_score_max": 0.05,
+        }
+        rows = crypto_historical_replay._simulate_strategy_rows("BTC-USD", candles, artifact_ctx, "1hour", thresholds)
+        risk_rows = [r for r in rows if r.get("actual_exit_trigger") == "Risk Cut"]
+        self.assertTrue(risk_rows)
+        self.assertTrue(bool(risk_rows[0].get("risk_cut_touched", False)))
+
+    def test_crypto_alignment_diagnostics_emitted(self) -> None:
+        closed_rows = []
+        ts = 1_700_000_000
+        for i in range(30):
+            closed_rows.append(
+                {
+                    "symbol": "BTC-USD",
+                    "entry_price": 100.0,
+                    "actual_exit_price": 98.0,
+                    "hold_hours": 10.0,
+                    "pnl_pct": -2.0,
+                    "actual_direction": "down",
+                    "actual_exit_trigger": "Risk Cut" if i % 2 == 0 else "Trailing",
+                    "source_type": "historical_strategy_replay",
+                    "entry_ts": ts + (i * 7200),
+                    "exit_ts": ts + (i * 7200) + 3600,
+                    "risk_cut_touched": bool(i % 2 == 0),
+                    "take_profit_touched": False,
+                    "trailing_armed": bool(i % 2 == 1),
+                    "favorable_then_softened_flag": bool(i % 2 == 1),
+                    "max_favorable_excursion_pct": 2.5,
+                    "max_adverse_excursion_pct": -2.5,
+                    "drawdown_from_peak_pct": -1.3,
+                    "trailing_pullback_pct": 1.3,
+                    "bars_in_trade": 8,
+                    "exit_momentum_3": -0.8,
+                    "exit_momentum_6": -0.5,
+                    "trend_momentum_score": 0.3,
+                    "recent_return_3": 0.8,
+                    "recent_return_6": 1.1,
+                    "recent_return_12": 1.3,
+                    "recent_return_24": 1.8,
+                    "signal_margin": 0.4,
+                    "label_rule_version": "historical_replay_v2",
+                    "exit_condition_priority_used": ["Risk Cut", "Take Profit", "Trailing", "Stale Alignment"],
+                    "same_candle_multi_exit_condition_count": 0,
+                }
+            )
+        payload = build_synthetic_replay_artifact("/tmp", "crypto", closed_rows)
+        diag = payload.get("crypto_classifier_diagnostics", {})
+        align = diag.get("crypto_label_feature_alignment_diagnostics", {})
+        self.assertIn("feature_distributions_by_actual_trigger", align)
+        self.assertIn("mismatch_counters", align)
+        self.assertIn("label_rule_version", align)
+
+    def test_label_compatible_v2_frontier_variants_present(self) -> None:
+        closed_rows = []
+        ts = 1_700_000_000
+        for i in range(40):
+            closed_rows.append(
+                {
+                    "symbol": "BTC-USD",
+                    "entry_price": 100.0,
+                    "actual_exit_price": 102.0 if i % 2 == 0 else 98.0,
+                    "hold_hours": 8.0,
+                    "pnl_pct": 2.0 if i % 2 == 0 else -2.0,
+                    "actual_direction": "up" if i % 2 == 0 else "down",
+                    "actual_exit_trigger": "Trailing" if i % 2 == 0 else "Risk Cut",
+                    "source_type": "historical_strategy_replay",
+                    "entry_ts": ts + (i * 7200),
+                    "exit_ts": ts + (i * 7200) + 3600,
+                    "risk_cut_touched": bool(i % 2 == 1),
+                    "take_profit_touched": False,
+                    "trailing_armed": bool(i % 2 == 0),
+                    "favorable_then_softened_flag": bool(i % 2 == 0),
+                    "max_favorable_excursion_pct": 2.5,
+                    "max_adverse_excursion_pct": -2.5,
+                    "drawdown_from_peak_pct": -1.3,
+                    "trailing_pullback_pct": 1.3,
+                    "bars_in_trade": 8,
+                    "exit_momentum_3": -0.5 if i % 2 == 1 else 0.2,
+                    "exit_momentum_6": -0.4 if i % 2 == 1 else 0.3,
+                    "trend_momentum_score": 0.3,
+                    "recent_return_3": 0.8,
+                    "recent_return_6": 1.1,
+                    "recent_return_12": 1.3,
+                    "recent_return_24": 1.8,
+                    "signal_margin": 0.4,
+                    "label_rule_version": "historical_replay_v2",
+                    "exit_condition_priority_used": ["Risk Cut", "Take Profit", "Trailing", "Stale Alignment"],
+                    "same_candle_multi_exit_condition_count": 0,
+                }
+            )
+        payload = build_synthetic_replay_artifact("/tmp", "crypto", closed_rows)
+        evals = payload.get("safe_selection_diagnostics", {}).get("latest", {}).get("candidate_evaluations", [])
+        names = [e.get("summary", {}).get("policy_name", "") for e in evals if e.get("variant") == "label_compatible_v2"]
+        self.assertTrue(any("label_compatible_v2" in n for n in names))
+
+    def test_label_compatible_v2_rejection_diagnostics_emitted(self) -> None:
+        closed_rows = []
+        ts = 1_700_000_000
+        for i in range(40):
+            closed_rows.append(
+                {
+                    "symbol": "ETH-USD",
+                    "entry_price": 100.0,
+                    "actual_exit_price": 102.0,
+                    "hold_hours": 8.0,
+                    "pnl_pct": 2.0,
+                    "actual_direction": "up",
+                    "actual_exit_trigger": "Trailing",
+                    "source_type": "historical_strategy_replay",
+                    "entry_ts": ts + (i * 7200),
+                    "exit_ts": ts + (i * 7200) + 3600,
+                    "risk_cut_touched": False,
+                    "take_profit_touched": False,
+                    "trailing_armed": True,
+                    "favorable_then_softened_flag": True,
+                    "max_favorable_excursion_pct": 2.5,
+                    "max_adverse_excursion_pct": -0.5,
+                    "drawdown_from_peak_pct": -1.3,
+                    "trailing_pullback_pct": 1.3,
+                    "bars_in_trade": 8,
+                    "exit_momentum_3": 0.2,
+                    "exit_momentum_6": 0.3,
+                    "trend_momentum_score": 0.3,
+                    "recent_return_3": 0.8,
+                    "recent_return_6": 1.1,
+                    "recent_return_12": 1.3,
+                    "recent_return_24": 1.8,
+                    "signal_margin": 0.4,
+                    "label_rule_version": "historical_replay_v2",
+                    "exit_condition_priority_used": ["Risk Cut", "Take Profit", "Trailing", "Stale Alignment"],
+                    "same_candle_multi_exit_condition_count": 0,
+                }
+            )
+        payload = build_synthetic_replay_artifact("/tmp", "crypto", closed_rows)
+        diag = payload.get("crypto_classifier_diagnostics", {})
+        self.assertIn("label_compatible_v2_rejection_diagnostics", diag)
+        self.assertIn("label_compatible_v2_near_miss_rows_count", diag)
 
     def test_load_market_trade_events_joins_crypto_snapshot_fields(self) -> None:
         with tempfile.TemporaryDirectory() as td:
