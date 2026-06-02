@@ -6,11 +6,13 @@ import json
 import math
 import os
 import random
+import re
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from app.confidence_calibration import build_confidence_calibration_payload
 from app.crypto_artifacts import discover_crypto_trained_artifacts, load_crypto_artifact_features
+import app.crypto_historical_replay as crypto_historical_replay
 from app.crypto_historical_replay import build_crypto_historical_strategy_replay
 from app.credential_utils import get_alpaca_creds, get_twelvedata_api_key
 from app.regime_classifier import build_all_market_regimes
@@ -789,6 +791,519 @@ def build_market_dataset_quality(hub_dir: str, market: str) -> Dict[str, Any]:
     return out
 
 
+def _legacy_trade_source_paths(hub_dir: str) -> Dict[str, List[str]]:
+    return {
+        "crypto": [
+            os.path.join(hub_dir, "crypto", "execution_audit.jsonl"),
+            os.path.join(hub_dir, "trade_history.jsonl"),
+        ],
+        "stocks": [
+            os.path.join(hub_dir, "stocks", "execution_audit.jsonl"),
+        ],
+        "forex": [
+            os.path.join(hub_dir, "forex", "execution_audit.jsonl"),
+        ],
+    }
+
+
+def _legacy_timestamp_quality(row: Dict[str, Any], market: str, source_file: str) -> str:
+    mk = _s(market).lower()
+    if mk == "crypto":
+        return "paired_entry_exit" if source_file.endswith("execution_audit.jsonl") else "paired_entry_exit_from_trade_history"
+    hold_h = _f(row.get("hold_hours", 0.0), 0.0)
+    if hold_h > 0.0:
+        return "derived_from_exit_hold"
+    return "single_timestamp_inferred_entry"
+
+
+def _legacy_side_for_row(row: Dict[str, Any], market: str) -> str:
+    mk = _s(market).lower()
+    side = _s(row.get("side", "")).lower()
+    if side:
+        return side
+    if mk in {"crypto", "stocks"}:
+        return "long"
+    return ""
+
+
+def _normalize_legacy_completed_trades(hub_dir: str) -> Dict[str, Any]:
+    normalized: List[Dict[str, Any]] = []
+    raw_rows_found = 0
+    source_files_used: List[str] = []
+    rows_by_market: Dict[str, int] = {}
+    timestamp_quality_counts: Dict[str, int] = {}
+    field_coverage: Dict[str, int] = {
+        "entry_ts": 0,
+        "exit_ts": 0,
+        "entry_price": 0,
+        "exit_price": 0,
+        "pnl_usd": 0,
+        "pnl_pct": 0,
+        "qty": 0,
+        "score": 0,
+        "calib_prob": 0,
+        "required_score": 0,
+    }
+    dedupe: Set[str] = set()
+    for market, paths in _legacy_trade_source_paths(hub_dir).items():
+        for path in paths:
+            src_rows = _safe_read_jsonl(path)
+            if not src_rows:
+                continue
+            raw_rows_found += int(len(src_rows))
+            source_files_used.append(path)
+            rows_for_events = src_rows
+            if market == "forex":
+                rows_for_events, _diag = _prepare_forex_audit_rows(src_rows)
+            if market == "crypto" and path.endswith("trade_history.jsonl"):
+                converted: List[Dict[str, Any]] = []
+                for row in src_rows:
+                    side = _s(row.get("side", "")).lower()
+                    if side not in {"buy", "sell"}:
+                        continue
+                    x = dict(row)
+                    x["event"] = "entry" if side == "buy" else "exit"
+                    x["pnl_usd"] = _f(row.get("realized_profit_usd", 0.0), 0.0)
+                    converted.append(x)
+                rows_for_events = converted
+            events = []
+            for row in rows_for_events:
+                ev = _as_trade_event(row, market)
+                if isinstance(ev, dict):
+                    events.append(ev)
+            closed = build_closed_trades(events, market).get("closed_trades", [])
+            for row in list(closed or []):
+                item = dict(row)
+                item["market"] = market
+                item["legacy_source_file"] = path
+                item["legacy_source_name"] = os.path.basename(path)
+                item["legacy_trade_id"] = "|".join(
+                    [
+                        market,
+                        _s(item.get("symbol", "")),
+                        str(int(_f(item.get("entry_ts", 0.0), 0.0))),
+                        str(int(_f(item.get("exit_ts", 0.0), 0.0))),
+                        f"{_f(item.get('qty', 0.0), 0.0):.8f}",
+                        f"{_f(item.get('entry_price', 0.0), 0.0):.8f}",
+                        f"{_f(item.get('exit_price', 0.0), 0.0):.8f}",
+                    ]
+                )
+                if item["legacy_trade_id"] in dedupe:
+                    continue
+                dedupe.add(item["legacy_trade_id"])
+                item["side"] = _legacy_side_for_row(item, market)
+                item["timestamp_quality"] = _legacy_timestamp_quality(item, market, path)
+                item["score"] = row.get("score")
+                item["calib_prob"] = row.get("calib_prob")
+                item["required_score"] = row.get("required_score")
+                rows_by_market[market] = int(rows_by_market.get(market, 0) + 1)
+                timestamp_quality_counts[item["timestamp_quality"]] = int(timestamp_quality_counts.get(item["timestamp_quality"], 0) + 1)
+                for key in list(field_coverage.keys()):
+                    if item.get(key) not in (None, "", 0, 0.0):
+                        field_coverage[key] = int(field_coverage.get(key, 0) + 1)
+                normalized.append(item)
+    normalized.sort(key=_stable_row_sort_key)
+    return {
+        "rows": normalized,
+        "raw_rows_found": int(raw_rows_found),
+        "normalized_rows_found": int(len(normalized)),
+        "rows_by_market": rows_by_market,
+        "timestamp_quality_summary": timestamp_quality_counts,
+        "field_coverage": field_coverage,
+        "source_files_used": sorted(set(source_files_used)),
+    }
+
+
+def _bar_ts_seconds(row: Dict[str, Any]) -> int:
+    raw = row.get("t", row.get("ts", row.get("timestamp", 0)))
+    if isinstance(raw, str):
+        try:
+            return int(time.mktime(time.strptime(raw.replace("Z", ""), "%Y-%m-%dT%H:%M:%S")))
+        except Exception:
+            try:
+                return int(_f(raw, 0.0))
+            except Exception:
+                return 0
+    value = int(_f(raw, 0.0))
+    if value > 1_000_000_000_000:
+        return int(value / 1000)
+    return value
+
+
+def _build_stock_candidate_asof(symbol: str, bars: List[Dict[str, Any]], entry_ts: int) -> Dict[str, Any]:
+    rows = [dict(r) for r in list(bars or []) if _bar_close(r) > 0.0]
+    rows.sort(key=_bar_ts_seconds)
+    idx = max((i for i, row in enumerate(rows) if _bar_ts_seconds(row) <= int(entry_ts)), default=-1)
+    if idx < 24:
+        return {}
+    px = _bar_close(rows[idx])
+    prev6 = _bar_close(rows[idx - 6])
+    prev24 = _bar_close(rows[idx - 24])
+    if px <= 0.0 or prev6 <= 0.0 or prev24 <= 0.0:
+        return {}
+    recent_returns: List[float] = []
+    for j in range(max(1, idx - 12), idx + 1):
+        prev_px = _bar_close(rows[j - 1])
+        cur_px = _bar_close(rows[j])
+        if prev_px > 0.0 and cur_px > 0.0:
+            recent_returns.append(((cur_px / prev_px) - 1.0) * 100.0)
+    mom6 = ((px / prev6) - 1.0) * 100.0
+    mom24 = ((px / prev24) - 1.0) * 100.0
+    trend_momentum_score = (0.55 * mom6) + (0.45 * mom24)
+    recent_volatility = _stddev_local(recent_returns)
+    signal_margin = max(0.0, (mom6 / 100.0)) + max(0.0, (mom24 / 100.0))
+    return {
+        "symbol": _normalize_stock_ticker(symbol),
+        "market": "stocks",
+        "source_type": "legacy_trade_model_replay",
+        "provider": "local_cache_or_provider",
+        "candle_timeframe": "1Hour",
+        "entry_price": round(float(px), 10),
+        "entry_ts": int(entry_ts),
+        "recent_return_6": round(float(mom6), 6),
+        "recent_return_24": round(float(mom24), 6),
+        "recent_volatility": round(float(recent_volatility), 6),
+        "trend_momentum_score": round(float(trend_momentum_score), 6),
+        "signal_margin": round(float(signal_margin), 6),
+        "signal_side": "long",
+        "regime": "legacy_trade_model_replay",
+        "bars_in_trade": 0,
+        "bars_since_peak": 0,
+        "peak_profit_pct": 0.0,
+        "max_favorable_excursion_pct": 0.0,
+        "max_adverse_excursion_pct": 0.0,
+        "drawdown_from_peak_pct": 0.0,
+        "trailing_armed": False,
+        "favorable_then_softened_flag": False,
+        "stale_hold_profile": False,
+        "volatility_expansion_pct": 0.0,
+        "trend_decay_after_peak": 0.0,
+        "exit_momentum_3": 0.0,
+        "exit_momentum_6": 0.0,
+    }
+
+
+def _build_crypto_candidate_asof(
+    *,
+    hub_dir: str,
+    settings: Dict[str, Any],
+    symbol: str,
+    entry_ts: int,
+    timeframe: str = "1hour",
+) -> Dict[str, Any]:
+    main_neural_dir = _resolve_crypto_neural_dir(os.path.dirname(hub_dir), settings)
+    if not main_neural_dir:
+        main_neural_dir = os.path.join(os.path.dirname(hub_dir), "market_data", "coins")
+    candles = crypto_historical_replay._load_cached_candles(hub_dir, symbol, timeframe)
+    if len(candles) < 48:
+        try:
+            start_ts_ms = int((int(entry_ts) - (90 * 86400)) * 1000)
+            end_ts_ms = int(int(entry_ts) * 1000)
+            fetched = crypto_historical_replay._fetch_kucoin_candles(symbol, timeframe, start_ts_ms, end_ts_ms)
+            if fetched:
+                candles = crypto_historical_replay._normalize_kucoin_rows(candles + fetched)
+                crypto_historical_replay._save_cached_candles(hub_dir, symbol, timeframe, candles)
+        except Exception:
+            pass
+    idx = max((i for i, row in enumerate(candles) if int(_f(row[0], 0.0) / 1000) <= int(entry_ts)), default=-1)
+    if idx < 24:
+        return {}
+    ts_ms, open_px, close_px, _high_px, _low_px, _vol = candles[idx]
+    prev3 = candles[idx - 3][2]
+    prev6 = candles[idx - 6][2]
+    prev12 = candles[idx - 12][2]
+    prev24 = candles[idx - 24][2]
+    recent_returns = [((candles[idx - j][2] / candles[idx - j - 1][2]) - 1.0) * 100.0 for j in range(1, min(12, idx))]
+    current_candle_pct_move = ((close_px / open_px) - 1.0) * 100.0 if open_px > 0 else 0.0
+    recent_return_3 = ((close_px / prev3) - 1.0) * 100.0 if prev3 > 0 else 0.0
+    recent_return_6 = ((close_px / prev6) - 1.0) * 100.0 if prev6 > 0 else 0.0
+    recent_return_12 = ((close_px / prev12) - 1.0) * 100.0 if prev12 > 0 else 0.0
+    recent_return_24 = ((close_px / prev24) - 1.0) * 100.0 if prev24 > 0 else 0.0
+    recent_volatility = crypto_historical_replay._stddev(recent_returns)
+    trend_momentum_score = (
+        (0.40 * recent_return_3)
+        + (0.30 * recent_return_6)
+        + (0.20 * recent_return_12)
+        + (0.10 * recent_return_24)
+    )
+    artifact_ctx = crypto_historical_replay._artifact_context(main_neural_dir, symbol, timeframe)
+    predicted_low = _f(artifact_ctx.get("predicted_low_boundary", 0.0), 0.0)
+    predicted_high = _f(artifact_ctx.get("predicted_high_boundary", 0.0), 0.0)
+    high_edge = ((predicted_high - close_px) / close_px) * 100.0 if predicted_high > 0 and close_px > 0 else 0.0
+    signal_margin = _f(artifact_ctx.get("signal_margin", 0.0), 0.0) + (0.18 * trend_momentum_score) + (0.08 * high_edge) - (0.04 * max(0.0, recent_volatility - 2.5))
+    signal_side = "long" if signal_margin >= 0.0 else "short"
+    return {
+        "market": "crypto",
+        "symbol": symbol,
+        "source_type": "legacy_trade_model_replay",
+        "provider": "local_cache_or_kucoin",
+        "candle_timeframe": timeframe,
+        "entry_price": round(float(close_px), 10),
+        "entry_ts": int(entry_ts),
+        "current_candle_pct_move": round(float(current_candle_pct_move), 6),
+        "recent_return_3": round(float(recent_return_3), 6),
+        "recent_return_6": round(float(recent_return_6), 6),
+        "recent_return_12": round(float(recent_return_12), 6),
+        "recent_return_24": round(float(recent_return_24), 6),
+        "recent_volatility": round(float(recent_volatility), 6),
+        "trend_momentum_score": round(float(trend_momentum_score), 6),
+        "signal_side": signal_side,
+        "signal_margin": round(float(signal_margin), 6),
+        "active_timeframe_count": int(_f(artifact_ctx.get("active_timeframe_count", 0), 0.0)),
+        "predicted_high_boundary": round(float(predicted_high), 10) if predicted_high > 0.0 else 0.0,
+        "predicted_low_boundary": round(float(predicted_low), 10) if predicted_low > 0.0 else 0.0,
+        "trained_artifact_fresh": bool(artifact_ctx.get("trained_artifacts_fresh", False)),
+        "artifact_training_time": int(_f(artifact_ctx.get("artifact_training_time", 0), 0.0)),
+        "strategy_adapter_used": "legacy_trade_model_replay_v1",
+        "regime": "legacy_trade_model_replay",
+        "risk_cut_touched": False,
+        "take_profit_touched": False,
+        "trailing_armed": False,
+        "favorable_then_softened_flag": False,
+        "max_favorable_excursion_pct": 0.0,
+        "max_adverse_excursion_pct": 0.0,
+        "drawdown_from_peak_pct": 0.0,
+        "trailing_pullback_pct": 0.0,
+        "bars_in_trade": 0,
+        "exit_momentum_3": 0.0,
+        "exit_momentum_6": 0.0,
+        "label_rule_version": "legacy_trade_model_replay_v1",
+        "exit_condition_priority_used": ["Risk Cut", "Take Profit", "Trailing", "Stale Alignment"],
+        "same_candle_multi_exit_condition_count": 0,
+    }
+
+
+def _legacy_trade_replay_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    profitable_take = 0
+    profitable_skip = 0
+    losing_take = 0
+    losing_skip = 0
+    dir_hits = 0
+    pnl_hits = 0
+    trigger_hits = 0
+    trigger_scored = 0
+    by_market: Dict[str, Dict[str, int]] = {}
+    by_symbol: Dict[str, Dict[str, int]] = {}
+    by_side: Dict[str, Dict[str, int]] = {}
+    by_bucket: Dict[str, Dict[str, int]] = {}
+    by_ts_quality: Dict[str, Dict[str, int]] = {}
+    for row in list(rows or []):
+        profitable = _trade_return_pct(row) > 1e-9
+        take = bool(row.get("replayed_take_trade", False))
+        key = "profitable_take" if profitable and take else "profitable_skip" if profitable else "losing_take" if take else "losing_skip"
+        if key == "profitable_take":
+            profitable_take += 1
+        elif key == "profitable_skip":
+            profitable_skip += 1
+        elif key == "losing_take":
+            losing_take += 1
+        else:
+            losing_skip += 1
+        if bool(row.get("direction_correct", False)):
+            dir_hits += 1
+        if bool(row.get("pnl_trend_correct", False)):
+            pnl_hits += 1
+        if row.get("trigger_match") is not None:
+            trigger_scored += 1
+            if bool(row.get("trigger_match", False)):
+                trigger_hits += 1
+        for bucket_map, bucket_key in (
+            (by_market, _s(row.get("market", "")) or "unknown"),
+            (by_symbol, _s(row.get("symbol", "")) or "unknown"),
+            (by_side, _s(row.get("side", "")) or "unknown"),
+            (by_bucket, _bucket_probability(_f(row.get("score", row.get("calib_prob", row.get("replayed_confidence", 0.0))), 0.0))),
+            (by_ts_quality, _s(row.get("timestamp_quality", "")) or "unknown"),
+        ):
+            bucket_map.setdefault(bucket_key, {"count": 0, "profitable_take": 0, "profitable_skip": 0, "losing_take": 0, "losing_skip": 0})
+            bucket_map[bucket_key]["count"] += 1
+            bucket_map[bucket_key][key] += 1
+    total = max(1, len(rows))
+    take_total = profitable_take + losing_take
+    skip_total = profitable_skip + losing_skip
+    return {
+        "rows": int(len(rows)),
+        "profitable_trade_model_would_take": int(profitable_take),
+        "profitable_trade_model_would_skip": int(profitable_skip),
+        "losing_trade_model_would_take": int(losing_take),
+        "losing_trade_model_would_skip": int(losing_skip),
+        "take_precision_pct": round(100.0 * profitable_take / max(1, take_total), 4),
+        "skip_precision_pct": round(100.0 * losing_skip / max(1, skip_total), 4),
+        "false_positive_count": int(losing_take),
+        "false_negative_count": int(profitable_skip),
+        "profitable_missed_count": int(profitable_skip),
+        "losing_avoided_count": int(losing_skip),
+        "direction_accuracy_pct": round(100.0 * dir_hits / total, 4),
+        "pnl_trend_accuracy_pct": round(100.0 * pnl_hits / total, 4),
+        "trigger_match_pct": round(100.0 * trigger_hits / max(1, trigger_scored), 4),
+        "trigger_scored_rows": int(trigger_scored),
+        "by_market": by_market,
+        "by_symbol": _top_counter({k: v.get("count", 0) for k, v in by_symbol.items()}, limit=20),
+        "by_side": by_side,
+        "by_score_bucket": by_bucket,
+        "by_timestamp_quality": by_ts_quality,
+    }
+
+
+def build_legacy_trade_model_replay(
+    *,
+    hub_dir: str,
+    base_dir: str,
+    settings: Dict[str, Any],
+) -> Dict[str, Any]:
+    legacy = _normalize_legacy_completed_trades(hub_dir)
+    rows = list(legacy.get("rows", []) or [])
+    eligible_rows: List[Dict[str, Any]] = []
+    replay_rows: List[Dict[str, Any]] = []
+    ineligible_reasons: Dict[str, int] = {}
+    legacy_primary_enabled = _env_flag("MODEL_QUALITY_USE_LEGACY_REPLAY_AS_PRIMARY")
+    source_files_used = list(legacy.get("source_files_used", []) or [])
+    stock_bar_cache: Dict[str, List[Dict[str, Any]]] = {}
+    crypto_candidate_cache: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    for row in rows:
+        market = _s(row.get("market", "")).lower()
+        symbol = _s(row.get("symbol", "")).upper()
+        entry_ts = int(_f(row.get("entry_ts", 0.0), 0.0))
+        side = _s(row.get("side", "")).lower()
+        if market not in {"crypto", "stocks", "forex"}:
+            row["replay_eligible"] = False
+            row["replay_ineligible_reason"] = "market_unknown"
+        elif not symbol:
+            row["replay_eligible"] = False
+            row["replay_ineligible_reason"] = "symbol_missing"
+        elif entry_ts <= 0:
+            row["replay_eligible"] = False
+            row["replay_ineligible_reason"] = "usable_timestamp_missing"
+        elif not side:
+            row["replay_eligible"] = False
+            row["replay_ineligible_reason"] = "side_unknown"
+        elif market == "forex":
+            row["replay_eligible"] = False
+            row["replay_ineligible_reason"] = "historical_forex_feature_replay_not_supported"
+        else:
+            row["replay_eligible"] = True
+            row["replay_ineligible_reason"] = ""
+        if not bool(row.get("replay_eligible", False)):
+            reason = _s(row.get("replay_ineligible_reason", "")) or "unknown"
+            ineligible_reasons[reason] = int(ineligible_reasons.get(reason, 0) + 1)
+            continue
+        eligible_rows.append(row)
+
+    for row in eligible_rows:
+        market = _s(row.get("market", "")).lower()
+        symbol = _s(row.get("symbol", "")).upper()
+        entry_ts = int(_f(row.get("entry_ts", 0.0), 0.0))
+        candidate: Dict[str, Any] = {}
+        if market == "stocks":
+            bars = stock_bar_cache.get(symbol)
+            if bars is None:
+                bars = _load_stock_cached_bars(hub_dir, symbol, "1Hour")
+                if len(bars) < 48:
+                    try:
+                        provider, client, _diag = _stock_provider_client(settings, base_dir)
+                        if client is not None:
+                            start_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(max(0, entry_ts - (120 * 86400))))
+                            end_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(entry_ts))
+                            if provider == "alpaca":
+                                bars = client.get_stock_bars(symbol, timeframe="1Hour", limit=720, feed="iex", start_iso=start_iso, end_iso=end_iso)
+                            else:
+                                bars_map = client.get_time_series_batch([symbol], interval="1h", outputsize=720)
+                                bars = list((bars_map.get(symbol, []) if isinstance(bars_map, dict) else []) or [])
+                            if bars:
+                                _save_stock_cached_bars(hub_dir, symbol, "1Hour", list(bars))
+                    except Exception:
+                        pass
+                stock_bar_cache[symbol] = list(bars or [])
+            candidate = _build_stock_candidate_asof(symbol, stock_bar_cache.get(symbol, []), entry_ts)
+        elif market == "crypto":
+            cache_key = (symbol, entry_ts)
+            if cache_key in crypto_candidate_cache:
+                candidate = dict(crypto_candidate_cache.get(cache_key, {}))
+            else:
+                candidate = _build_crypto_candidate_asof(hub_dir=hub_dir, settings=settings, symbol=symbol, entry_ts=entry_ts, timeframe="1hour")
+                crypto_candidate_cache[cache_key] = dict(candidate)
+        if not candidate:
+            row["replay_eligible"] = False
+            row["replay_ineligible_reason"] = "historical_candle_data_unavailable_or_insufficient"
+            reason = _s(row.get("replay_ineligible_reason", "")) or "unknown"
+            ineligible_reasons[reason] = int(ineligible_reasons.get(reason, 0) + 1)
+            continue
+        train_rows = [
+            r for r in rows
+            if _s(r.get("market", "")).lower() == market
+            and int(_f(r.get("exit_ts", 0.0), 0.0)) > 0
+            and int(_f(r.get("exit_ts", 0.0), 0.0)) <= entry_ts
+            and _s(r.get("symbol", ""))
+        ]
+        predictor_variant = "baseline" if market == "crypto" else "candidate"
+        regime = _regime_from_prior(train_rows)
+        replay_pred = _predict_one(train_rows=train_rows, candidate=candidate, regime=regime, market=market, predictor_variant=predictor_variant)
+        replay_row = dict(row)
+        replay_row.update(
+            {
+                "source_type": "legacy_trade_model_replay",
+                "replayed_predicted_direction": _s(replay_pred.get("predicted_direction", "")) or "flat",
+                "replayed_predicted_exit_trigger": _s(replay_pred.get("predicted_exit_trigger", "")) or "Unknown",
+                "replayed_predicted_pnl_trend": _s(replay_pred.get("predicted_pnl_trend", "")) or (_s(replay_pred.get("predicted_direction", "")) or "flat"),
+                "replayed_confidence": round(_f(replay_pred.get("predicted_confidence", 0.0), 0.0), 6),
+                "replayed_direction_scores": dict(replay_pred.get("direction_scores", {}) if isinstance(replay_pred.get("direction_scores", {}), dict) else {}),
+                "replayed_trigger_scores": dict(replay_pred.get("trigger_scores", {}) if isinstance(replay_pred.get("trigger_scores", {}), dict) else {}),
+                "replayed_trade_quality_score": round(_f(replay_pred.get("stock_trade_quality_score", 0.0), 0.0), 6),
+                "replay_model_variant": predictor_variant,
+            }
+        )
+        if market == "crypto":
+            abstain_cfg = _calibrate_abstain_threshold(train_rows, market, predictor_variant=predictor_variant)
+            policy = abstain_cfg.get("policy", {}) if isinstance(abstain_cfg.get("policy", {}), dict) else {}
+            temp_row = dict(replay_row)
+            temp_row["predicted_direction"] = replay_row["replayed_predicted_direction"]
+            temp_row["predicted_exit_trigger"] = replay_row["replayed_predicted_exit_trigger"]
+            temp_row["predicted_confidence"] = replay_row["replayed_confidence"]
+            temp_row["direction_scores"] = replay_row["replayed_direction_scores"]
+            temp_row["trigger_scores"] = replay_row["replayed_trigger_scores"]
+            temp_row["source_type"] = "historical_strategy_replay"
+            take_trade, skip_reason = _crypto_admission_decision(temp_row, policy)
+        else:
+            abstain_cfg = _calibrate_abstain_threshold(train_rows, market, predictor_variant=predictor_variant)
+            threshold = _f(abstain_cfg.get("threshold", 0.6), 0.6)
+            take_trade = _f(replay_row.get("replayed_confidence", 0.0), 0.0) >= threshold
+            skip_reason = "" if take_trade else f"confidence_below_threshold_{threshold:.2f}"
+        actual_direction = _trade_direction(replay_row)
+        actual_pnl_trend = "up" if _trade_return_pct(replay_row) > 1e-9 else "down" if _trade_return_pct(replay_row) < -1e-9 else "flat"
+        replay_row["replayed_take_trade"] = bool(take_trade)
+        replay_row["replayed_skip_reason"] = _s(skip_reason)
+        replay_row["direction_correct"] = bool(_s(replay_row.get("replayed_predicted_direction", "")).lower() == actual_direction)
+        replay_row["pnl_trend_correct"] = bool(_s(replay_row.get("replayed_predicted_pnl_trend", "")).lower() == actual_pnl_trend)
+        actual_trigger = _s(replay_row.get("actual_exit_trigger", ""))
+        replay_row["trigger_match"] = None if not actual_trigger else bool(_s(replay_row.get("replayed_predicted_exit_trigger", "")) == actual_trigger)
+        replay_rows.append(replay_row)
+
+    summary_metrics = _legacy_trade_replay_metrics(replay_rows)
+    output = {
+        "status": "ok",
+        "legacy_rows_found": int(legacy.get("normalized_rows_found", 0) or 0),
+        "legacy_rows_found_raw": int(legacy.get("raw_rows_found", 0) or 0),
+        "legacy_rows_replay_eligible": int(len(eligible_rows)),
+        "legacy_rows_replayed": int(len(replay_rows)),
+        "ineligible_reasons": _top_counter(ineligible_reasons, limit=20),
+        "rows_by_market": dict(legacy.get("rows_by_market", {}) if isinstance(legacy.get("rows_by_market", {}), dict) else {}),
+        "timestamp_quality_summary": dict(legacy.get("timestamp_quality_summary", {}) if isinstance(legacy.get("timestamp_quality_summary", {}), dict) else {}),
+        "field_coverage": dict(legacy.get("field_coverage", {}) if isinstance(legacy.get("field_coverage", {}), dict) else {}),
+        "source_files_used": source_files_used,
+        "legacy_trade_model_replay_used_as_primary": bool(legacy_primary_enabled),
+        "legacy_trade_model_replay_used_as_supplemental": True,
+        "model_at_entry_replay_metrics": summary_metrics,
+        "row_samples": replay_rows[:50],
+    }
+    jsonl_path = os.path.join(hub_dir, "legacy_trade_model_replay.jsonl")
+    _write_jsonl(jsonl_path, replay_rows)
+    json_path = os.path.join(hub_dir, "model_quality_legacy_trade_replay.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2)
+    output["output_json"] = json_path
+    output["output_jsonl"] = jsonl_path
+    return output
+
+
 def _resolve_crypto_neural_dir(base_dir: str, settings: Dict[str, Any]) -> str:
     raw = _s((settings or {}).get("main_neural_dir", ""))
     if not raw:
@@ -935,6 +1450,19 @@ def _stable_rows_hash(rows: List[Dict[str, Any]]) -> str:
         )
     payload = json.dumps(compact, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _replay_row_id(row: Dict[str, Any]) -> str:
+    return "|".join(
+        [
+            _s(row.get("symbol", "")),
+            str(int(_f(row.get("entry_ts", 0.0), 0.0))),
+            str(int(_f(row.get("exit_ts", 0.0), 0.0))),
+            _s(row.get("actual_exit_trigger", "")) or "Unknown",
+            _s(row.get("source_type", "")) or "unknown",
+            _s(row.get("predictor_variant", "")) or "unscored",
+        ]
+    )
 
 
 def _latest_replay_path(hub_dir: str, market: str) -> str:
@@ -1119,6 +1647,37 @@ def _cohort_weighted_value(cohorts: List[Tuple[float, Dict[str, float]]], key: s
     return num / den
 
 
+def _stock_directional_pnl_rate(rows: List[Dict[str, Any]], *, direction: str) -> float:
+    sample = list(rows or [])
+    if not sample:
+        return 0.0
+    want = _s(direction).lower()
+    num = 0.0
+    den = 0.0
+    size = len(sample)
+    for idx, row in enumerate(sample):
+        recency_w = _recency_weight(idx + 1, size)
+        den += recency_w
+        row_dir = _trade_direction(row)
+        if row_dir != want:
+            continue
+        if want == "up" and _trade_return_pct(row) > 1e-9:
+            num += recency_w
+        elif want == "down" and _trade_return_pct(row) < -1e-9:
+            num += recency_w
+    return num / max(1e-9, den)
+
+
+def _stock_shape_bucket(value: float, *, thresholds: Tuple[float, ...]) -> str:
+    v = abs(float(value))
+    if v < thresholds[0]:
+        return f"<{thresholds[0]:.1f}"
+    for lo, hi in zip(thresholds, thresholds[1:]):
+        if v < hi:
+            return f"{lo:.1f}-{hi:.1f}"
+    return f"{thresholds[-1]:.1f}+"
+
+
 def _recency_weight(age_rank: int, size: int) -> float:
     return 0.7 + (0.6 * (float(age_rank) / float(max(1, size))))
 
@@ -1202,6 +1761,12 @@ def _confidence_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             for k, v in by_actual_trigger.items()
         },
     }
+
+
+def _row_overlap_count(rows_a: List[Dict[str, Any]], rows_b: List[Dict[str, Any]]) -> int:
+    ids_a = {_s(r.get("replay_row_id", "")) for r in list(rows_a or []) if _s(r.get("replay_row_id", ""))}
+    ids_b = {_s(r.get("replay_row_id", "")) for r in list(rows_b or []) if _s(r.get("replay_row_id", ""))}
+    return int(len(ids_a & ids_b))
 
 
 def _population_diagnostics(full_rows: List[Dict[str, Any]], admitted_rows: List[Dict[str, Any]], abstained_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -2024,8 +2589,9 @@ def _crypto_predict_historical_replay_one(
             trigger_scores[trigger] += 0.40 * (proto_bonus / max(1, len(_CRYPTO_HISTORICAL_REPLAY_FEATURES)))
 
     variant = _s(predictor_variant).lower() or "candidate"
-    use_exit_shape = variant in {"candidate", "active", "exit_shape_enhanced", "label_compatible_v2"}
+    use_exit_shape = variant in {"candidate", "active", "exit_shape_enhanced", "label_compatible_v2", "label_compatible_v3_sequence"}
     use_label_compatible_v2 = variant == "label_compatible_v2"
+    use_label_compatible_v3_sequence = variant == "label_compatible_v3_sequence"
     momentum = _f(candidate.get("trend_momentum_score", 0.0), 0.0)
     volatility = _f(candidate.get("recent_volatility", 0.0), 0.0)
     signal_margin = _f(candidate.get("signal_margin", 0.0), 0.0)
@@ -2040,8 +2606,12 @@ def _crypto_predict_historical_replay_one(
     up_recovery_reason = ""
     take_profit_candidate = False
     stale_override_reason = ""
+    risk_trailing_resolver_applied = False
+    risk_trailing_resolver_reason = ""
+    risk_trailing_sequence_score_risk = 0.0
+    risk_trailing_sequence_score_trailing = 0.0
 
-    if use_label_compatible_v2:
+    if use_label_compatible_v2 or use_label_compatible_v3_sequence:
         risk_cut_touched = bool(candidate.get("risk_cut_touched", False))
         take_profit_touched = bool(candidate.get("take_profit_touched", False))
         trailing_armed = bool(candidate.get("trailing_armed", False))
@@ -2053,6 +2623,16 @@ def _crypto_predict_historical_replay_one(
         bars_in_trade = _f(candidate.get("bars_in_trade", 0.0), 0.0)
         exit_m3 = _f(candidate.get("exit_momentum_3", 0.0), 0.0)
         exit_m6 = _f(candidate.get("exit_momentum_6", 0.0), 0.0)
+        trailing_before_risk_cut = bool(candidate.get("trailing_before_risk_cut", False))
+        risk_cut_before_trailing = bool(candidate.get("risk_cut_before_trailing", False))
+        risk_cut_after_trailing_arm = bool(candidate.get("risk_cut_after_trailing_arm", False))
+        risk_cut_after_peak = bool(candidate.get("risk_cut_after_peak", False))
+        trailing_valid_before_risk = bool(candidate.get("trailing_valid_before_risk", False))
+        same_candle_risk_and_trailing = bool(candidate.get("same_candle_risk_and_trailing", False))
+        exit_close_position_in_candle_range = _f(candidate.get("exit_close_position_in_candle_range", 0.5), 0.5)
+        peak_to_exit_velocity = abs(_f(candidate.get("peak_to_exit_velocity_pct_per_bar", 0.0), 0.0))
+        risk_breach_depth = _f(candidate.get("risk_breach_depth_pct", 0.0), 0.0)
+        bars_from_trailing_arm_to_risk_cut = _f(candidate.get("bars_from_trailing_arm_to_risk_cut", -1.0), -1.0)
         risk_support = sum(1 for r in working if _s(r.get("actual_exit_trigger", "")) == "Risk Cut")
         tp_support = sum(1 for r in working if _s(r.get("actual_exit_trigger", "")) == "Take Profit")
         trailing_support = sum(1 for r in working if _s(r.get("actual_exit_trigger", "")) == "Trailing")
@@ -2079,6 +2659,44 @@ def _crypto_predict_historical_replay_one(
             up_recovery_reason = "label_compatible_trailing_recovery"
         if take_profit_touched and mfe_pct >= 4.0:
             take_profit_candidate = True
+        if use_label_compatible_v3_sequence:
+            if risk_cut_before_trailing:
+                risk_trailing_sequence_score_risk += 2.25
+                risk_trailing_resolver_reason = "risk_cut_before_trailing"
+            if risk_cut_touched and risk_breach_depth >= 0.20:
+                risk_trailing_sequence_score_risk += 1.35 + min(1.25, risk_breach_depth / 1.5)
+                if not risk_trailing_resolver_reason:
+                    risk_trailing_resolver_reason = "risk_breach_depth"
+            if risk_cut_after_trailing_arm and peak_to_exit_velocity >= 0.45:
+                risk_trailing_sequence_score_risk += 1.55
+                risk_trailing_sequence_score_trailing -= 0.35
+                if not risk_trailing_resolver_reason:
+                    risk_trailing_resolver_reason = "risk_after_trailing_sharp_reversal"
+            if trailing_before_risk_cut and trailing_valid_before_risk and softened and risk_breach_depth <= 0.05:
+                risk_trailing_sequence_score_trailing += 1.85
+                if not risk_trailing_resolver_reason:
+                    risk_trailing_resolver_reason = "trailing_before_risk_without_breach"
+            if trailing_armed and exit_close_position_in_candle_range <= 0.22 and mae_pct >= 1.8:
+                risk_trailing_sequence_score_trailing -= 0.95
+                risk_trailing_sequence_score_risk += 0.95
+                if not risk_trailing_resolver_reason:
+                    risk_trailing_resolver_reason = "exit_closed_near_low_with_deep_adverse_move"
+            if same_candle_risk_and_trailing:
+                if exit_close_position_in_candle_range <= 0.35:
+                    risk_trailing_sequence_score_risk += 0.75
+                    if not risk_trailing_resolver_reason:
+                        risk_trailing_resolver_reason = "same_candle_low_close_bias_risk"
+                else:
+                    risk_trailing_sequence_score_trailing += 0.55
+                    if not risk_trailing_resolver_reason:
+                        risk_trailing_resolver_reason = "same_candle_high_close_bias_trailing"
+            if risk_cut_after_peak and peak_to_exit_velocity >= 0.60:
+                risk_trailing_sequence_score_risk += 0.85
+            if bars_from_trailing_arm_to_risk_cut >= 0 and bars_from_trailing_arm_to_risk_cut <= 2:
+                risk_trailing_sequence_score_risk += 0.65
+            trigger_scores["Risk Cut"] += risk_trailing_sequence_score_risk
+            trigger_scores["Trailing"] += risk_trailing_sequence_score_trailing
+            risk_trailing_resolver_applied = abs(risk_trailing_sequence_score_risk) > 1e-9 or abs(risk_trailing_sequence_score_trailing) > 1e-9
     else:
         if use_exit_shape and momentum >= 2.6 and volatility >= 0.55 and signal_margin >= 0.43 and move_12 >= 2.5:
             trigger_scores["Risk Cut"] += 0.75
@@ -2212,7 +2830,11 @@ def _crypto_predict_historical_replay_one(
         "direction_independent_score_down": round(float(direction_scores.get("down", 0.0) - max(0.0, -trigger_direction_prior_applied)), 6),
         "independent_direction_score_up": round(float(direction_scores.get("up", 0.0) - max(0.0, trigger_direction_prior_applied)), 6),
         "independent_direction_score_down": round(float(direction_scores.get("down", 0.0) - max(0.0, -trigger_direction_prior_applied)), 6),
-        "exit_shape_predictive_mode": "active" if variant == "label_compatible_v2" else ("active" if use_exit_shape else "diagnostic_only"),
+        "exit_shape_predictive_mode": "active" if variant in {"label_compatible_v2", "label_compatible_v3_sequence"} else ("active" if use_exit_shape else "diagnostic_only"),
+        "risk_trailing_resolver_applied": bool(risk_trailing_resolver_applied),
+        "risk_trailing_resolver_reason": risk_trailing_resolver_reason,
+        "risk_trailing_sequence_score_risk": round(float(risk_trailing_sequence_score_risk), 6),
+        "risk_trailing_sequence_score_trailing": round(float(risk_trailing_sequence_score_trailing), 6),
         "upside_boundary_distance_pct": round(float(_f(upside_diag.get("upside_boundary_distance_pct", 0.0), 0.0)), 6),
         "downside_boundary_distance_pct": round(float(_f(upside_diag.get("downside_boundary_distance_pct", 0.0), 0.0)), 6),
         "predictor_source_mode": "historical_strategy_replay",
@@ -2270,7 +2892,22 @@ def _stock_predict_one(
     gap_against_position_pct = _f(candidate.get("gap_against_position_pct", 0.0), 0.0)
     exit_m3 = _f(candidate.get("exit_momentum_3", 0.0), 0.0)
     exit_m6 = _f(candidate.get("exit_momentum_6", 0.0), 0.0)
+    bars_since_peak = int(_f(candidate.get("bars_since_peak", 0.0), 0.0))
+    bars_in_trade = max(1, int(_f(candidate.get("bars_in_trade", candidate.get("hold_hours", 0.0)), 0.0)))
+    max_favorable_excursion_pct = _f(candidate.get("max_favorable_excursion_pct", 0.0), 0.0)
+    max_adverse_excursion_pct = abs(_f(candidate.get("max_adverse_excursion_pct", 0.0), 0.0))
     stats = _weighted_trade_stats(filtered)
+    symbol_stats = _weighted_trade_stats(symbol_rows or filtered)
+    regime_stats = _weighted_trade_stats(regime_rows or filtered)
+    recent_stats = _weighted_trade_stats(recent_rows or filtered)
+    pnl_cohorts: List[Tuple[float, Dict[str, float]]] = []
+    for weight, rows_cohort, stats_cohort in [
+        (1.25, symbol_rows, symbol_stats),
+        (0.95, regime_rows, regime_stats),
+        (0.80, recent_rows, recent_stats),
+    ]:
+        if rows_cohort:
+            pnl_cohorts.append((weight, stats_cohort))
     up_score = (0.55 * stats.get("up_rate", 0.0)) + (0.25 * max(0.0, mom / 4.0)) + (0.15 * max(0.0, ret24 / 5.0)) + (0.05 * max(0.0, signal_margin))
     down_score = (0.55 * stats.get("down_rate", 0.0)) + (0.25 * max(0.0, -mom / 4.0)) + (0.15 * max(0.0, -ret24 / 5.0)) + (0.05 * max(0.0, vol / 2.5))
     guard_applied = False
@@ -2374,14 +3011,141 @@ def _stock_predict_one(
     hold_h = max(0.25, _median([_f(r.get("hold_hours", 0.0), 0.0) for r in filtered], default=6.0))
     med_ret = _median([_trade_return_pct(r) for r in filtered], default=0.0) / 100.0
     entry_px = _f(candidate.get("entry_price", 0.0), 0.0)
-    exit_px = entry_px * (1.0 + abs(med_ret)) if pred_dir == "up" else entry_px * (1.0 - abs(med_ret))
-    conf = max(0.18, min(0.95, 0.20 + (0.30 * max(up_score, down_score)) + (0.25 * max(trigger_scores.values()))))
+    trigger_is_stale = pred_trigger == "Stale Alignment"
+    hold_long = hold_h >= max(18.0, _cohort_weighted_value(pnl_cohorts, "q75_hold_h", default=18.0))
+    mixed_returns = ret6 <= 0.35 and ret24 <= 0.90
+    high_vol_long_hold_penalty = 0.0
+    drawdown_quality_penalty = 0.0
+    symbol_pnl_history_penalty = 0.0
+    pnl_quality_reasons: List[str] = []
+    weak_window_guard_reason = ""
+    symbol_pnl_up_rate = _stock_directional_pnl_rate(symbol_rows, direction="up")
+    regime_pnl_up_rate = _stock_directional_pnl_rate(regime_rows, direction="up")
+    recent_pnl_up_rate = _stock_directional_pnl_rate(recent_rows, direction="up")
+    blended_symbol_pnl = _blend_probability(pnl_cohorts, "up_rate") if pnl_cohorts else stats.get("up_rate", 0.0)
+    trade_quality_base = (
+        0.18
+        + (0.18 * max(0.0, min(1.0, ret6 / 2.5)))
+        + (0.18 * max(0.0, min(1.0, ret24 / 4.0)))
+        + (0.12 * max(0.0, min(1.0, signal_margin / 0.55)))
+        + (0.12 * max(0.0, min(1.0, mom / 3.0)))
+        + (0.10 * max(0.0, min(1.0, max_favorable_excursion_pct / 3.0)))
+        + (0.08 if trailing_armed else 0.0)
+        + (0.06 if favorable_then_softened else 0.0)
+    )
+    if vol >= 0.75 and hold_long and mixed_returns:
+        high_vol_long_hold_penalty += 0.26
+        pnl_quality_reasons.append("high_vol_long_hold_mixed_returns")
+        weak_window_guard_reason = weak_window_guard_reason or "high_vol_long_hold_mixed_returns"
+    elif vol >= 0.60 and hold_h >= 14.0 and mixed_returns:
+        high_vol_long_hold_penalty += 0.14
+        pnl_quality_reasons.append("moderate_vol_long_hold_mixed_returns")
+        weak_window_guard_reason = weak_window_guard_reason or "moderate_vol_long_hold_mixed_returns"
+    if drawdown_from_peak_pct >= 2.0:
+        drawdown_quality_penalty += 0.24
+        pnl_quality_reasons.append("large_drawdown_from_peak")
+        weak_window_guard_reason = weak_window_guard_reason or "large_drawdown_from_peak"
+    elif drawdown_from_peak_pct >= 1.2:
+        drawdown_quality_penalty += 0.14
+        pnl_quality_reasons.append("moderate_drawdown_from_peak")
+        weak_window_guard_reason = weak_window_guard_reason or "moderate_drawdown_from_peak"
+    if stale_hold_profile:
+        drawdown_quality_penalty += 0.16
+        pnl_quality_reasons.append("stale_hold_profile")
+        weak_window_guard_reason = weak_window_guard_reason or "stale_hold_profile"
+    if trend_decay_after_peak <= -1.0:
+        drawdown_quality_penalty += 0.08
+        pnl_quality_reasons.append("trend_decay_after_peak")
+    if exit_m3 <= -0.8 or exit_m6 <= -1.0:
+        drawdown_quality_penalty += 0.08
+        pnl_quality_reasons.append("exit_momentum_decay")
+    if max_adverse_excursion_pct >= 1.6:
+        drawdown_quality_penalty += 0.08
+        pnl_quality_reasons.append("large_adverse_excursion")
+    if len(symbol_rows) >= 8 and symbol_pnl_up_rate < 0.50:
+        symbol_pnl_history_penalty += min(0.18, (0.50 - symbol_pnl_up_rate) * 0.45)
+        pnl_quality_reasons.append("same_symbol_pnl_history_weak")
+        weak_window_guard_reason = weak_window_guard_reason or "same_symbol_pnl_history_weak"
+    if len(regime_rows) >= 12 and regime_pnl_up_rate < 0.48:
+        symbol_pnl_history_penalty += min(0.10, (0.48 - regime_pnl_up_rate) * 0.30)
+        pnl_quality_reasons.append("same_regime_pnl_history_weak")
+    if bars_since_peak >= 8 and drawdown_from_peak_pct >= 1.0:
+        drawdown_quality_penalty += 0.06
+        pnl_quality_reasons.append("late_trade_drawdown")
+    trade_quality_score = max(0.0, min(1.0, trade_quality_base - (0.45 * high_vol_long_hold_penalty) - (0.40 * drawdown_quality_penalty)))
+    pnl_quality_score = max(
+        0.0,
+        min(
+            1.0,
+            (0.35 * blended_symbol_pnl)
+            + (0.20 * symbol_pnl_up_rate)
+            + (0.12 * regime_pnl_up_rate)
+            + (0.08 * recent_pnl_up_rate)
+            + (0.15 * trade_quality_score)
+            + (0.10 if trailing_armed and favorable_then_softened else 0.0)
+            - high_vol_long_hold_penalty
+            - drawdown_quality_penalty
+            - symbol_pnl_history_penalty,
+        ),
+    )
+    pnl_quality_reason = "clean_trend_followthrough"
+    if pnl_quality_reasons:
+        pnl_quality_reason = pnl_quality_reasons[0]
+    pnl_quality_gate_applied = False
+    weak_window_guard_applied = bool(high_vol_long_hold_penalty > 0.0 or drawdown_quality_penalty > 0.0 or symbol_pnl_history_penalty > 0.0)
+    variant_name = _s(predictor_variant).lower()
+    predicted_pnl_trend = "up" if pred_dir == "up" else "down"
+    if variant_name == "stock_pnl_quality_v2":
+        strong_weak_window = (
+            pred_dir == "up"
+            and (
+                (drawdown_from_peak_pct >= 1.8 and bars_in_trade >= 18 and (stale_hold_profile or trigger_is_stale))
+                or (vol >= 0.80 and hold_long and mixed_returns and drawdown_from_peak_pct >= 1.5)
+                or (symbol_pnl_up_rate < 0.45 and drawdown_from_peak_pct >= 2.0 and bars_since_peak >= 6)
+            )
+        )
+        if strong_weak_window and pnl_quality_score < 0.52:
+            predicted_pnl_trend = "down"
+            pnl_quality_gate_applied = True
+            pnl_quality_reason = pnl_quality_reason or "weak_pnl_quality_gate"
+        elif pred_dir == "up" and trigger_is_stale and pnl_quality_score < 0.42:
+            predicted_pnl_trend = "down"
+            pnl_quality_gate_applied = True
+            pnl_quality_reason = pnl_quality_reason or "stale_trigger_pnl_quality_gate"
+        elif pred_dir == "up" and trade_quality_score < 0.32 and drawdown_from_peak_pct >= 2.0:
+            predicted_pnl_trend = "down"
+            pnl_quality_gate_applied = True
+            pnl_quality_reason = pnl_quality_reason or "weak_trade_quality_gate"
+        if predicted_pnl_trend == "up":
+            exit_px = entry_px * (1.0 + max(0.0005, abs(med_ret)))
+        elif predicted_pnl_trend == "down":
+            implied_down_move = max(0.0005, abs(_cohort_weighted_value(pnl_cohorts, "median_down_ret_pct", default=max(0.10, abs(med_ret * 100.0)))) / 100.0)
+            exit_px = entry_px * (1.0 - implied_down_move)
+        else:
+            exit_px = entry_px
+        conf = max(
+            0.18,
+            min(
+                0.95,
+                0.18
+                + (0.24 * max(up_score, down_score))
+                + (0.22 * max(trigger_scores.values()))
+                + (0.16 * trade_quality_score)
+                + (0.12 * pnl_quality_score)
+                - (0.08 if pnl_quality_gate_applied else 0.0),
+            ),
+        )
+    else:
+        predicted_pnl_trend = "up" if pred_dir == "up" else "down"
+        exit_px = entry_px * (1.0 + abs(med_ret)) if pred_dir == "up" else entry_px * (1.0 - abs(med_ret))
+        conf = max(0.18, min(0.95, 0.20 + (0.30 * max(up_score, down_score)) + (0.25 * max(trigger_scores.values()))))
     sorted_triggers = sorted(trigger_scores.items(), key=lambda kv: kv[1], reverse=True)
     return {
         "predicted_direction": pred_dir,
         "predicted_exit_trigger": pred_trigger,
         "predicted_hold_hours": round(float(hold_h), 6),
         "predicted_exit_price": round(float(max(1e-12, exit_px)), 10),
+        "predicted_pnl_trend": predicted_pnl_trend,
         "predicted_confidence": round(float(conf), 6),
         "trigger_scores": {k: round(float(v), 6) for k, v in trigger_scores.items()},
         "direction_scores": {"up": round(float(up_score), 6), "down": round(float(down_score), 6)},
@@ -2391,7 +3155,7 @@ def _stock_predict_one(
         "stock_direction_score_down": round(float(down_score), 6),
         "stock_direction_score_gap": round(float(up_score - down_score), 6),
         "predictor_mode": "stock_historical_replay",
-        "predictor_variant": _s(predictor_variant).lower() or "candidate",
+        "predictor_variant": variant_name or "candidate",
         "stock_up_bias_guard_applied": bool(guard_applied),
         "stock_down_case_guard_reason": guard_reason,
         "stock_down_case_guard_applied": bool(guard_applied),
@@ -2407,6 +3171,15 @@ def _stock_predict_one(
         "stock_trailing_override_applied": bool(trailing_override_applied),
         "stock_down_case_exit_shape_reason": down_exit_shape_reason,
         "stock_exit_shape_predictive_mode": "active",
+        "stock_pnl_quality_score": round(float(pnl_quality_score), 6),
+        "stock_pnl_quality_reason": pnl_quality_reason,
+        "stock_trade_quality_score": round(float(trade_quality_score), 6),
+        "stock_trade_quality_gate_applied": bool(pnl_quality_gate_applied),
+        "stock_weak_window_guard_applied": bool(weak_window_guard_applied),
+        "stock_weak_window_guard_reason": weak_window_guard_reason or pnl_quality_reason,
+        "stock_high_vol_long_hold_penalty": round(float(high_vol_long_hold_penalty), 6),
+        "stock_drawdown_quality_penalty": round(float(drawdown_quality_penalty), 6),
+        "stock_symbol_pnl_history_penalty": round(float(symbol_pnl_history_penalty), 6),
         "winning_reason": "momentum_up" if pred_dir == "up" else "momentum_down",
     }
 
@@ -3244,6 +4017,13 @@ def _safe_selection_guardrails(
             failures.append("candidate_admission_rate_below_40")
     if int(candidate.get("admitted_trades", 0) or 0) < 20 and int(baseline.get("admitted_trades", 0) or 0) >= 40:
         failures.append("candidate_low_trade_count_vs_broader_baseline")
+    if _s(market).lower() == "stocks":
+        if _f(cand_metrics.get("directional_accuracy_pct", 0.0), 0.0) < 90.0:
+            failures.append("stocks_directional_below_target")
+        if _f(cand_metrics.get("trigger_match_pct", 0.0), 0.0) < 90.0:
+            failures.append("stocks_trigger_below_target")
+        if _f(cand_metrics.get("pnl_trend_match_pct", 0.0), 0.0) < _f(base_metrics.get("pnl_trend_match_pct", 0.0), 0.0) - 1.0:
+            failures.append("stocks_pnl_trend_regressed")
     if _s(market).lower() == "forex":
         if _f(cand_metrics.get("trigger_match_pct", 0.0), 0.0) < _f(base_metrics.get("trigger_match_pct", 0.0), 0.0) - 1.0:
             failures.append("forex_trigger_match_regressed")
@@ -3780,12 +4560,21 @@ def _calibrate_abstain_threshold(train_rows: List[Dict[str, Any]], market: str, 
         pred_val.append(merged)
         running.append(row)
     if _s(market).lower() == "stocks":
-        thresholds = [
-            ("no_abstain_full_universe", 0.0),
-            ("low_threshold", 0.45),
-            ("balanced_threshold", 0.55),
-            ("high_confidence_threshold", 0.70),
-        ]
+        if _s(predictor_variant).lower() == "stock_pnl_quality_v2":
+            thresholds = [
+                ("no_abstain_full_universe", 0.0),
+                ("low_threshold", 0.42),
+                ("balanced_threshold", 0.50),
+                ("quality_gate_threshold", 0.58),
+                ("high_confidence_threshold", 0.68),
+            ]
+        else:
+            thresholds = [
+                ("no_abstain_full_universe", 0.0),
+                ("low_threshold", 0.45),
+                ("balanced_threshold", 0.55),
+                ("high_confidence_threshold", 0.70),
+            ]
     elif _s(market).lower() == "forex":
         thresholds = [
             ("no_abstain_full_universe", 0.0),
@@ -3923,6 +4712,136 @@ def _stock_provider_client(settings: Dict[str, Any], base_dir: str) -> Tuple[str
     return provider, None, diagnostics
 
 
+def _normalize_stock_ticker(value: Any) -> str:
+    raw = _s(value).upper()
+    if not raw:
+        return ""
+    cleaned = re.sub(r"[^A-Z0-9._-]+", "", raw)
+    return cleaned[:16]
+
+
+def _stock_manual_watchlist_path(hub_dir: str) -> str:
+    return os.path.join(hub_dir, "stocks", "manual_watchlist.json")
+
+
+def _stock_watchlist_preview_dir(hub_dir: str) -> str:
+    return os.path.join(hub_dir, "stocks", "watchlist_previews")
+
+
+def _stock_watchlist_preview_path(hub_dir: str, symbol: str) -> str:
+    return os.path.join(_stock_watchlist_preview_dir(hub_dir), f"{_normalize_stock_ticker(symbol)}.json")
+
+
+def validate_stock_watchlist_symbol(
+    *,
+    symbol: str,
+    settings: Dict[str, Any],
+    base_dir: str,
+    hub_dir: str = "",
+) -> Dict[str, Any]:
+    normalized = _normalize_stock_ticker(symbol)
+    provider, client, provider_diag = _stock_provider_client(settings, base_dir)
+    result: Dict[str, Any] = {
+        "symbol": normalized,
+        "provider": provider,
+        "valid": False,
+        "status": "invalid_symbol" if normalized else "empty_symbol",
+        "error": "",
+        "already_in_watchlist": False,
+        "stock_watchlist_search_query": _s(symbol),
+        "stock_watchlist_search_provider": provider,
+        "stock_watchlist_search_valid": False,
+        "stock_watchlist_search_error": "",
+    }
+    existing_watch = {_normalize_stock_ticker(s) for s in _stock_symbol_candidates(hub_dir, [], limit=500)} if hub_dir else set()
+    settings_watch = {_normalize_stock_ticker(tok) for tok in _s(settings.get("stock_universe_symbols", "")).replace("\n", ",").split(",")}
+    if normalized and (normalized in existing_watch or normalized in settings_watch):
+        result["already_in_watchlist"] = True
+    if not normalized:
+        result["stock_watchlist_search_error"] = "empty_symbol"
+        return result
+    if client is None:
+        result["status"] = "provider_unavailable"
+        result["error"] = _s(provider_diag.get("reason", "")) or "provider_unavailable"
+        result["stock_watchlist_search_error"] = result["error"]
+        return result
+    try:
+        valid = False
+        if provider == "alpaca":
+            assets = client.list_tradable_assets()
+            if assets:
+                valid = any(
+                    _normalize_stock_ticker((row or {}).get("symbol", "")) == normalized
+                    and str((row or {}).get("tradable", True)).lower() != "false"
+                    for row in assets
+                    if isinstance(row, dict)
+                )
+            if not valid:
+                valid = len(client.get_stock_bars(normalized, timeframe="1Day", limit=5, feed="iex")) > 0
+        else:
+            valid = len((client.get_time_series_batch([normalized], interval="1day", outputsize=5) or {}).get(normalized, [])) > 0
+        result["valid"] = bool(valid)
+        result["status"] = "valid_symbol" if valid else "invalid_symbol"
+    except Exception as exc:
+        result["status"] = "provider_unavailable"
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        result["stock_watchlist_search_error"] = result["error"]
+    result["stock_watchlist_search_valid"] = bool(result["valid"])
+    return result
+
+
+def _read_stock_manual_watchlist(hub_dir: str) -> Dict[str, Any]:
+    payload = _safe_read_json(_stock_manual_watchlist_path(hub_dir))
+    if not isinstance(payload.get("symbols", {}), dict):
+        payload["symbols"] = {}
+    return payload
+
+
+def _write_json_atomic(path: str, payload: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp, path)
+
+
+def add_stock_to_manual_watchlist(
+    *,
+    hub_dir: str,
+    settings: Dict[str, Any],
+    symbol: str,
+    validation_provider: str,
+) -> Dict[str, Any]:
+    normalized = _normalize_stock_ticker(symbol)
+    payload = _read_stock_manual_watchlist(hub_dir)
+    symbols_map = payload.get("symbols", {}) if isinstance(payload.get("symbols", {}), dict) else {}
+    now_ts = int(time.time())
+    existing = symbols_map.get(normalized, {}) if isinstance(symbols_map.get(normalized, {}), dict) else {}
+    symbols_map[normalized] = {
+        "symbol": normalized,
+        "added_at": int(existing.get("added_at", now_ts) or now_ts),
+        "updated_at": now_ts,
+        "added_by_user": True,
+        "source": "manual_watchlist_search",
+        "validation_provider": validation_provider,
+        "historical_warmup_status": _s(existing.get("historical_warmup_status", "")) or "pending",
+        "prediction_preview_status": _s(existing.get("prediction_preview_status", "")) or "pending",
+    }
+    payload["ts"] = now_ts
+    payload["symbols"] = symbols_map
+    _write_json_atomic(_stock_manual_watchlist_path(hub_dir), payload)
+
+    watch = []
+    for tok in _s(settings.get("stock_universe_symbols", "")).replace("\n", ",").split(","):
+        sym = _normalize_stock_ticker(tok)
+        if sym and sym not in watch:
+            watch.append(sym)
+    if normalized and normalized not in watch:
+        watch.append(normalized)
+    settings["stock_universe_symbols"] = ",".join(watch)
+    return {"symbol": normalized, "symbols": watch, "storage_path": _stock_manual_watchlist_path(hub_dir)}
+
+
 def _bar_close(row: Dict[str, Any]) -> float:
     for key in ("c", "close"):
         val = _f(row.get(key, 0.0), 0.0)
@@ -3993,6 +4912,225 @@ def _save_stock_cached_bars(hub_dir: str, symbol: str, timeframe: str, bars: Lis
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"bars": list(bars or [])}, f)
     os.replace(tmp, path)
+
+
+def warm_stock_historical_cache(
+    *,
+    hub_dir: str,
+    base_dir: str,
+    settings: Dict[str, Any],
+    symbol: str,
+    lookback_days: int = 365,
+    timeframe: str = "1Hour",
+    force_refresh: bool = False,
+) -> Dict[str, Any]:
+    normalized = _normalize_stock_ticker(symbol)
+    provider, client, _diag = _stock_provider_client(settings, base_dir)
+    cache_before = _load_stock_cached_bars(hub_dir, normalized, timeframe) if normalized and (not force_refresh) else []
+    out: Dict[str, Any] = {
+        "symbol": normalized,
+        "provider": provider,
+        "timeframe": timeframe,
+        "lookback_days": int(lookback_days),
+        "cache_path": _stock_cache_root(hub_dir),
+        "cache_rows_before": int(len(cache_before)),
+        "remote_rows_fetched": 0,
+        "cache_rows_after": int(len(cache_before)),
+        "date_range": {},
+        "warmup_status": "provider_unavailable" if client is None else "pending",
+        "warmup_error": "",
+    }
+    if not normalized:
+        out["warmup_status"] = "invalid_symbol"
+        out["warmup_error"] = "invalid_symbol"
+        return out
+    if client is None:
+        out["warmup_error"] = _s(_diag.get("reason", "")) or "provider_unavailable"
+        return out
+    now_ts = int(time.time())
+    start_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts - (int(lookback_days) * 86400)))
+    end_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts))
+    bars = list(cache_before)
+    needs_fetch = force_refresh or len(bars) < 48
+    if bars and not needs_fetch:
+        ts_values = [_bar_ts(r) for r in bars if _bar_ts(r) > 0]
+        if ts_values:
+            out["date_range"] = {"start_ts": int(min(ts_values)), "end_ts": int(max(ts_values))}
+            oldest_ok = min(ts_values) <= (now_ts - (int(lookback_days) * 86400) + 86400)
+            newest_ok = max(ts_values) >= (now_ts - 172800)
+            needs_fetch = not (oldest_ok and newest_ok)
+    try:
+        if needs_fetch:
+            fetched: List[Dict[str, Any]] = []
+            if provider == "alpaca":
+                fetched = client.get_stock_bars(
+                    normalized,
+                    timeframe=timeframe,
+                    limit=max(480, int((lookback_days * 24) * 1.2)),
+                    feed="iex",
+                    start_iso=start_iso,
+                    end_iso=end_iso,
+                )
+                if len(fetched) < 48 and timeframe == "1Hour":
+                    fetched = client.get_stock_bars(
+                        normalized,
+                        timeframe="1Day",
+                        limit=max(180, int(lookback_days)),
+                        feed="iex",
+                        start_iso=start_iso,
+                        end_iso=end_iso,
+                    )
+            else:
+                interval = "1h" if timeframe.lower() == "1hour" else "1day"
+                fetched = list((client.get_time_series_batch([normalized], interval=interval, outputsize=max(480, int((lookback_days * 24) * 1.2))) or {}).get(normalized, []))
+            out["remote_rows_fetched"] = int(len(fetched))
+            if fetched:
+                merged: Dict[str, Dict[str, Any]] = {}
+                for row in list(cache_before) + list(fetched):
+                    if isinstance(row, dict):
+                        merged[_s(row.get("t", row.get("datetime", "")))] = dict(row)
+                bars = sorted(merged.values(), key=_bar_ts)
+                _save_stock_cached_bars(hub_dir, normalized, timeframe, bars)
+        out["cache_rows_after"] = int(len(bars))
+        ts_values = [_bar_ts(r) for r in bars if _bar_ts(r) > 0]
+        if ts_values:
+            out["date_range"] = {"start_ts": int(min(ts_values)), "end_ts": int(max(ts_values))}
+        out["warmup_status"] = "ready" if len(bars) >= 48 else "insufficient_history"
+    except Exception as exc:
+        out["warmup_status"] = "provider_error"
+        out["warmup_error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
+def _build_stock_preview_candidate(symbol: str, bars: List[Dict[str, Any]]) -> Dict[str, Any]:
+    rows = [dict(r) for r in list(bars or []) if _bar_close(r) > 0.0]
+    rows.sort(key=_bar_ts)
+    if len(rows) < 25:
+        return {}
+    idx = len(rows) - 1
+    px = _bar_close(rows[idx])
+    prev6 = _bar_close(rows[idx - 6])
+    prev24 = _bar_close(rows[idx - 24])
+    if px <= 0.0 or prev6 <= 0.0 or prev24 <= 0.0:
+        return {}
+    recent_returns: List[float] = []
+    for j in range(max(1, idx - 12), idx + 1):
+        prev_px = _bar_close(rows[j - 1])
+        cur_px = _bar_close(rows[j])
+        if prev_px > 0.0 and cur_px > 0.0:
+            recent_returns.append(((cur_px / prev_px) - 1.0) * 100.0)
+    mom6 = ((px / prev6) - 1.0) * 100.0
+    mom24 = ((px / prev24) - 1.0) * 100.0
+    trend_momentum_score = (0.55 * mom6) + (0.45 * mom24)
+    recent_volatility = _stddev_local(recent_returns)
+    signal_margin = max(0.0, (mom6 / 100.0)) + max(0.0, (mom24 / 100.0))
+    return {
+        "symbol": normalized if (normalized := _normalize_stock_ticker(symbol)) else _normalize_stock_ticker(symbol),
+        "market": "stocks",
+        "source_type": "historical_api_replay",
+        "provider": "alpaca_or_twelvedata",
+        "candle_timeframe": "1Hour",
+        "entry_price": round(float(px), 10),
+        "entry_ts": int(_bar_ts(rows[idx])),
+        "recent_return_6": round(float(mom6), 6),
+        "recent_return_24": round(float(mom24), 6),
+        "recent_volatility": round(float(recent_volatility), 6),
+        "trend_momentum_score": round(float(trend_momentum_score), 6),
+        "signal_margin": round(float(signal_margin), 6),
+        "signal_side": "long",
+        "regime": "historical_preview",
+    }
+
+
+def build_stock_watchlist_prediction_preview(
+    *,
+    hub_dir: str,
+    base_dir: str,
+    settings: Dict[str, Any],
+    symbol: str,
+    timeframe: str = "1Hour",
+    lookback_days: int = 365,
+) -> Dict[str, Any]:
+    normalized = _normalize_stock_ticker(symbol)
+    bars = _load_stock_cached_bars(hub_dir, normalized, timeframe)
+    replay_rows = _simulate_stock_trades_from_bars(normalized, bars)
+    candidate = _build_stock_preview_candidate(normalized, bars)
+    preview: Dict[str, Any] = {
+        "symbol": normalized,
+        "provider": _s(settings.get("stock_data_provider", "alpaca")) or "alpaca",
+        "rows_available": int(len(bars)),
+        "replay_rows_generated": int(len(replay_rows)),
+        "source_type": "historical_api_replay",
+        "timeframe": timeframe,
+        "lookback_days": int(lookback_days),
+        "predicted_direction": "warming / insufficient data",
+        "predicted_exit_trigger": "warming / insufficient data",
+        "predicted_pnl_trend": "warming / insufficient data",
+        "confidence": 0.0,
+        "stock_pnl_quality_score": 0.0,
+        "stock_pnl_quality_reason": "",
+        "stock_trade_quality_score": 0.0,
+        "trade_quality_gate_applied": False,
+        "direction_scores": {},
+        "trigger_scores": {},
+        "stock_readiness": {
+            "sufficient_history": bool(len(bars) >= 48),
+            "sufficient_replay_rows": bool(len(replay_rows) >= 12),
+            "trade_eligible": False,
+            "trade_blockers": [],
+        },
+        "common_historical_outcomes": {
+            "trigger_distribution": _count_by(replay_rows, lambda r: _s(r.get("actual_exit_trigger", "")) or "Unknown"),
+            "direction_distribution": _count_by(replay_rows, lambda r: _s(r.get("actual_direction", _trade_direction(r))).lower() or "unknown"),
+            "average_pnl_pct": round(sum(_trade_return_pct(r) for r in replay_rows) / max(1, len(replay_rows)), 6) if replay_rows else 0.0,
+        },
+        "explanation": "",
+    }
+    blockers: List[str] = []
+    if len(bars) < 48:
+        blockers.append("insufficient_history")
+    if len(replay_rows) < 12:
+        blockers.append("insufficient_replay_rows")
+    if not candidate:
+        blockers.append("candidate_features_unavailable")
+    if candidate and replay_rows:
+        pred = _stock_predict_one(train_rows=replay_rows[:-1] if len(replay_rows) > 1 else replay_rows, candidate=candidate, regime="historical_preview", predictor_variant="stock_pnl_quality_v2")
+        preview["predicted_direction"] = _s(pred.get("predicted_direction", "")) or "unknown"
+        preview["predicted_exit_trigger"] = _s(pred.get("predicted_exit_trigger", "")) or "Unknown"
+        preview["predicted_pnl_trend"] = _s(pred.get("predicted_pnl_trend", "")) or ("up" if _s(pred.get("predicted_direction", "")).lower() == "up" else "down")
+        preview["confidence"] = round(_f(pred.get("predicted_confidence", 0.0), 0.0), 6)
+        preview["stock_pnl_quality_score"] = round(_f(pred.get("stock_pnl_quality_score", 0.0), 0.0), 6)
+        preview["stock_pnl_quality_reason"] = _s(pred.get("stock_pnl_quality_reason", ""))
+        preview["stock_trade_quality_score"] = round(_f(pred.get("stock_trade_quality_score", 0.0), 0.0), 6)
+        preview["trade_quality_gate_applied"] = bool(pred.get("stock_trade_quality_gate_applied", False))
+        preview["direction_scores"] = dict(pred.get("direction_scores", {}) if isinstance(pred.get("direction_scores", {}), dict) else {})
+        preview["trigger_scores"] = dict(pred.get("trigger_scores", {}) if isinstance(pred.get("trigger_scores", {}), dict) else {})
+        if _s(preview.get("predicted_direction", "")).lower() != "up":
+            blockers.append("predicted_direction_not_up")
+        if _s(preview.get("predicted_pnl_trend", "")).lower() != "up":
+            blockers.append("predicted_pnl_trend_not_up")
+        if _f(preview.get("confidence", 0.0), 0.0) < 0.30:
+            blockers.append("preview_confidence_low")
+        if _f(preview.get("stock_pnl_quality_score", 0.0), 0.0) < 0.50:
+            blockers.append("stock_pnl_quality_weak")
+        if bool(preview.get("trade_quality_gate_applied", False)):
+            blockers.append("trade_quality_gate_applied")
+    rollout = _safe_read_json(os.path.join(hub_dir, "model_quality_full_pass.json"))
+    stocks_rollout = rollout.get("controlled_rollout_readiness", {}).get("stocks", {}) if isinstance(rollout.get("controlled_rollout_readiness", {}), dict) else {}
+    if stocks_rollout and not bool(stocks_rollout.get("controlled_rollout_eligible", False)):
+        blockers.append("market_rollout_not_ready")
+    preview["stock_readiness"]["trade_blockers"] = blockers
+    preview["stock_readiness"]["trade_eligible"] = not blockers
+    preview["manual_watchlist_trade_eligible"] = bool(not blockers)
+    preview["manual_watchlist_trade_blockers"] = list(blockers)
+    preview["explanation"] = (
+        "Historical replay preview is ready and the symbol passes local readiness checks."
+        if not blockers
+        else "Historical replay preview is available, but live trading stays blocked until readiness checks pass: " + ", ".join(blockers)
+    )
+    os.makedirs(_stock_watchlist_preview_dir(hub_dir), exist_ok=True)
+    _write_json_atomic(_stock_watchlist_preview_path(hub_dir, normalized), preview)
+    return preview
 
 
 def _simulate_stock_trades_from_bars(symbol: str, bars: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -4109,6 +5247,7 @@ def _simulate_stock_trades_from_bars(symbol: str, bars: List[Dict[str, Any]]) ->
                 "exit_price": round(float(px), 10),
                 "hold_hours": round(float(max(0.0, (ts - entry_ts) / 3600.0)), 6),
                 "pnl_usd": round(float(pnl_usd), 8),
+                "actual_direction": "up" if pnl_usd > 1e-9 else "down" if pnl_usd < -1e-9 else "flat",
                 "actual_exit_trigger": trigger,
                 "event_exit_tag": f"historical_api_replay:{trigger.lower().replace(' ', '_')}",
                 "raw_rule_reason": trigger.lower().replace(" ", "_"),
@@ -4306,6 +5445,7 @@ def build_synthetic_replay_artifact(
 
     for r in rows:
         r["actual_direction"] = _trade_direction(r)
+        r["replay_row_id"] = _replay_row_id(r)
 
     n = len(rows)
     test_n = max(8, min(40, int(round(n * 0.20))))
@@ -4326,13 +5466,14 @@ def build_synthetic_replay_artifact(
         test = rows[end : end + test_n]
         if len(test) < 4:
             continue
+        current_window_index = win_count + 1
         predictor_variants = ["candidate"]
         if m == "crypto" and any(_is_historical_strategy_replay_row(r) for r in train):
-            predictor_variants = ["baseline", "candidate", "label_compatible_v2"]
+            predictor_variants = ["baseline", "candidate", "label_compatible_v2", "label_compatible_v3_sequence"]
         elif m == "forex":
             predictor_variants = ["baseline", "candidate"]
         elif m == "stocks":
-            predictor_variants = ["candidate"]
+            predictor_variants = ["candidate", "stock_pnl_quality_v2"]
         variant_predictions: Dict[str, List[Dict[str, Any]]] = {}
         variant_abstain: Dict[str, Dict[str, Any]] = {}
         variant_scored: Dict[str, Dict[str, Any]] = {}
@@ -4366,9 +5507,12 @@ def build_synthetic_replay_artifact(
                     pred = _predict_one(train_rows=prior, candidate=rr, regime=regime, market=m, predictor_variant=predictor_variant)
                 merged = dict(rr)
                 merged.update(pred)
+                merged["predictor_variant"] = _s(merged.get("predictor_variant", "")) or predictor_variant
+                merged["walkforward_window_index"] = int(current_window_index)
                 merged["predicted_exit_ts"] = int(
                     _f(rr.get("entry_ts", 0.0), 0.0) + int(round(_f(pred.get("predicted_hold_hours", 0.0), 0.0) * 3600.0))
                 )
+                merged["replay_row_id"] = _replay_row_id(merged)
                 test_preds.append(merged)
                 prior.append(rr)
             scored = _score_crypto_with_policy(test_preds, selected_policy) if m == "crypto" else _score_with_threshold(test_preds, threshold, m)
@@ -4523,6 +5667,15 @@ def build_synthetic_replay_artifact(
     population_diag = _population_diagnostics(preds_all, admitted_all, abstained_all)
     crypto_diag = _crypto_replay_diagnostics(admitted_all, full_rows=preds_all, abstained_rows=abstained_all) if m == "crypto" else {}
     market_diag = _market_predictor_diagnostics(m, admitted_all, full_rows=preds_all, abstained_rows=abstained_all) if m in {"stocks", "forex"} else {}
+    selected_variant_distribution = _count_by(
+        [w.get("safe_selection", {}) for w in windows if isinstance(w.get("safe_selection", {}), dict)],
+        lambda s: _s(s.get("selected_predictor_variant", "")) or "unknown",
+    )
+    final_scoring_variant_name = (
+        next(iter(selected_variant_distribution.keys()))
+        if len(selected_variant_distribution) == 1
+        else "mixed_selected_variants_aggregate"
+    )
     if crypto_diag:
         crypto_diag["population_diagnostics"] = population_diag
         crypto_diag["crypto_label_feature_alignment_diagnostics"] = _crypto_label_feature_alignment_diagnostics(preds_all)
@@ -4555,6 +5708,63 @@ def build_synthetic_replay_artifact(
                 "admitted_metrics": population_diag.get("admitted_metrics", {}),
                 "abstained_metrics": population_diag.get("abstained_metrics", {}),
             }
+        latest_selection = safe_selection_snapshots[-1] if safe_selection_snapshots else {}
+        latest_candidate_evals = latest_selection.get("candidate_evaluations", []) if isinstance(latest_selection.get("candidate_evaluations", []), list) else []
+        latest_candidate_variant = "label_compatible_v2" if any(_s(ev.get("variant", "")) == "label_compatible_v2" for ev in latest_candidate_evals) else ""
+        latest_candidate_eval = next(
+            (
+                ev
+                for ev in latest_candidate_evals
+                if _s(ev.get("variant", "")) == latest_candidate_variant
+            ),
+            {},
+        ) if latest_candidate_variant else {}
+        latest_candidate_summary = latest_candidate_eval.get("summary", {}) if isinstance(latest_candidate_eval.get("summary", {}), dict) else {}
+        latest_candidate_rows = variant_predictions.get(latest_candidate_variant, []) if latest_candidate_variant else []
+        latest_candidate_admitted = (
+            variant_scored.get(latest_candidate_variant, {}).get("admitted", [])
+            if latest_candidate_variant and isinstance(variant_scored.get(latest_candidate_variant, {}), dict)
+            else []
+        )
+        selected_latest_rows = selected_preds if isinstance(selected_preds, list) else []
+        selected_latest_admitted = selected_scored.get("admitted", []) if isinstance(selected_scored.get("admitted", []), list) else []
+        divergence_reason = "candidate_and_final_metrics_align"
+        if _s(latest_selection.get("selected_predictor_variant", "")) != latest_candidate_variant and latest_candidate_variant:
+            divergence_reason = "latest_candidate_not_selected_due_to_safe_selection_guardrails"
+        elif final_scoring_variant_name == "mixed_selected_variants_aggregate":
+            divergence_reason = "final_metrics_are_aggregate_across_windows_with_mixed_selected_variants"
+        elif int(len(admitted_all)) != int(len(selected_latest_admitted)) or int(len(preds_all)) != int(len(selected_latest_rows)):
+            divergence_reason = "final_metrics_are_aggregate_across_all_selected_windows_not_latest_window_only"
+        elif _s(latest_selection.get("selected_predictor_variant", "")) != _s(final_scoring_variant_name):
+            divergence_reason = "final_metrics_use_selected_window_aggregate_not_latest_selected_variant_only"
+        crypto_diag["candidate_vs_final_reconciliation"] = {
+            "candidate_variant_name": latest_candidate_variant or "none",
+            "selected_variant_name": _s(latest_selection.get("selected_predictor_variant", "")) or "none",
+            "final_scoring_variant_name": final_scoring_variant_name,
+            "final_metrics_basis": "selected_admitted_rows_aggregate",
+            "candidate_full_rows_count": int(len(latest_candidate_rows)),
+            "candidate_admitted_rows_count": int(len(latest_candidate_admitted)),
+            "final_full_rows_count": int(len(preds_all)),
+            "final_admitted_rows_count": int(len(admitted_all)),
+            "latest_selected_window_full_rows_count": int(len(selected_latest_rows)),
+            "latest_selected_window_admitted_rows_count": int(len(selected_latest_admitted)),
+            "overlap_count_between_candidate_and_final_admitted": _row_overlap_count(latest_candidate_admitted, admitted_all),
+            "candidate_metrics": latest_candidate_summary.get("metrics", {}),
+            "candidate_full_metrics": latest_candidate_summary.get("full_metrics", {}),
+            "final_metrics": metrics,
+            "final_full_metrics": population_diag.get("full_universe_metrics", {}),
+            "latest_selected_window_metrics": selected_scored.get("metrics", {}) if isinstance(selected_scored.get("metrics", {}), dict) else {},
+            "latest_selected_window_full_metrics": selected_scored.get("full_metrics", {}) if isinstance(selected_scored.get("full_metrics", {}), dict) else {},
+            "selected_variant_distribution": selected_variant_distribution,
+            "reason_final_metrics_differ_from_candidate_metrics": divergence_reason,
+            "final_metrics_using": {
+                "variant": final_scoring_variant_name,
+                "row_set": "admitted_rows",
+                "aggregation_scope": "all_selected_windows",
+                "fallback_to_baseline": bool(latest_selection.get("fallback_to_baseline", False)),
+            },
+            "candidate_guardrail_failures": list(latest_candidate_eval.get("guardrail_failures", []) or []),
+        }
         crypto_diag["admission_reason_counts"] = _count_by(
             admitted_all + abstained_all,
             lambda r: _s(r.get("admission_reason", "")) or "unknown",
@@ -4639,10 +5849,9 @@ def build_synthetic_replay_artifact(
         "iterations": [{"iteration": 1, "test_predictions": admitted_all}],
     }
     if crypto_diag:
-        latest_selection = safe_selection_snapshots[-1] if safe_selection_snapshots else {}
         crypto_diag["safe_selection"] = latest_selection
         crypto_diag["exit_shape_predictive_mode"] = (
-            "active" if _s(latest_selection.get("selected_predictor_variant", "")) == "label_compatible_v2" else "diagnostic_only"
+            "active" if _s(latest_selection.get("selected_predictor_variant", "")) in {"label_compatible_v2", "label_compatible_v3_sequence"} else "diagnostic_only"
         )
         label_v2_eval = {}
         for ev in latest_selection.get("candidate_evaluations", []) if isinstance(latest_selection.get("candidate_evaluations", []), list) else []:
@@ -4833,6 +6042,27 @@ def _crypto_replay_diagnostics(
     manual_mispreds: List[Dict[str, Any]] = []
     stale_vs_trailing_examples: List[Dict[str, Any]] = []
     stale_vs_manual_examples: List[Dict[str, Any]] = []
+    trigger_pair_misses: Dict[str, int] = {
+        "Risk Cut->Trailing": 0,
+        "Risk Cut->Stale Alignment": 0,
+        "Trailing->Risk Cut": 0,
+        "Trailing->Stale Alignment": 0,
+        "Stale Alignment->Risk Cut": 0,
+        "Stale Alignment->Trailing": 0,
+    }
+    miss_bars_in_trade: Dict[str, int] = {}
+    miss_drawdown_from_peak: Dict[str, int] = {}
+    miss_max_adverse_excursion: Dict[str, int] = {}
+    miss_trailing_armed: Dict[str, int] = {}
+    miss_risk_cut_touched: Dict[str, int] = {}
+    miss_favorable_then_softened: Dict[str, int] = {}
+    actual_risk_cut_by_sequence: Dict[str, int] = {}
+    actual_trailing_by_sequence: Dict[str, int] = {}
+    risk_cut_to_trailing_sequence: Dict[str, int] = {}
+    trailing_to_risk_cut_sequence: Dict[str, int] = {}
+    miss_exit_close_position_bucket: Dict[str, int] = {}
+    miss_peak_to_exit_velocity_bucket: Dict[str, int] = {}
+    miss_bars_from_trailing_arm_to_risk_cut_bucket: Dict[str, int] = {}
     proto_support: Dict[str, Dict[str, int]] = {}
     manual_predicted = 0
     manual_correct = 0
@@ -4970,6 +6200,65 @@ def _crypto_replay_diagnostics(
             miss_recent24_bucket[_historical_replay_bucket("recent_return_24", _f(row.get("recent_return_24", 0.0), 0.0))] = int(
                 miss_recent24_bucket.get(_historical_replay_bucket("recent_return_24", _f(row.get("recent_return_24", 0.0), 0.0)), 0) + 1
             )
+            pair_key = f"{act_trig}->{pred_trig}"
+            if pair_key in trigger_pair_misses:
+                trigger_pair_misses[pair_key] = int(trigger_pair_misses.get(pair_key, 0) + 1)
+            miss_bars_in_trade[_bucket_hold_hours(_f(row.get("bars_in_trade", 0.0), 0.0))] = int(
+                miss_bars_in_trade.get(_bucket_hold_hours(_f(row.get("bars_in_trade", 0.0), 0.0)), 0) + 1
+            )
+            miss_drawdown_from_peak[_bucket_margin_value(abs(_f(row.get("drawdown_from_peak_pct", 0.0), 0.0)))] = int(
+                miss_drawdown_from_peak.get(_bucket_margin_value(abs(_f(row.get("drawdown_from_peak_pct", 0.0), 0.0))), 0) + 1
+            )
+            miss_max_adverse_excursion[_bucket_margin_value(abs(_f(row.get("max_adverse_excursion_pct", 0.0), 0.0)))] = int(
+                miss_max_adverse_excursion.get(_bucket_margin_value(abs(_f(row.get("max_adverse_excursion_pct", 0.0), 0.0))), 0) + 1
+            )
+            miss_trailing_armed[str(bool(row.get("trailing_armed", False))).lower()] = int(
+                miss_trailing_armed.get(str(bool(row.get("trailing_armed", False))).lower(), 0) + 1
+            )
+            miss_risk_cut_touched[str(bool(row.get("risk_cut_touched", False))).lower()] = int(
+                miss_risk_cut_touched.get(str(bool(row.get("risk_cut_touched", False))).lower(), 0) + 1
+            )
+            miss_favorable_then_softened[str(bool(row.get("favorable_then_softened_flag", False))).lower()] = int(
+                miss_favorable_then_softened.get(str(bool(row.get("favorable_then_softened_flag", False))).lower(), 0) + 1
+            )
+            sequence_bucket = (
+                "risk_before_trailing" if bool(row.get("risk_cut_before_trailing", False))
+                else "trailing_before_risk" if bool(row.get("trailing_before_risk_cut", False))
+                else "same_candle" if bool(row.get("same_candle_risk_and_trailing", False))
+                else "risk_after_trailing" if bool(row.get("risk_cut_after_trailing_arm", False))
+                else "other"
+            )
+            if act_trig == "Risk Cut" and pred_trig == "Trailing":
+                risk_cut_to_trailing_sequence[sequence_bucket] = int(risk_cut_to_trailing_sequence.get(sequence_bucket, 0) + 1)
+            if act_trig == "Trailing" and pred_trig == "Risk Cut":
+                trailing_to_risk_cut_sequence[sequence_bucket] = int(trailing_to_risk_cut_sequence.get(sequence_bucket, 0) + 1)
+            miss_exit_close_position_bucket[_bucket_probability(_f(row.get("exit_close_position_in_candle_range", 0.5), 0.5))] = int(
+                miss_exit_close_position_bucket.get(_bucket_probability(_f(row.get("exit_close_position_in_candle_range", 0.5), 0.5)), 0) + 1
+            )
+            miss_peak_to_exit_velocity_bucket[_bucket_margin_value(abs(_f(row.get("peak_to_exit_velocity_pct_per_bar", 0.0), 0.0)))] = int(
+                miss_peak_to_exit_velocity_bucket.get(_bucket_margin_value(abs(_f(row.get("peak_to_exit_velocity_pct_per_bar", 0.0), 0.0))), 0) + 1
+            )
+            miss_bars_from_trailing_arm_to_risk_cut_bucket[_bucket_margin_value(_f(row.get("bars_from_trailing_arm_to_risk_cut", -1.0), -1.0))] = int(
+                miss_bars_from_trailing_arm_to_risk_cut_bucket.get(_bucket_margin_value(_f(row.get("bars_from_trailing_arm_to_risk_cut", -1.0), -1.0)), 0) + 1
+            )
+        if act_trig == "Risk Cut":
+            sequence_bucket = (
+                "risk_before_trailing" if bool(row.get("risk_cut_before_trailing", False))
+                else "trailing_before_risk" if bool(row.get("trailing_before_risk_cut", False))
+                else "same_candle" if bool(row.get("same_candle_risk_and_trailing", False))
+                else "risk_after_trailing" if bool(row.get("risk_cut_after_trailing_arm", False))
+                else "other"
+            )
+            actual_risk_cut_by_sequence[sequence_bucket] = int(actual_risk_cut_by_sequence.get(sequence_bucket, 0) + 1)
+        if act_trig == "Trailing":
+            sequence_bucket = (
+                "risk_before_trailing" if bool(row.get("risk_cut_before_trailing", False))
+                else "trailing_before_risk" if bool(row.get("trailing_before_risk_cut", False))
+                else "same_candle" if bool(row.get("same_candle_risk_and_trailing", False))
+                else "risk_after_trailing" if bool(row.get("risk_cut_after_trailing_arm", False))
+                else "other"
+            )
+            actual_trailing_by_sequence[sequence_bucket] = int(actual_trailing_by_sequence.get(sequence_bucket, 0) + 1)
         if (
             _s(row.get("actual_direction", "")).lower() == "up"
             and _s(row.get("actual_exit_trigger", "")) == "Trailing"
@@ -5083,6 +6372,24 @@ def _crypto_replay_diagnostics(
         "misses_by_recent_return_6_bucket": _top_counter(miss_recent6_bucket),
         "misses_by_recent_return_12_bucket": _top_counter(miss_recent12_bucket),
         "misses_by_recent_return_24_bucket": _top_counter(miss_recent24_bucket),
+        "trigger_pair_miss_counts": trigger_pair_misses,
+        "trigger_miss_feature_diagnostics": {
+            "misses_by_bars_in_trade": _top_counter(miss_bars_in_trade),
+            "misses_by_drawdown_from_peak_pct": _top_counter(miss_drawdown_from_peak),
+            "misses_by_max_adverse_excursion_pct": _top_counter(miss_max_adverse_excursion),
+            "misses_by_trailing_armed": _top_counter(miss_trailing_armed),
+            "misses_by_risk_cut_touched": _top_counter(miss_risk_cut_touched),
+            "misses_by_favorable_then_softened_flag": _top_counter(miss_favorable_then_softened),
+            "misses_by_exit_close_position_in_candle_range": _top_counter(miss_exit_close_position_bucket),
+            "misses_by_peak_to_exit_velocity_pct_per_bar": _top_counter(miss_peak_to_exit_velocity_bucket),
+            "misses_by_bars_from_trailing_arm_to_risk_cut": _top_counter(miss_bars_from_trailing_arm_to_risk_cut_bucket),
+        },
+        "risk_trailing_sequence_diagnostics": {
+            "actual_risk_cut_by_sequence": _top_counter(actual_risk_cut_by_sequence),
+            "actual_trailing_by_sequence": _top_counter(actual_trailing_by_sequence),
+            "risk_cut_predicted_trailing_by_sequence": _top_counter(risk_cut_to_trailing_sequence),
+            "trailing_predicted_risk_cut_by_sequence": _top_counter(trailing_to_risk_cut_sequence),
+        },
         "confidence_distribution": _confidence_summary(rows),
         "full_universe_confidence_distribution": _confidence_summary(full_population),
         "abstained_confidence_distribution": _confidence_summary(abstained_population),
@@ -5188,6 +6495,30 @@ def _market_predictor_diagnostics(
     actual_down_predicted_up_after_guard = 0
     stale_as_trailing = 0
     trailing_as_stale = 0
+    stock_pnl_miss_symbol: Dict[str, int] = {}
+    stock_pnl_miss_trigger: Dict[str, int] = {}
+    stock_pnl_miss_pred_trigger: Dict[str, int] = {}
+    stock_pnl_miss_direction: Dict[str, int] = {}
+    stock_pnl_miss_pred_direction: Dict[str, int] = {}
+    stock_pnl_miss_hold: Dict[str, int] = {}
+    stock_pnl_miss_vol: Dict[str, int] = {}
+    stock_pnl_miss_ret6: Dict[str, int] = {}
+    stock_pnl_miss_ret24: Dict[str, int] = {}
+    stock_pnl_miss_mfe: Dict[str, int] = {}
+    stock_pnl_miss_mae: Dict[str, int] = {}
+    stock_pnl_miss_drawdown: Dict[str, int] = {}
+    stock_pnl_miss_bars_since_peak: Dict[str, int] = {}
+    stock_pnl_miss_bars_in_trade: Dict[str, int] = {}
+    stock_pnl_miss_trailing_armed: Dict[str, int] = {}
+    stock_pnl_miss_softened: Dict[str, int] = {}
+    stock_pnl_miss_stale_profile: Dict[str, int] = {}
+    stock_pnl_miss_window: Dict[str, int] = {}
+    stock_weak_window_reason_counts: Dict[str, int] = {}
+    stock_direction_correct_pnl_wrong = 0
+    stock_trigger_correct_pnl_wrong = 0
+    stock_direction_trigger_correct_pnl_wrong = 0
+    stock_pnl_false_positive = 0
+    stock_pnl_false_negative = 0
     for row in population:
         actual_dir = _s(row.get("actual_direction", "")).lower() or "unknown"
         pred_dir = _s(row.get("predicted_direction", "")).lower() or "unknown"
@@ -5204,6 +6535,38 @@ def _market_predictor_diagnostics(
                 stale_as_trailing += 1
             if actual_trigger == "Trailing" and predicted_trigger == "Stale Alignment":
                 trailing_as_stale += 1
+            pnl_wrong = actual_pnl != pred_pnl
+            if pnl_wrong:
+                stock_pnl_miss_symbol[_s(row.get("symbol", "")) or "UNKNOWN"] = int(stock_pnl_miss_symbol.get(_s(row.get("symbol", "")) or "UNKNOWN", 0) + 1)
+                stock_pnl_miss_trigger[actual_trigger] = int(stock_pnl_miss_trigger.get(actual_trigger, 0) + 1)
+                stock_pnl_miss_pred_trigger[predicted_trigger] = int(stock_pnl_miss_pred_trigger.get(predicted_trigger, 0) + 1)
+                stock_pnl_miss_direction[actual_dir] = int(stock_pnl_miss_direction.get(actual_dir, 0) + 1)
+                stock_pnl_miss_pred_direction[pred_dir] = int(stock_pnl_miss_pred_direction.get(pred_dir, 0) + 1)
+                stock_pnl_miss_hold[_bucket_hold_hours(_f(row.get("hold_hours", 0.0), 0.0))] = int(stock_pnl_miss_hold.get(_bucket_hold_hours(_f(row.get("hold_hours", 0.0), 0.0)), 0) + 1)
+                stock_pnl_miss_vol[_historical_replay_bucket("recent_volatility", _f(row.get("recent_volatility", 0.0), 0.0))] = int(stock_pnl_miss_vol.get(_historical_replay_bucket("recent_volatility", _f(row.get("recent_volatility", 0.0), 0.0)), 0) + 1)
+                stock_pnl_miss_ret6[_historical_replay_bucket("recent_return_6", abs(_f(row.get("recent_return_6", 0.0), 0.0)))] = int(stock_pnl_miss_ret6.get(_historical_replay_bucket("recent_return_6", abs(_f(row.get("recent_return_6", 0.0), 0.0))), 0) + 1)
+                stock_pnl_miss_ret24[_historical_replay_bucket("recent_return_24", abs(_f(row.get("recent_return_24", 0.0), 0.0)))] = int(stock_pnl_miss_ret24.get(_historical_replay_bucket("recent_return_24", abs(_f(row.get("recent_return_24", 0.0), 0.0))), 0) + 1)
+                stock_pnl_miss_mfe[_stock_shape_bucket(_f(row.get("max_favorable_excursion_pct", 0.0), 0.0), thresholds=(1.0, 2.0, 4.0))] = int(stock_pnl_miss_mfe.get(_stock_shape_bucket(_f(row.get("max_favorable_excursion_pct", 0.0), 0.0), thresholds=(1.0, 2.0, 4.0)), 0) + 1)
+                stock_pnl_miss_mae[_stock_shape_bucket(_f(row.get("max_adverse_excursion_pct", 0.0), 0.0), thresholds=(0.5, 1.5, 3.0))] = int(stock_pnl_miss_mae.get(_stock_shape_bucket(_f(row.get("max_adverse_excursion_pct", 0.0), 0.0), thresholds=(0.5, 1.5, 3.0)), 0) + 1)
+                stock_pnl_miss_drawdown[_stock_shape_bucket(_f(row.get("drawdown_from_peak_pct", 0.0), 0.0), thresholds=(0.5, 1.5, 3.0))] = int(stock_pnl_miss_drawdown.get(_stock_shape_bucket(_f(row.get("drawdown_from_peak_pct", 0.0), 0.0), thresholds=(0.5, 1.5, 3.0)), 0) + 1)
+                stock_pnl_miss_bars_since_peak[_bucket_margin_value(_f(row.get("bars_since_peak", 0.0), 0.0))] = int(stock_pnl_miss_bars_since_peak.get(_bucket_margin_value(_f(row.get("bars_since_peak", 0.0), 0.0)), 0) + 1)
+                stock_pnl_miss_bars_in_trade[_bucket_margin_value(_f(row.get("bars_in_trade", 0.0), 0.0))] = int(stock_pnl_miss_bars_in_trade.get(_bucket_margin_value(_f(row.get("bars_in_trade", 0.0), 0.0)), 0) + 1)
+                stock_pnl_miss_trailing_armed[str(bool(row.get("trailing_armed", False))).lower()] = int(stock_pnl_miss_trailing_armed.get(str(bool(row.get("trailing_armed", False))).lower(), 0) + 1)
+                stock_pnl_miss_softened[str(bool(row.get("favorable_then_softened_flag", False))).lower()] = int(stock_pnl_miss_softened.get(str(bool(row.get("favorable_then_softened_flag", False))).lower(), 0) + 1)
+                stock_pnl_miss_stale_profile[str(bool(row.get("stale_hold_profile", False))).lower()] = int(stock_pnl_miss_stale_profile.get(str(bool(row.get("stale_hold_profile", False))).lower(), 0) + 1)
+                stock_pnl_miss_window[str(int(_f(row.get("walkforward_window_index", 0.0), 0.0)) or 0)] = int(stock_pnl_miss_window.get(str(int(_f(row.get("walkforward_window_index", 0.0), 0.0)) or 0), 0) + 1)
+                weak_reason = _s(row.get("stock_weak_window_guard_reason", "")) or "none"
+                stock_weak_window_reason_counts[weak_reason] = int(stock_weak_window_reason_counts.get(weak_reason, 0) + 1)
+                if actual_dir == pred_dir:
+                    stock_direction_correct_pnl_wrong += 1
+                if actual_trigger == predicted_trigger:
+                    stock_trigger_correct_pnl_wrong += 1
+                if actual_dir == pred_dir and actual_trigger == predicted_trigger:
+                    stock_direction_trigger_correct_pnl_wrong += 1
+                if pred_pnl == "up" and actual_pnl != "up":
+                    stock_pnl_false_positive += 1
+                if pred_pnl != "up" and actual_pnl == "up":
+                    stock_pnl_false_negative += 1
         if actual_dir != pred_dir or actual_trigger != predicted_trigger:
             miss_symbol[_s(row.get("symbol", "")) or "UNKNOWN"] = int(miss_symbol.get(_s(row.get("symbol", "")) or "UNKNOWN", 0) + 1)
             miss_reason[_s(row.get("raw_rule_reason", row.get("event_exit_tag", ""))) or "unknown"] = int(miss_reason.get(_s(row.get("raw_rule_reason", row.get("event_exit_tag", ""))) or "unknown", 0) + 1)
@@ -5241,6 +6604,42 @@ def _market_predictor_diagnostics(
         out["stock_stale_trailing_confusion_after_exit_shape"] = {
             "stale_predicted_trailing": int(stale_as_trailing),
             "trailing_predicted_stale": int(trailing_as_stale),
+        }
+        out["stock_direction_correct_pnl_wrong_count"] = int(stock_direction_correct_pnl_wrong)
+        out["stock_trigger_correct_pnl_wrong_count"] = int(stock_trigger_correct_pnl_wrong)
+        out["stock_direction_trigger_correct_pnl_wrong_count"] = int(stock_direction_trigger_correct_pnl_wrong)
+        out["stock_pnl_trend_miss_diagnostics"] = {
+            "pnl_trend_false_positives": int(stock_pnl_false_positive),
+            "pnl_trend_false_negatives": int(stock_pnl_false_negative),
+            "misses_by_symbol": _top_counter(stock_pnl_miss_symbol),
+            "misses_by_trigger": _top_counter(stock_pnl_miss_trigger),
+            "misses_by_predicted_trigger": _top_counter(stock_pnl_miss_pred_trigger),
+            "misses_by_direction": _top_counter(stock_pnl_miss_direction),
+            "misses_by_predicted_direction": _top_counter(stock_pnl_miss_pred_direction),
+            "misses_by_hold_bucket": _top_counter(stock_pnl_miss_hold),
+            "misses_by_volatility_bucket": _top_counter(stock_pnl_miss_vol),
+            "misses_by_return_6_bucket": _top_counter(stock_pnl_miss_ret6),
+            "misses_by_return_24_bucket": _top_counter(stock_pnl_miss_ret24),
+            "misses_by_max_favorable_excursion_pct": _top_counter(stock_pnl_miss_mfe),
+            "misses_by_max_adverse_excursion_pct": _top_counter(stock_pnl_miss_mae),
+            "misses_by_drawdown_from_peak_pct": _top_counter(stock_pnl_miss_drawdown),
+            "misses_by_bars_since_peak": _top_counter(stock_pnl_miss_bars_since_peak),
+            "misses_by_bars_in_trade": _top_counter(stock_pnl_miss_bars_in_trade),
+            "misses_by_trailing_armed": _top_counter(stock_pnl_miss_trailing_armed),
+            "misses_by_favorable_then_softened_flag": _top_counter(stock_pnl_miss_softened),
+            "misses_by_stale_hold_profile": _top_counter(stock_pnl_miss_stale_profile),
+            "misses_by_walkforward_window": _top_counter(stock_pnl_miss_window),
+        }
+        out["stock_weak_window_diagnostics"] = {
+            "guard_reasons": _top_counter(stock_weak_window_reason_counts),
+            "guard_applied_rows": int(sum(1 for r in population if bool(r.get("stock_weak_window_guard_applied", False)))),
+            "high_vol_long_hold_penalty_rows": int(sum(1 for r in population if _f(r.get("stock_high_vol_long_hold_penalty", 0.0), 0.0) > 0.0)),
+            "drawdown_quality_penalty_rows": int(sum(1 for r in population if _f(r.get("stock_drawdown_quality_penalty", 0.0), 0.0) > 0.0)),
+            "symbol_pnl_history_penalty_rows": int(sum(1 for r in population if _f(r.get("stock_symbol_pnl_history_penalty", 0.0), 0.0) > 0.0)),
+            "weak_window_metrics_by_window": {
+                str(window): _metrics_for_rows([r for r in population if str(int(_f(r.get("walkforward_window_index", 0.0), 0.0)) or 0) == str(window)])
+                for window in sorted({str(int(_f(r.get("walkforward_window_index", 0.0), 0.0)) or 0) for r in population})
+            },
         }
     return out
 
@@ -5325,6 +6724,7 @@ def run_model_quality_full_pass(
     stock_backfill_max_symbols = _env_int("STOCK_REPLAY_BACKFILL_MAX_SYMBOLS", 50 if stock_backfill_enabled else 24)
     stock_backfill_force_refresh = _env_flag("STOCK_REPLAY_BACKFILL_FORCE_REFRESH")
     use_live_rows_as_primary = _env_flag("MODEL_QUALITY_USE_LIVE_ROWS_AS_PRIMARY")
+    use_legacy_replay_as_primary = _env_flag("MODEL_QUALITY_USE_LEGACY_REPLAY_AS_PRIMARY")
     ts = int(time.time())
     stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(ts))
     out_dir = os.path.join(hub_dir, "datasets")
@@ -5680,6 +7080,7 @@ def run_model_quality_full_pass(
     calibration = build_confidence_calibration_payload(hub_dir, cfg)
     shadow = build_shadow_scorecards(hub_dir)
     replay_diag = {m: build_replay_diagnostics(hub_dir, m) for m in markets}
+    legacy_trade_replay = build_legacy_trade_model_replay(hub_dir=hub_dir, base_dir=base_dir, settings=cfg)
 
     promotion_thresholds = {"directional_accuracy_pct": 90.0, "trigger_match_pct": 90.0, "pnl_trend_match_pct": 90.0}
     promotion_minima = {
@@ -5788,6 +7189,9 @@ def run_model_quality_full_pass(
         "confidence_calibration": calibration,
         "shadow_scorecards": shadow,
         "replay_diagnostics": replay_diag,
+        "legacy_trade_model_replay": legacy_trade_replay,
+        "legacy_trade_model_replay_used_as_primary": bool(use_legacy_replay_as_primary and legacy_trade_replay.get("legacy_rows_replayed", 0)),
+        "legacy_trade_model_replay_used_as_supplemental": True,
         "crypto_trained_artifact_diagnostics": crypto_artifact_report.get("discovery", {}),
         "crypto_feature_source_diagnostics": (
             dataset_reports.get("crypto", {}).get("feature_source_diagnostics", {})

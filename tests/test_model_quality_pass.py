@@ -14,6 +14,7 @@ from app.crypto_historical_replay import build_crypto_historical_strategy_replay
 from app.model_quality_pass import (
     _completed_live_decision_rows,
     _generate_stock_historical_replay_closed_trades,
+    _normalize_stock_ticker,
     _prepare_forex_audit_rows,
     _crypto_admission_decision,
     _predict_one,
@@ -21,12 +22,17 @@ from app.model_quality_pass import (
     _simulate_stock_trades_from_bars,
     _stock_predict_one,
     _score_with_threshold,
+    add_stock_to_manual_watchlist,
     build_market_dataset_quality,
+    build_stock_watchlist_prediction_preview,
+    build_legacy_trade_model_replay,
     build_closed_trades,
     build_replay_diagnostics,
     build_synthetic_replay_artifact,
     load_market_trade_events,
     run_model_quality_full_pass,
+    validate_stock_watchlist_symbol,
+    warm_stock_historical_cache,
 )
 from app.trigger_normalization import normalize_exit_trigger
 
@@ -1293,6 +1299,267 @@ class TestModelQualityPass(unittest.TestCase):
         self.assertGreater(float(out.get("stock_stale_vs_trailing_margin", 0.0)), 0.0)
         self.assertTrue(bool(out.get("stock_stale_override_applied", False)))
 
+    def test_stock_pnl_quality_v2_ignores_candidate_actual_pnl_fields(self) -> None:
+        train_rows = []
+        for i in range(12):
+            train_rows.append(
+                {
+                    "symbol": "SMCI",
+                    "entry_price": 100.0,
+                    "actual_exit_price": 97.0,
+                    "hold_hours": 22.0,
+                    "pnl_pct": -3.0,
+                    "actual_direction": "down",
+                    "actual_exit_trigger": "Stale Alignment",
+                    "regime": "high_volatility",
+                    "source_type": "historical_api_replay",
+                    "recent_return_6": -0.4,
+                    "recent_return_24": 0.3,
+                    "recent_volatility": 0.95,
+                    "trend_momentum_score": 0.2,
+                    "signal_margin": 0.08,
+                    "drawdown_from_peak_pct": -2.2,
+                    "bars_in_trade": 24,
+                    "bars_since_peak": 9,
+                    "stale_hold_profile": True,
+                }
+            )
+        base_candidate = {
+            "symbol": "SMCI",
+            "entry_price": 100.0,
+            "source_type": "historical_api_replay",
+            "recent_return_6": 0.1,
+            "recent_return_24": 0.5,
+            "recent_volatility": 0.90,
+            "trend_momentum_score": 0.35,
+            "signal_margin": 0.10,
+            "peak_profit_pct": 1.2,
+            "drawdown_from_peak_pct": -2.0,
+            "trailing_armed": True,
+            "favorable_then_softened_flag": True,
+            "stale_hold_profile": True,
+            "volatility_expansion_pct": 30.0,
+            "trend_decay_after_peak": -1.2,
+            "max_favorable_excursion_pct": 1.4,
+            "max_adverse_excursion_pct": -1.8,
+            "bars_since_peak": 8,
+            "bars_in_trade": 26,
+            "exit_momentum_3": -0.9,
+            "exit_momentum_6": -1.1,
+        }
+        candidate_up = dict(base_candidate, actual_exit_price=120.0, pnl_pct=20.0)
+        candidate_down = dict(base_candidate, actual_exit_price=80.0, pnl_pct=-20.0)
+        out_up = _predict_one(train_rows=train_rows, candidate=candidate_up, regime="high_volatility", market="stocks", predictor_variant="stock_pnl_quality_v2")
+        out_down = _predict_one(train_rows=train_rows, candidate=candidate_down, regime="high_volatility", market="stocks", predictor_variant="stock_pnl_quality_v2")
+        self.assertAlmostEqual(float(out_up.get("stock_pnl_quality_score", 0.0)), float(out_down.get("stock_pnl_quality_score", 0.0)), places=6)
+        self.assertEqual(str(out_up.get("predicted_pnl_trend", "")), str(out_down.get("predicted_pnl_trend", "")))
+
+    def test_stock_pnl_quality_v2_reduces_weak_setup(self) -> None:
+        train_rows = []
+        for i in range(12):
+            train_rows.append(
+                {
+                    "symbol": "AAPL",
+                    "entry_price": 100.0,
+                    "exit_price": 98.0,
+                    "actual_exit_price": 98.0,
+                    "hold_hours": 20.0,
+                    "pnl_pct": -2.0,
+                    "actual_direction": "down",
+                    "actual_exit_trigger": "Stale Alignment",
+                    "regime": "high_volatility",
+                    "source_type": "historical_api_replay",
+                    "recent_return_6": -0.2,
+                    "recent_return_24": 0.1,
+                    "recent_volatility": 0.85,
+                    "trend_momentum_score": 0.1,
+                    "signal_margin": 0.08,
+                    "drawdown_from_peak_pct": -2.1,
+                    "bars_in_trade": 24,
+                    "bars_since_peak": 8,
+                    "stale_hold_profile": True,
+                }
+            )
+        candidate = {
+            "symbol": "AAPL",
+            "entry_price": 100.0,
+            "source_type": "historical_api_replay",
+            "recent_return_6": 0.15,
+            "recent_return_24": 0.6,
+            "recent_volatility": 0.88,
+            "trend_momentum_score": 0.3,
+            "signal_margin": 0.10,
+            "peak_profit_pct": 1.1,
+            "drawdown_from_peak_pct": -2.3,
+            "trailing_armed": True,
+            "favorable_then_softened_flag": True,
+            "stale_hold_profile": True,
+            "volatility_expansion_pct": 28.0,
+            "trend_decay_after_peak": -1.1,
+            "max_favorable_excursion_pct": 1.5,
+            "max_adverse_excursion_pct": -1.7,
+            "bars_since_peak": 9,
+            "bars_in_trade": 25,
+            "exit_momentum_3": -0.8,
+            "exit_momentum_6": -1.0,
+        }
+        out = _predict_one(train_rows=train_rows, candidate=candidate, regime="high_volatility", market="stocks", predictor_variant="stock_pnl_quality_v2")
+        self.assertEqual(str(out.get("predicted_pnl_trend", "")), "down")
+        self.assertTrue(bool(out.get("stock_weak_window_guard_applied", False)))
+        self.assertLess(float(out.get("stock_pnl_quality_score", 1.0)), 0.50)
+
+    def test_stock_pnl_quality_v2_keeps_strong_clean_setup_up(self) -> None:
+        train_rows = []
+        for i in range(12):
+            train_rows.append(
+                {
+                    "symbol": "NVDA",
+                    "entry_price": 100.0,
+                    "exit_price": 104.0,
+                    "actual_exit_price": 104.0,
+                    "hold_hours": 8.0,
+                    "pnl_pct": 4.0,
+                    "actual_direction": "up",
+                    "actual_exit_trigger": "Trailing",
+                    "regime": "trend_up",
+                    "source_type": "historical_api_replay",
+                    "recent_return_6": 1.4,
+                    "recent_return_24": 2.6,
+                    "recent_volatility": 0.45,
+                    "trend_momentum_score": 1.8,
+                    "signal_margin": 0.34,
+                    "drawdown_from_peak_pct": -0.8,
+                    "bars_in_trade": 10,
+                    "bars_since_peak": 2,
+                    "trailing_armed": True,
+                    "favorable_then_softened_flag": True,
+                }
+            )
+        candidate = {
+            "symbol": "NVDA",
+            "entry_price": 100.0,
+            "source_type": "historical_api_replay",
+            "recent_return_6": 1.2,
+            "recent_return_24": 2.4,
+            "recent_volatility": 0.42,
+            "trend_momentum_score": 1.7,
+            "signal_margin": 0.32,
+            "peak_profit_pct": 3.2,
+            "drawdown_from_peak_pct": -0.9,
+            "trailing_armed": True,
+            "favorable_then_softened_flag": True,
+            "stale_hold_profile": False,
+            "volatility_expansion_pct": 12.0,
+            "trend_decay_after_peak": -0.4,
+            "max_favorable_excursion_pct": 3.5,
+            "max_adverse_excursion_pct": -0.6,
+            "bars_since_peak": 2,
+            "bars_in_trade": 10,
+            "exit_momentum_3": 0.3,
+            "exit_momentum_6": 0.6,
+        }
+        out = _predict_one(train_rows=train_rows, candidate=candidate, regime="trend_up", market="stocks", predictor_variant="stock_pnl_quality_v2")
+        self.assertEqual(str(out.get("predicted_pnl_trend", "")), "up")
+        self.assertFalse(bool(out.get("stock_trade_quality_gate_applied", False)))
+        self.assertGreater(float(out.get("stock_pnl_quality_score", 0.0)), 0.50)
+
+    def test_stock_safe_selection_evaluates_pnl_quality_variant(self) -> None:
+        closed_rows = []
+        ts = 1_700_000_000
+        for i in range(60):
+            closed_rows.append(
+                {
+                    "symbol": "AMD",
+                    "entry_price": 100.0,
+                    "actual_exit_price": 104.0 if i % 2 == 0 else 98.0,
+                    "exit_price": 104.0 if i % 2 == 0 else 98.0,
+                    "hold_hours": 10.0 if i % 2 == 0 else 22.0,
+                    "pnl_pct": 4.0 if i % 2 == 0 else -2.0,
+                    "actual_direction": "up" if i % 2 == 0 else "down",
+                    "actual_exit_trigger": "Trailing" if i % 2 == 0 else "Stale Alignment",
+                    "source_type": "historical_api_replay",
+                    "regime": "trend_up" if i % 2 == 0 else "high_volatility",
+                    "entry_ts": ts + (i * 7200),
+                    "exit_ts": ts + (i * 7200) + 3600,
+                    "recent_return_6": 1.4 if i % 2 == 0 else 0.1,
+                    "recent_return_24": 2.4 if i % 2 == 0 else 0.4,
+                    "recent_volatility": 0.42 if i % 2 == 0 else 0.88,
+                    "trend_momentum_score": 1.6 if i % 2 == 0 else 0.2,
+                    "signal_margin": 0.32 if i % 2 == 0 else 0.08,
+                    "peak_profit_pct": 3.0 if i % 2 == 0 else 1.2,
+                    "drawdown_from_peak_pct": -0.8 if i % 2 == 0 else -2.1,
+                    "trailing_armed": bool(i % 2 == 0),
+                    "favorable_then_softened_flag": bool(i % 2 == 0),
+                    "stale_hold_profile": bool(i % 2 == 1),
+                    "bars_in_trade": 10 if i % 2 == 0 else 24,
+                    "bars_since_peak": 2 if i % 2 == 0 else 8,
+                    "max_favorable_excursion_pct": 3.5 if i % 2 == 0 else 1.0,
+                    "max_adverse_excursion_pct": -0.7 if i % 2 == 0 else -1.8,
+                    "trend_decay_after_peak": -0.3 if i % 2 == 0 else -1.1,
+                    "volatility_expansion_pct": 10.0 if i % 2 == 0 else 28.0,
+                    "exit_momentum_3": 0.4 if i % 2 == 0 else -0.8,
+                    "exit_momentum_6": 0.6 if i % 2 == 0 else -1.0,
+                }
+            )
+        payload = build_synthetic_replay_artifact("/tmp", "stocks", closed_rows)
+        safe = payload.get("stock_safe_selection", {})
+        evals = safe.get("candidate_evaluations", []) if isinstance(safe.get("candidate_evaluations", []), list) else []
+        self.assertTrue(any(str(ev.get("variant", "")) == "stock_pnl_quality_v2" for ev in evals))
+
+    def test_stock_predictor_diagnostics_emit_pnl_trend_miss_fields(self) -> None:
+        rows = [
+            {
+                "symbol": "AMD",
+                "actual_direction": "up",
+                "predicted_direction": "up",
+                "actual_exit_trigger": "Trailing",
+                "predicted_exit_trigger": "Trailing",
+                "entry_price": 100.0,
+                "exit_price": 104.0,
+                "actual_exit_price": 104.0,
+                "predicted_exit_price": 99.0,
+                "hold_hours": 20.0,
+                "recent_return_6": 0.2,
+                "recent_return_24": 0.6,
+                "recent_volatility": 0.85,
+                "max_favorable_excursion_pct": 2.2,
+                "max_adverse_excursion_pct": -1.7,
+                "drawdown_from_peak_pct": -2.1,
+                "bars_since_peak": 9,
+                "bars_in_trade": 24,
+                "trailing_armed": True,
+                "favorable_then_softened_flag": True,
+                "stale_hold_profile": True,
+                "walkforward_window_index": 2,
+                "raw_rule_reason": "trailing",
+            }
+        ]
+        diag = model_quality_pass._market_predictor_diagnostics("stocks", rows, full_rows=rows, abstained_rows=[])
+        self.assertIn("stock_pnl_trend_miss_diagnostics", diag)
+        self.assertIn("stock_weak_window_diagnostics", diag)
+        self.assertEqual(int(diag.get("stock_direction_correct_pnl_wrong_count", 0)), 1)
+        self.assertEqual(int(diag.get("stock_trigger_correct_pnl_wrong_count", 0)), 1)
+        self.assertEqual(int(diag.get("stock_direction_trigger_correct_pnl_wrong_count", 0)), 1)
+
+    def test_stock_watchlist_preview_includes_pnl_quality_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            settings = {"stock_data_provider": "alpaca"}
+            bars = []
+            base_ts = 1_700_000_000
+            price = 100.0
+            for i in range(72):
+                price *= 1.004 if i < 36 else 1.001
+                bars.append({"t": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(base_ts + (i * 3600))), "o": price, "h": price * 1.01, "l": price * 0.995, "c": price, "v": 1000})
+            fake_client = mock.Mock()
+            fake_client.get_stock_bars.return_value = list(bars)
+            with mock.patch.object(model_quality_pass, "_stock_provider_client", return_value=("alpaca", fake_client, {})):
+                warm_stock_historical_cache(hub_dir=td, base_dir=td, settings=settings, symbol="NVDA")
+                preview = build_stock_watchlist_prediction_preview(hub_dir=td, base_dir=td, settings=settings, symbol="NVDA")
+            self.assertIn("stock_pnl_quality_score", preview)
+            self.assertIn("stock_pnl_quality_reason", preview)
+            self.assertIn("stock_trade_quality_score", preview)
+            self.assertIn("trade_quality_gate_applied", preview)
+
     def test_safe_selection_falls_back_to_baseline_when_crypto_candidate_regresses(self) -> None:
         closed_rows = []
         ts = 1_700_000_000
@@ -1340,9 +1607,178 @@ class TestModelQualityPass(unittest.TestCase):
             payload = build_synthetic_replay_artifact("/tmp", "crypto", closed_rows)
         safe = payload.get("safe_selection_diagnostics", {}).get("latest", {})
         crypto_diag = payload.get("crypto_classifier_diagnostics", {})
+        recon = crypto_diag.get("candidate_vs_final_reconciliation", {})
         self.assertTrue(bool(safe.get("fallback_to_baseline", False)))
         self.assertEqual(str(safe.get("selected_predictor_variant", "")), "baseline")
         self.assertEqual(str(crypto_diag.get("exit_shape_predictive_mode", "")), "diagnostic_only")
+        self.assertEqual(str(recon.get("selected_variant_name", "")), "baseline")
+        self.assertIn("safe_selection_guardrails", str(recon.get("reason_final_metrics_differ_from_candidate_metrics", "")))
+
+    def test_crypto_candidate_vs_final_reconciliation_emitted(self) -> None:
+        closed_rows = []
+        ts = 1_700_000_000
+        for i in range(60):
+            closed_rows.append(
+                {
+                    "symbol": "BTC-USD",
+                    "entry_price": 100.0,
+                    "actual_exit_price": 98.0,
+                    "exit_price": 98.0,
+                    "hold_hours": 6.0,
+                    "pnl_pct": -2.0,
+                    "actual_direction": "down",
+                    "actual_exit_trigger": "Risk Cut",
+                    "source_type": "historical_strategy_replay",
+                    "entry_ts": ts + (i * 7200),
+                    "exit_ts": ts + (i * 7200) + 3600,
+                    "risk_cut_touched": True,
+                    "take_profit_touched": False,
+                    "trailing_armed": False,
+                    "favorable_then_softened_flag": False,
+                    "max_favorable_excursion_pct": 0.3,
+                    "max_adverse_excursion_pct": -2.2,
+                    "drawdown_from_peak_pct": -0.8,
+                    "trailing_pullback_pct": 0.0,
+                    "bars_in_trade": 6,
+                    "exit_momentum_3": -0.6,
+                    "exit_momentum_6": -0.7,
+                    "trend_momentum_score": -0.5,
+                    "recent_return_3": -0.4,
+                    "recent_return_6": -0.9,
+                    "recent_return_12": -1.3,
+                    "recent_return_24": -1.7,
+                    "signal_margin": 0.1,
+                    "label_rule_version": "historical_replay_v2",
+                    "exit_condition_priority_used": ["Risk Cut", "Take Profit", "Trailing", "Stale Alignment"],
+                    "same_candle_multi_exit_condition_count": 0,
+                }
+            )
+
+        def fake_predict(*, predictor_variant: str = "candidate", **kwargs):
+            if predictor_variant == "baseline":
+                return {
+                    "predicted_direction": "up",
+                    "predicted_exit_trigger": "Trailing",
+                    "predicted_hold_hours": 6.0,
+                    "predicted_exit_price": 102.0,
+                    "predicted_confidence": 0.8,
+                    "trigger_margin": 0.5,
+                    "direction_margin": 0.5,
+                    "predictor_source_mode": "historical_strategy_replay",
+                }
+            if predictor_variant == "candidate":
+                return {
+                    "predicted_direction": "up",
+                    "predicted_exit_trigger": "Stale Alignment",
+                    "predicted_hold_hours": 6.0,
+                    "predicted_exit_price": 101.0,
+                    "predicted_confidence": 0.55,
+                    "trigger_margin": 0.2,
+                    "direction_margin": 0.2,
+                    "predictor_source_mode": "historical_strategy_replay",
+                }
+            return {
+                "predicted_direction": "down",
+                "predicted_exit_trigger": "Risk Cut",
+                "predicted_hold_hours": 6.0,
+                "predicted_exit_price": 98.0,
+                "predicted_confidence": 0.9,
+                "trigger_margin": 1.2,
+                "direction_margin": 1.0,
+                "predictor_source_mode": "historical_strategy_replay",
+            }
+
+        with mock.patch.object(model_quality_pass, "_predict_one", side_effect=fake_predict):
+            payload = build_synthetic_replay_artifact("/tmp", "crypto", closed_rows)
+        crypto_diag = payload.get("crypto_classifier_diagnostics", {})
+        recon = crypto_diag.get("candidate_vs_final_reconciliation", {})
+        self.assertIn("candidate_variant_name", recon)
+        self.assertIn("final_scoring_variant_name", recon)
+        self.assertIn("overlap_count_between_candidate_and_final_admitted", recon)
+        self.assertIn("candidate_metrics", recon)
+        self.assertIn("final_metrics", recon)
+        self.assertIn("final_metrics_using", recon)
+
+    def test_crypto_v2_selected_final_metrics_identify_v2_rows(self) -> None:
+        closed_rows = []
+        ts = 1_700_000_000
+        for i in range(60):
+            closed_rows.append(
+                {
+                    "symbol": "ETH-USD",
+                    "entry_price": 100.0,
+                    "actual_exit_price": 98.0,
+                    "exit_price": 98.0,
+                    "hold_hours": 6.0,
+                    "pnl_pct": -2.0,
+                    "actual_direction": "down",
+                    "actual_exit_trigger": "Risk Cut",
+                    "source_type": "historical_strategy_replay",
+                    "entry_ts": ts + (i * 7200),
+                    "exit_ts": ts + (i * 7200) + 3600,
+                    "risk_cut_touched": True,
+                    "take_profit_touched": False,
+                    "trailing_armed": False,
+                    "favorable_then_softened_flag": False,
+                    "max_favorable_excursion_pct": 0.3,
+                    "max_adverse_excursion_pct": -2.2,
+                    "drawdown_from_peak_pct": -0.8,
+                    "trailing_pullback_pct": 0.0,
+                    "bars_in_trade": 6,
+                    "exit_momentum_3": -0.6,
+                    "exit_momentum_6": -0.7,
+                    "trend_momentum_score": -0.5,
+                    "recent_return_3": -0.4,
+                    "recent_return_6": -0.9,
+                    "recent_return_12": -1.3,
+                    "recent_return_24": -1.7,
+                    "signal_margin": 0.1,
+                    "label_rule_version": "historical_replay_v2",
+                    "exit_condition_priority_used": ["Risk Cut", "Take Profit", "Trailing", "Stale Alignment"],
+                    "same_candle_multi_exit_condition_count": 0,
+                }
+            )
+
+        def fake_predict(*, predictor_variant: str = "candidate", **kwargs):
+            if predictor_variant == "baseline":
+                return {
+                    "predicted_direction": "up",
+                    "predicted_exit_trigger": "Trailing",
+                    "predicted_hold_hours": 6.0,
+                    "predicted_exit_price": 102.0,
+                    "predicted_confidence": 0.8,
+                    "trigger_margin": 0.5,
+                    "direction_margin": 0.5,
+                    "predictor_source_mode": "historical_strategy_replay",
+                }
+            if predictor_variant == "candidate":
+                return {
+                    "predicted_direction": "up",
+                    "predicted_exit_trigger": "Stale Alignment",
+                    "predicted_hold_hours": 6.0,
+                    "predicted_exit_price": 101.0,
+                    "predicted_confidence": 0.55,
+                    "trigger_margin": 0.2,
+                    "direction_margin": 0.2,
+                    "predictor_source_mode": "historical_strategy_replay",
+                }
+            return {
+                "predicted_direction": "down",
+                "predicted_exit_trigger": "Risk Cut",
+                "predicted_hold_hours": 6.0,
+                "predicted_exit_price": 98.0,
+                "predicted_confidence": 0.95,
+                "trigger_margin": 1.5,
+                "direction_margin": 1.5,
+                "predictor_source_mode": "historical_strategy_replay",
+            }
+
+        with mock.patch.object(model_quality_pass, "_predict_one", side_effect=fake_predict):
+            payload = build_synthetic_replay_artifact("/tmp", "crypto", closed_rows)
+        recon = payload.get("crypto_classifier_diagnostics", {}).get("candidate_vs_final_reconciliation", {})
+        self.assertEqual(str(recon.get("selected_variant_name", "")), "label_compatible_v2")
+        self.assertIn(str(recon.get("final_scoring_variant_name", "")), {"label_compatible_v2", "mixed_selected_variants_aggregate"})
+        self.assertEqual(str((recon.get("final_metrics_using", {}) or {}).get("row_set", "")), "admitted_rows")
 
     def test_forex_safe_selection_falls_back_to_baseline(self) -> None:
         closed_rows = []
@@ -2676,6 +3112,393 @@ class TestModelQualityPass(unittest.TestCase):
             self.assertIn("risk_multiplier_recommended", promo)
             self.assertIn("eligible", rollout)
             self.assertIn("risk_multiplier_recommended", rollout)
+
+    def test_crypto_sequence_fields_are_computed_without_post_exit_candles(self) -> None:
+        artifact_ctx = {
+            "usable": True,
+            "signal_margin": 0.6,
+            "active_timeframe_count": 4,
+            "trained_artifacts_fresh": True,
+            "artifact_training_time": 1,
+            "predicted_low_boundary": 90.0,
+            "predicted_high_boundary": 120.0,
+        }
+        thresholds = {
+            "entry_signal_margin_min": 0.1,
+            "entry_trend_score_min": -10.0,
+            "entry_return6_min": -10.0,
+            "risk_cut_pct": 2.25,
+            "take_profit_pct": 4.25,
+            "trailing_arm_pct": 1.6,
+            "trailing_drawdown_pct": 1.1,
+            "stale_hold_hours": 18.0,
+            "stale_trend_score_max": 0.05,
+        }
+        candles = []
+        ts = 1_700_000_000_000
+        price = 100.0
+        for _ in range(24):
+            candles.append([ts, price, price, price * 1.002, price * 0.998, 1000.0])
+            ts += 3_600_000
+        candles.append([ts, 100.0, 100.0, 100.2, 99.8, 1000.0]); ts += 3_600_000
+        candles.append([ts, 100.0, 102.0, 102.4, 99.9, 1000.0]); ts += 3_600_000
+        candles.append([ts, 102.0, 101.7, 102.0, 97.4, 1000.0]); ts += 3_600_000
+        candles.append([ts, 101.7, 110.0, 111.0, 101.5, 1000.0]); ts += 3_600_000
+        for _ in range(24):
+            candles.append([ts, 110.0, 110.0, 110.2, 109.8, 1000.0])
+            ts += 3_600_000
+        rows = crypto_historical_replay._simulate_strategy_rows("BTC-USD", candles, artifact_ctx, "1hour", thresholds)
+        self.assertGreaterEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row.get("actual_exit_trigger"), "Risk Cut")
+        self.assertEqual(int(row.get("exit_bar", -1)), 2)
+        self.assertEqual(int(row.get("risk_cut_touched_bar", -1)), 2)
+        self.assertEqual(int(row.get("trailing_armed_bar", -1)), 1)
+        self.assertTrue(bool(row.get("risk_cut_after_trailing_arm", False)))
+        self.assertGreaterEqual(float(row.get("risk_breach_depth_pct", 0.0) or 0.0), 0.0)
+        self.assertLess(int(row.get("exit_ts", 0) or 0), int(candles[-1][0] / 1000))
+
+    def test_crypto_v3_sequence_prefers_risk_cut_before_trailing(self) -> None:
+        train_rows = []
+        for i in range(12):
+            train_rows.append(
+                {
+                    "symbol": "BTC-USD",
+                    "source_type": "historical_strategy_replay",
+                    "entry_price": 100.0,
+                    "exit_price": 97.0,
+                    "actual_exit_price": 97.0,
+                    "hold_hours": 8.0,
+                    "pnl_pct": -3.0,
+                    "actual_direction": "down",
+                    "actual_exit_trigger": "Risk Cut",
+                    "regime": "high_volatility",
+                    "strategy_adapter_used": "minimal_artifact_replay_v1",
+                    "signal_side": "long",
+                    "current_candle_pct_move": 1.6,
+                    "recent_return_3": 2.5,
+                    "recent_return_6": 2.8,
+                    "recent_return_12": 3.0,
+                    "recent_return_24": 3.1,
+                    "recent_volatility": 0.8,
+                    "trend_momentum_score": 2.7,
+                    "signal_margin": 0.52,
+                    "active_timeframe_count": 5,
+                }
+            )
+        candidate = {
+            "symbol": "BTC-USD",
+            "source_type": "historical_strategy_replay",
+            "entry_price": 100.0,
+            "strategy_adapter_used": "minimal_artifact_replay_v1",
+            "signal_side": "long",
+            "current_candle_pct_move": 1.5,
+            "recent_return_3": 2.6,
+            "recent_return_6": 2.7,
+            "recent_return_12": 2.9,
+            "recent_return_24": 3.0,
+            "recent_volatility": 0.78,
+            "trend_momentum_score": 2.6,
+            "signal_margin": 0.51,
+            "active_timeframe_count": 5,
+            "risk_cut_touched": True,
+            "trailing_armed": True,
+            "favorable_then_softened_flag": True,
+            "risk_cut_before_trailing": True,
+            "risk_breach_depth_pct": 0.8,
+            "exit_close_position_in_candle_range": 0.12,
+            "max_adverse_excursion_pct": -2.8,
+            "max_favorable_excursion_pct": 2.4,
+            "drawdown_from_peak_pct": -2.1,
+            "trailing_pullback_pct": 2.1,
+            "bars_in_trade": 8,
+            "exit_momentum_3": -1.9,
+            "exit_momentum_6": -2.2,
+        }
+        out = _predict_one(train_rows=train_rows, candidate=candidate, regime="high_volatility", market="crypto", predictor_variant="label_compatible_v3_sequence")
+        self.assertEqual(str(out.get("predicted_exit_trigger", "")), "Risk Cut")
+        self.assertTrue(bool(out.get("risk_trailing_resolver_applied", False)))
+
+    def test_crypto_v3_sequence_prefers_trailing_before_risk_without_breach(self) -> None:
+        train_rows = []
+        for i in range(12):
+            train_rows.append(
+                {
+                    "symbol": "ETH-USD",
+                    "source_type": "historical_strategy_replay",
+                    "entry_price": 100.0,
+                    "exit_price": 103.0,
+                    "actual_exit_price": 103.0,
+                    "hold_hours": 10.0,
+                    "pnl_pct": 3.0,
+                    "actual_direction": "up",
+                    "actual_exit_trigger": "Trailing",
+                    "regime": "high_volatility",
+                    "strategy_adapter_used": "minimal_artifact_replay_v1",
+                    "signal_side": "long",
+                    "current_candle_pct_move": 1.2,
+                    "recent_return_3": 2.0,
+                    "recent_return_6": 2.2,
+                    "recent_return_12": 2.4,
+                    "recent_return_24": 2.6,
+                    "recent_volatility": 0.58,
+                    "trend_momentum_score": 2.2,
+                    "signal_margin": 0.42,
+                    "active_timeframe_count": 5,
+                }
+            )
+        candidate = {
+            "symbol": "ETH-USD",
+            "source_type": "historical_strategy_replay",
+            "entry_price": 100.0,
+            "strategy_adapter_used": "minimal_artifact_replay_v1",
+            "signal_side": "long",
+            "current_candle_pct_move": 1.1,
+            "recent_return_3": 2.1,
+            "recent_return_6": 2.2,
+            "recent_return_12": 2.4,
+            "recent_return_24": 2.5,
+            "recent_volatility": 0.56,
+            "trend_momentum_score": 2.15,
+            "signal_margin": 0.41,
+            "active_timeframe_count": 5,
+            "risk_cut_touched": False,
+            "trailing_armed": True,
+            "favorable_then_softened_flag": True,
+            "trailing_before_risk_cut": True,
+            "trailing_valid_before_risk": True,
+            "risk_breach_depth_pct": 0.0,
+            "exit_close_position_in_candle_range": 0.62,
+            "max_adverse_excursion_pct": -0.6,
+            "max_favorable_excursion_pct": 3.2,
+            "drawdown_from_peak_pct": -1.4,
+            "trailing_pullback_pct": 1.4,
+            "bars_in_trade": 10,
+            "exit_momentum_3": -0.6,
+            "exit_momentum_6": -0.8,
+        }
+        out = _predict_one(train_rows=train_rows, candidate=candidate, regime="high_volatility", market="crypto", predictor_variant="label_compatible_v3_sequence")
+        self.assertEqual(str(out.get("predicted_exit_trigger", "")), "Trailing")
+
+    def test_stock_ticker_normalization_and_manual_watchlist_storage(self) -> None:
+        self.assertEqual(_normalize_stock_ticker(" nvda "), "NVDA")
+        self.assertEqual(_normalize_stock_ticker("brk.b!"), "BRK.B")
+        with tempfile.TemporaryDirectory() as td:
+            settings = {"stock_universe_symbols": "AAPL"}
+            add_stock_to_manual_watchlist(hub_dir=td, settings=settings, symbol="nvda", validation_provider="alpaca")
+            add_stock_to_manual_watchlist(hub_dir=td, settings=settings, symbol="NVDA", validation_provider="alpaca")
+            payload = self._write_and_read(os.path.join(td, "stocks", "manual_watchlist.json"))
+            self.assertIn("NVDA", payload.get("symbols", {}))
+            self.assertEqual(settings.get("stock_universe_symbols"), "AAPL,NVDA")
+
+    def test_validate_stock_symbol_handles_invalid_without_crashing(self) -> None:
+        with mock.patch.object(model_quality_pass, "_stock_provider_client", return_value=("alpaca", mock.Mock(get_stock_bars=lambda *a, **k: [], list_tradable_assets=lambda: []), {})):
+            out = validate_stock_watchlist_symbol(symbol="bad$", settings={}, base_dir="/tmp")
+        self.assertEqual(out.get("symbol"), "BAD")
+        self.assertFalse(bool(out.get("valid", False)))
+
+    def test_targeted_stock_warmup_and_preview_use_existing_cache_path(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            settings = {"stock_data_provider": "alpaca"}
+            bars = []
+            base_ts = 1_700_000_000
+            price = 100.0
+            for i in range(72):
+                if i < 30:
+                    price *= 1.004
+                else:
+                    price *= 0.998
+                bars.append({"t": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(base_ts + (i * 3600))), "o": price, "h": price * 1.01, "l": price * 0.995, "c": price, "v": 1000})
+            fake_client = mock.Mock()
+            fake_client.get_stock_bars.return_value = list(bars)
+            with mock.patch.object(model_quality_pass, "_stock_provider_client", return_value=("alpaca", fake_client, {})):
+                warm = warm_stock_historical_cache(hub_dir=td, base_dir=td, settings=settings, symbol="NVDA")
+                preview = build_stock_watchlist_prediction_preview(hub_dir=td, base_dir=td, settings=settings, symbol="NVDA")
+            self.assertEqual(warm.get("warmup_status"), "ready")
+            self.assertTrue(str(warm.get("cache_path", "")).endswith("stocks/historical_replay_cache"))
+            self.assertTrue(os.path.exists(os.path.join(td, "stocks", "historical_replay_cache", "NVDA_1Hour.json")))
+            self.assertIn("stock_readiness", preview)
+            self.assertTrue(os.path.exists(os.path.join(td, "stocks", "watchlist_previews", "NVDA.json")))
+
+    def test_stock_provider_failure_is_non_fatal_and_insufficient_history_blocks_trade(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            settings = {"stock_data_provider": "alpaca"}
+            fake_client = mock.Mock()
+            fake_client.get_stock_bars.side_effect = RuntimeError("provider down")
+            with mock.patch.object(model_quality_pass, "_stock_provider_client", return_value=("alpaca", fake_client, {})):
+                warm = warm_stock_historical_cache(hub_dir=td, base_dir=td, settings=settings, symbol="NVDA")
+            self.assertEqual(warm.get("warmup_status"), "provider_error")
+            preview = build_stock_watchlist_prediction_preview(hub_dir=td, base_dir=td, settings=settings, symbol="NVDA")
+            self.assertFalse(bool(preview.get("manual_watchlist_trade_eligible", False)))
+            self.assertIn("insufficient_history", list(preview.get("manual_watchlist_trade_blockers", []) or []))
+
+    def test_build_legacy_trade_model_replay_replays_stock_trade_with_pre_entry_bars_only(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            self._write_jsonl(
+                os.path.join(td, "stocks", "execution_audit.jsonl"),
+                [
+                    {
+                        "ts": 1_700_000_000,
+                        "event": "entry",
+                        "symbol": "NVDA",
+                        "qty": 2.0,
+                        "price": 100.0,
+                        "ok": True,
+                    },
+                    {
+                        "ts": 1_700_003_600,
+                        "event": "exit",
+                        "symbol": "NVDA",
+                        "qty": 2.0,
+                        "price": 104.0,
+                        "ok": True,
+                        "tag": "Trailing",
+                    },
+                ],
+            )
+            bars = []
+            base_ts = 1_700_000_000 - (25 * 3600)
+            price = 90.0
+            for i in range(26):
+                price += 0.44
+                bars.append(
+                    {
+                        "t": base_ts + (i * 3600),
+                        "o": round(price - 0.25, 4),
+                        "h": round(price + 0.5, 4),
+                        "l": round(price - 0.5, 4),
+                        "c": round(price, 4),
+                        "v": 1000,
+                    }
+                )
+            bars.append(
+                {
+                    "t": 1_700_000_000 + 3600,
+                    "o": 101.0,
+                    "h": 150.0,
+                    "l": 100.5,
+                    "c": 140.0,
+                    "v": 1000,
+                }
+            )
+            cache_path = os.path.join(td, "stocks", "historical_replay_cache", "NVDA_1Hour.json")
+            self._write_json(cache_path, {"bars": bars})
+            seen: dict[str, object] = {}
+
+            def _fake_predict(*, train_rows, candidate, regime, market, predictor_variant):
+                seen["candidate"] = dict(candidate)
+                return {
+                    "predicted_direction": "flat",
+                    "predicted_exit_trigger": "Trailing",
+                    "predicted_pnl_trend": "flat",
+                    "predicted_confidence": 0.91,
+                    "direction_scores": {"up": 0.91, "down": 0.09},
+                    "trigger_scores": {"Trailing": 0.81, "Stale Alignment": 0.19},
+                    "stock_trade_quality_score": 0.77,
+                }
+
+            with mock.patch("app.model_quality_pass._predict_one", side_effect=_fake_predict):
+                with mock.patch("app.model_quality_pass._calibrate_abstain_threshold", return_value={"threshold": 0.60, "coverage": 1.0, "metrics": {}}):
+                    out = build_legacy_trade_model_replay(hub_dir=td, base_dir=td, settings={})
+
+            self.assertEqual(int(out.get("legacy_rows_found", 0)), 1)
+            self.assertEqual(int(out.get("legacy_rows_replayed", 0)), 1)
+            self.assertTrue(bool(out.get("legacy_trade_model_replay_used_as_supplemental")))
+            sample = list(out.get("row_samples", []) or [])[0]
+            self.assertIn("replayed_predicted_direction", sample)
+            self.assertIn("replayed_take_trade", sample)
+            self.assertEqual(sample.get("timestamp_quality"), "single_timestamp_inferred_entry")
+            self.assertTrue(bool(sample.get("direction_correct")))
+            self.assertTrue(bool(sample.get("pnl_trend_correct")))
+            self.assertTrue(bool(sample.get("trigger_match")))
+            candidate = seen.get("candidate", {}) if isinstance(seen.get("candidate", {}), dict) else {}
+            self.assertEqual(candidate.get("source_type"), "legacy_trade_model_replay")
+            self.assertAlmostEqual(float(candidate.get("entry_price", 0.0) or 0.0), float(bars[25]["c"]), places=6)
+            self.assertNotIn("predicted_direction", sample)
+
+    def test_build_legacy_trade_model_replay_reports_ineligible_forex_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            legacy_payload = {
+                "rows": [
+                    {
+                        "market": "forex",
+                        "symbol": "EUR_USD",
+                        "side": "long",
+                        "entry_ts": 1_700_000_000,
+                        "exit_ts": 1_700_003_600,
+                        "entry_price": 1.0,
+                        "exit_price": 1.01,
+                        "hold_hours": 1.0,
+                        "pnl_pct": 1.0,
+                        "legacy_trade_id": "fx-1",
+                        "timestamp_quality": "derived_from_exit_hold",
+                    }
+                ],
+                "raw_rows_found": 1,
+                "normalized_rows_found": 1,
+                "rows_by_market": {"forex": 1},
+                "timestamp_quality_summary": {"derived_from_exit_hold": 1},
+                "field_coverage": {"entry_ts": 1, "exit_ts": 1, "entry_price": 1, "exit_price": 1, "pnl_usd": 0, "pnl_pct": 1, "qty": 0, "score": 0, "calib_prob": 0, "required_score": 0},
+                "source_files_used": [os.path.join(td, "forex", "execution_audit.jsonl")],
+            }
+            with mock.patch("app.model_quality_pass._normalize_legacy_completed_trades", return_value=legacy_payload):
+                out = build_legacy_trade_model_replay(hub_dir=td, base_dir=td, settings={})
+            self.assertEqual(int(out.get("legacy_rows_found", 0)), 1)
+            self.assertEqual(int(out.get("legacy_rows_replayed", 0)), 0)
+            self.assertEqual(int(out.get("legacy_rows_replay_eligible", 0)), 0)
+            self.assertEqual(int(out.get("ineligible_reasons", {}).get("historical_forex_feature_replay_not_supported", 0)), 1)
+            self.assertEqual(int(out.get("timestamp_quality_summary", {}).get("derived_from_exit_hold", 0)), 1)
+
+    def test_run_model_quality_full_pass_includes_legacy_trade_replay_as_supplemental(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            legacy_payload = {
+                "status": "ok",
+                "legacy_rows_found": 12,
+                "legacy_rows_replayed": 7,
+                "legacy_trade_model_replay_used_as_primary": False,
+                "legacy_trade_model_replay_used_as_supplemental": True,
+                "model_at_entry_replay_metrics": {"rows": 7},
+            }
+            with mock.patch("app.model_quality_pass.load_market_trade_events", return_value={"events": []}):
+                with mock.patch("app.model_quality_pass.build_closed_trades", return_value={"closed_trades": []}):
+                    with mock.patch("app.model_quality_pass.build_crypto_historical_strategy_replay", return_value={"state": "READY", "rows": [], "diagnostics": {"historical_strategy_replay_rows": 0, "historical_strategy_replay_symbols": []}}):
+                        with mock.patch("app.model_quality_pass.build_all_market_regimes", return_value={}):
+                            with mock.patch("app.model_quality_pass.build_walkforward_report", return_value={}):
+                                with mock.patch("app.model_quality_pass.build_confidence_calibration_payload", return_value={}):
+                                    with mock.patch("app.model_quality_pass.build_shadow_scorecards", return_value={}):
+                                        with mock.patch("app.model_quality_pass.build_legacy_trade_model_replay", return_value=legacy_payload):
+                                            out = run_model_quality_full_pass(base_dir=td, hub_dir=td, settings={})
+            self.assertEqual(out.get("legacy_trade_model_replay", {}).get("legacy_rows_found"), 12)
+            self.assertFalse(bool(out.get("legacy_trade_model_replay_used_as_primary")))
+            self.assertTrue(bool(out.get("legacy_trade_model_replay_used_as_supplemental")))
+            self.assertEqual(out.get("replay_generation", {}).get("crypto", {}).get("model_quality_primary_source_used"), "closed_trade_only")
+
+    def test_run_model_quality_full_pass_reports_legacy_primary_flag_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            legacy_payload = {
+                "status": "ok",
+                "legacy_rows_found": 12,
+                "legacy_rows_replayed": 7,
+                "legacy_trade_model_replay_used_as_primary": True,
+                "legacy_trade_model_replay_used_as_supplemental": True,
+                "model_at_entry_replay_metrics": {"rows": 7},
+            }
+            with mock.patch.dict(os.environ, {"MODEL_QUALITY_USE_LEGACY_REPLAY_AS_PRIMARY": "1"}, clear=False):
+                with mock.patch("app.model_quality_pass.load_market_trade_events", return_value={"events": []}):
+                    with mock.patch("app.model_quality_pass.build_closed_trades", return_value={"closed_trades": []}):
+                        with mock.patch("app.model_quality_pass.build_crypto_historical_strategy_replay", return_value={"state": "READY", "rows": [], "diagnostics": {"historical_strategy_replay_rows": 0, "historical_strategy_replay_symbols": []}}):
+                            with mock.patch("app.model_quality_pass.build_all_market_regimes", return_value={}):
+                                with mock.patch("app.model_quality_pass.build_walkforward_report", return_value={}):
+                                    with mock.patch("app.model_quality_pass.build_confidence_calibration_payload", return_value={}):
+                                        with mock.patch("app.model_quality_pass.build_shadow_scorecards", return_value={}):
+                                            with mock.patch("app.model_quality_pass.build_legacy_trade_model_replay", return_value=legacy_payload):
+                                                out = run_model_quality_full_pass(base_dir=td, hub_dir=td, settings={})
+            self.assertTrue(bool(out.get("legacy_trade_model_replay_used_as_primary")))
+            self.assertTrue(bool(out.get("legacy_trade_model_replay_used_as_supplemental")))
+
+    def _write_and_read(self, path: str) -> dict:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
 
 
 if __name__ == "__main__":
