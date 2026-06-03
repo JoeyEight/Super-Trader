@@ -17,6 +17,7 @@ import signal
 import zipfile
 import re
 import hashlib
+from collections import deque
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -5649,6 +5650,7 @@ class PowerTraderHub(tk.Tk):
             "coin",
             "projection",
             "score",
+            "horizon",
             "entry",
             "exit",
             "gain",
@@ -5662,6 +5664,7 @@ class PowerTraderHub(tk.Tk):
             "coin": "Coin",
             "projection": "Projection",
             "score": "Score",
+            "horizon": "Horizon",
             "entry": "Proj Entry",
             "exit": "Proj Exit",
             "gain": "Pred Move",
@@ -5675,6 +5678,7 @@ class PowerTraderHub(tk.Tk):
             "coin": 70,
             "projection": 118,
             "score": 90,
+            "horizon": 92,
             "entry": 110,
             "exit": 110,
             "gain": 96,
@@ -6787,11 +6791,12 @@ class PowerTraderHub(tk.Tk):
         watch_wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         watch_wrap.columnconfigure(0, weight=1)
         watch_wrap.rowconfigure(1, weight=1)
-        watch_cols = ("symbol", "projection", "score", "entry", "exit", "gain", "sell_in", "status", "why", "logic", "trigger")
+        watch_cols = ("symbol", "projection", "score", "horizon", "entry", "exit", "gain", "sell_in", "status", "why", "logic", "trigger")
         watch_headings = {
             "symbol": ("Pair" if market_key == "forex" else "Symbol"),
             "projection": "Projection",
             "score": "Score",
+            "horizon": "Horizon",
             "entry": "Proj Entry",
             "exit": "Proj Exit",
             "gain": "Pred Move",
@@ -6805,6 +6810,7 @@ class PowerTraderHub(tk.Tk):
             "symbol": 92,
             "projection": 118,
             "score": 92,
+            "horizon": 92,
             "entry": 110,
             "exit": 110,
             "gain": 96,
@@ -8193,6 +8199,9 @@ class PowerTraderHub(tk.Tk):
             return {
                 "columns": (
                     "symbol",
+                    "projection",
+                    "score",
+                    "horizon",
                     "side",
                     "qty",
                     "value",
@@ -8202,11 +8211,15 @@ class PowerTraderHub(tk.Tk):
                     "ask_price",
                     "day_pct",
                     "qty_available",
+                    "pred_move",
                     "expected_sell",
                     "exit_trigger",
                 ),
                 "headings": {
                     "symbol": "Symbol",
+                    "projection": "Projection",
+                    "score": "Score",
+                    "horizon": "Horizon",
                     "side": "Side",
                     "qty": "Qty",
                     "value": "Value",
@@ -8216,11 +8229,15 @@ class PowerTraderHub(tk.Tk):
                     "ask_price": "Ask/Mark",
                     "day_pct": "Day %",
                     "qty_available": "Avail",
+                    "pred_move": "Pred Move",
                     "expected_sell": "Est Sell By",
                     "exit_trigger": "Exit Trigger",
                 },
                 "widths": {
                     "symbol": 110,
+                    "projection": 118,
+                    "score": 96,
+                    "horizon": 92,
                     "side": 78,
                     "qty": 96,
                     "value": 110,
@@ -8230,10 +8247,12 @@ class PowerTraderHub(tk.Tk):
                     "ask_price": 100,
                     "day_pct": 92,
                     "qty_available": 96,
+                    "pred_move": 96,
                     "expected_sell": 170,
                     "exit_trigger": 130,
                 },
                 "numeric_cols": {
+                    "score",
                     "qty",
                     "value",
                     "unrealized_usd",
@@ -8242,12 +8261,16 @@ class PowerTraderHub(tk.Tk):
                     "ask_price",
                     "day_pct",
                     "qty_available",
+                    "pred_move",
                 },
-                "center_cols": {"side"},
+                "center_cols": {"projection", "horizon", "side"},
             }
         return {
             "columns": (
                 "pair",
+                "projection",
+                "score",
+                "horizon",
                 "side",
                 "units",
                 "value",
@@ -8259,11 +8282,15 @@ class PowerTraderHub(tk.Tk):
                 "margin",
                 "financing",
                 "trades",
+                "pred_move",
                 "expected_sell",
                 "exit_trigger",
             ),
             "headings": {
                 "pair": "Pair",
+                "projection": "Projection",
+                "score": "Score",
+                "horizon": "Horizon",
                 "side": "Side",
                 "units": "Units",
                 "value": "Value",
@@ -8275,11 +8302,15 @@ class PowerTraderHub(tk.Tk):
                 "margin": "Margin",
                 "financing": "Financing",
                 "trades": "Trades",
+                "pred_move": "Pred Move",
                 "expected_sell": "Est Sell By",
                 "exit_trigger": "Exit Trigger",
             },
             "widths": {
                 "pair": 112,
+                "projection": 118,
+                "score": 96,
+                "horizon": 92,
                 "side": 78,
                 "units": 88,
                 "value": 112,
@@ -8291,11 +8322,12 @@ class PowerTraderHub(tk.Tk):
                 "margin": 110,
                 "financing": 112,
                 "trades": 82,
+                "pred_move": 96,
                 "expected_sell": 170,
                 "exit_trigger": 130,
             },
-            "numeric_cols": {"units", "value", "notional_usd", "unrealized_usd", "realized_usd", "avg_cost", "ask_price", "margin", "financing", "trades"},
-            "center_cols": {"side"},
+            "numeric_cols": {"score", "units", "value", "notional_usd", "unrealized_usd", "realized_usd", "avg_cost", "ask_price", "margin", "financing", "trades", "pred_move"},
+            "center_cols": {"projection", "horizon", "side"},
         }
 
     @staticmethod
@@ -8530,6 +8562,10 @@ class PowerTraderHub(tk.Tk):
                     realized_f = None
                 quote_row = quote_map.get(symbol, {}) if isinstance(quote_map.get(symbol, {}), dict) else {}
                 signal_row = signal_map.get(symbol, {}) if isinstance(signal_map.get(symbol, {}), dict) else {}
+                projection = self._market_position_projection_summary(
+                    side=raw_row.get("side", "LONG"),
+                    signal_row=signal_row,
+                )
                 try:
                     model_score_f = float(signal_row.get("score", 0.0) or 0.0)
                 except Exception:
@@ -8643,6 +8679,9 @@ class PowerTraderHub(tk.Tk):
                 display_rows.append(
                     {
                         "symbol": symbol,
+                        "projection": str(projection.get("projection", "Neutral") or "Neutral"),
+                        "score": str(projection.get("score", "N/A") or "N/A"),
+                        "horizon": str(projection.get("horizon", "Signal") or "Signal"),
                         "side": str(raw_row.get("side", "LONG") or "LONG").strip().upper(),
                         "qty": self._market_fmt_num(qty_f, 6),
                         "value": self._market_fmt_money(value_f, 2),
@@ -8652,6 +8691,7 @@ class PowerTraderHub(tk.Tk):
                         "ask_price": _fmt_price(ask_f) if ask_f > 0.0 else (_fmt_price(mark_f) if mark_f > 0.0 else "N/A"),
                         "day_pct": self._market_fmt_ratio_pct(day_pct_f, 2),
                         "qty_available": self._market_fmt_num(avail_f, 6),
+                        "pred_move": str(projection.get("pred_move", "N/A") or "N/A"),
                         "expected_sell": str(expected_sell.get("label", "TBD") or "TBD"),
                         "_expected_sell_rule": str(expected_sell.get("rule", "") or "").strip(),
                         "exit_trigger": str(exit_trigger.get("label", "On Signal") or "On Signal"),
@@ -8748,6 +8788,11 @@ class PowerTraderHub(tk.Tk):
                         base_ccy = ""
                         quote_ccy = ""
                 quote_row = quote_map.get(pair, {}) if isinstance(quote_map.get(pair, {}), dict) else {}
+                signal_row = signal_map.get(pair, {}) if isinstance(signal_map.get(pair, {}), dict) else {}
+                projection = self._market_position_projection_summary(
+                    side=side,
+                    signal_row=signal_row,
+                )
                 try:
                     last_price_f = float(quote_row.get("last", 0.0) or 0.0)
                 except Exception:
@@ -8818,6 +8863,9 @@ class PowerTraderHub(tk.Tk):
                 display_rows.append(
                     {
                         "pair": pair,
+                        "projection": str(projection.get("projection", "Neutral") or "Neutral"),
+                        "score": str(projection.get("score", "N/A") or "N/A"),
+                        "horizon": str(projection.get("horizon", "Signal") or "Signal"),
                         "side": side,
                         "units": self._market_fmt_num(units_f, 0),
                         "value": value_txt,
@@ -8829,6 +8877,7 @@ class PowerTraderHub(tk.Tk):
                         "margin": f"{self._market_fmt_num(margin_f, 4)} {acct_ccy}".strip(),
                         "financing": f"{self._market_fmt_signed_money(financing_f, 4)} {acct_ccy}".strip(),
                         "trades": str(len(trade_ids)),
+                        "pred_move": str(projection.get("pred_move", "N/A") or "N/A"),
                         "expected_sell": str(expected_sell.get("label", "TBD") or "TBD"),
                         "_expected_sell_rule": str(expected_sell.get("rule", "") or "").strip(),
                         "exit_trigger": str(exit_trigger.get("label", "On Signal") or "On Signal"),
@@ -8889,7 +8938,7 @@ class PowerTraderHub(tk.Tk):
             return DARK_MUTED
         if txt.upper() == "N/A":
             return DARK_MUTED
-        signed_cols = {"unrealized_usd", "realized_usd", "day_pct", "financing"}
+        signed_cols = {"score", "pred_move", "unrealized_usd", "realized_usd", "day_pct", "financing"}
         if mk == "stocks":
             signed_cols.add("day_pct")
         if col_key in signed_cols:
@@ -8908,7 +8957,10 @@ class PowerTraderHub(tk.Tk):
         weight = "bold" if str(col or "").strip().lower() in {
             "symbol",
             "pair",
+            "projection",
             "side",
+            "score",
+            "pred_move",
             "unrealized_usd",
             "realized_usd",
             "day_pct",
@@ -9969,10 +10021,90 @@ class PowerTraderHub(tk.Tk):
             return f"{int(round(est_days * 24.0))}h"
         return f"{est_days:.1f}d"
 
+    def _market_position_projection_summary(
+        self,
+        *,
+        side: Any,
+        signal_row: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        row = signal_row if isinstance(signal_row, dict) else {}
+        score_f = _float_or_none(row.get("score", None))
+        chg6_f = _float_or_none(row.get("change_6h_pct", None))
+        chg24_f = _float_or_none(row.get("change_24h_pct", None))
+        calib_prob = _float_or_none(
+            row.get("calibration_effective_prob", row.get("calib_prob", None)),
+        )
+        has_signal = any(
+            value is not None and math.isfinite(float(value)) and abs(float(value)) > 1e-9
+            for value in (score_f, chg6_f, chg24_f)
+        ) or (calib_prob is not None and math.isfinite(float(calib_prob)) and float(calib_prob) > 0.0)
+        if not has_signal:
+            return {
+                "projection": "Neutral",
+                "score": "N/A",
+                "pred_move": "N/A",
+                "_pred_move_f": 0.0,
+            }
+        conf_txt = str(row.get("confidence", "") or "").strip().upper()
+        conf_mult = 0.65
+        if conf_txt == "HIGH":
+            conf_mult = 1.0
+        elif conf_txt in {"MED", "MEDIUM"}:
+            conf_mult = 0.8
+        elif conf_txt == "LOW":
+            conf_mult = 0.6
+        elif calib_prob is not None:
+            conf_mult = max(0.55, min(1.0, float(calib_prob)))
+
+        score_component = float(score_f or 0.0) * 0.22
+        score_component = max(-2.5, min(2.5, score_component))
+        drift_component = 0.0
+        if chg6_f is not None:
+            drift_component += float(chg6_f) / 6.0
+        if chg24_f is not None:
+            if chg6_f is not None:
+                drift_component = (drift_component * 0.65) + ((float(chg24_f) / 24.0) * 0.35)
+            else:
+                drift_component += float(chg24_f) / 24.0
+        projected_move_pct = (score_component + drift_component) * conf_mult
+        projected_move_pct = max(-3.5, min(3.5, projected_move_pct))
+
+        if projected_move_pct >= 0.05:
+            projection_label = "Upward"
+        elif projected_move_pct <= -0.05:
+            projection_label = "Downward"
+        else:
+            bias_probe = 0.0
+            if score_f is not None:
+                bias_probe = float(score_f)
+            elif chg6_f is not None:
+                bias_probe = float(chg6_f)
+            elif chg24_f is not None:
+                bias_probe = float(chg24_f)
+            projection_label = self._projection_direction_label(side, bias_probe)
+
+        if score_f is not None and math.isfinite(float(score_f)):
+            score_txt = f"{float(score_f):+.4f}"
+        elif calib_prob is not None and math.isfinite(float(calib_prob)):
+            score_txt = f"{float(calib_prob):+.4f}"
+        else:
+            score_txt = "N/A"
+
+        move_txt = f"{projected_move_pct:+.2f}%" if math.isfinite(float(projected_move_pct)) else "N/A"
+        return {
+            "projection": projection_label,
+            "score": score_txt,
+            "pred_move": move_txt,
+            "horizon": "Next 1h",
+            "_pred_move_f": float(projected_move_pct),
+        }
+
     def _stock_manual_watchlist_rows(self, limit: int = 20) -> List[Dict[str, str]]:
         out: List[Dict[str, str]] = []
         trader_gate_reason = ""
         market_closed = False
+        thinker_row_map: Dict[str, Dict[str, Any]] = {}
+        rejected_row_map: Dict[str, Dict[str, Any]] = {}
         try:
             trader_path = str((self.market_trader_paths or {}).get("stocks", "") or "").strip()
         except Exception:
@@ -9989,6 +10121,33 @@ class PowerTraderHub(tk.Tk):
             ai_state = str(thinker_row.get("ai_state", "") or "").strip().lower()
             msg = str(thinker_row.get("msg", "") or "").strip().lower()
             market_closed = bool(thinker_row.get("market_open") is False) or ("market closed" in ai_state) or ("market closed" in msg)
+            for key in ("leaders", "all_scores"):
+                rows = thinker_row.get(key, [])
+                if not isinstance(rows, list):
+                    continue
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    ident = str(row.get("symbol", "") or "").strip().upper()
+                    if ident and ident not in thinker_row_map:
+                        thinker_row_map[ident] = row
+            top_pick = thinker_row.get("top_pick", {})
+            if isinstance(top_pick, dict):
+                ident = str(top_pick.get("symbol", "") or "").strip().upper()
+                if ident and ident not in thinker_row_map:
+                    thinker_row_map[ident] = dict(top_pick)
+            rejected_rows = thinker_row.get("rejected", [])
+            if isinstance(rejected_rows, list):
+                for row in rejected_rows:
+                    if not isinstance(row, dict):
+                        continue
+                    ident = str(row.get("symbol", "") or "").strip().upper()
+                    if ident and ident not in rejected_row_map:
+                        rejected_row_map[ident] = dict(row)
+        try:
+            profit_target_pct = float(self.settings.get("stock_profit_target_pct", 0.0) or 0.0)
+        except Exception:
+            profit_target_pct = 0.0
         try:
             payload = _safe_read_json(self.stock_manual_watchlist_path) or {}
             symbols_map = payload.get("symbols", {}) if isinstance(payload.get("symbols", {}), dict) else {}
@@ -10002,6 +10161,19 @@ class PowerTraderHub(tk.Tk):
             readiness = preview.get("stock_readiness", {}) if isinstance(preview.get("stock_readiness", {}), dict) else {}
             blockers = [str(x or "").strip() for x in list(readiness.get("trade_blockers", []) or []) if str(x or "").strip()]
             eligible = bool(readiness.get("trade_eligible", False))
+            live_row = thinker_row_map.get(ident, {}) if isinstance(thinker_row_map.get(ident, {}), dict) else {}
+            rejected_row = rejected_row_map.get(ident, {}) if isinstance(rejected_row_map.get(ident, {}), dict) else {}
+            live_side = str(live_row.get("side", "watch") or "watch").strip().upper()
+            live_score: Optional[float] = None
+            try:
+                live_score = float(live_row.get("score", 0.0) or 0.0)
+            except Exception:
+                live_score = None
+            live_score_outlier = False
+            if live_score is not None:
+                if (not math.isfinite(live_score)) or abs(float(live_score)) > 100.0:
+                    live_score_outlier = True
+            live_eligible = bool(live_row.get("eligible_for_entry", False)) and live_side in {"LONG", "SHORT"}
             direction = str(preview.get("predicted_direction", "") or "").strip().lower()
             pnl_trend = str(preview.get("predicted_pnl_trend", "") or "").strip().lower()
             direction_label = "Neutral"
@@ -10024,55 +10196,186 @@ class PowerTraderHub(tk.Tk):
                 projected_move_pct = projected_move_pct
             elif direction == "down":
                 projected_move_pct = -projected_move_pct
+            live_last_price = 0.0
+            live_change_6h_pct = 0.0
+            live_change_24h_pct = 0.0
+            live_calib_prob = 0.0
+            if live_row:
+                try:
+                    live_last_price = float(live_row.get("last", 0.0) or 0.0)
+                except Exception:
+                    live_last_price = 0.0
+                try:
+                    live_change_6h_pct = float(live_row.get("change_6h_pct", 0.0) or 0.0)
+                except Exception:
+                    live_change_6h_pct = 0.0
+                try:
+                    live_change_24h_pct = float(live_row.get("change_24h_pct", 0.0) or 0.0)
+                except Exception:
+                    live_change_24h_pct = 0.0
+                try:
+                    live_calib_prob = float(live_row.get("calibration_effective_prob", live_row.get("calib_prob", 0.0)) or 0.0)
+                except Exception:
+                    live_calib_prob = 0.0
             runtime_gate_reason = ""
             if eligible and market_closed:
                 runtime_gate_reason = "Market closed; new stock entries pause until the next session."
             elif eligible and trader_gate_reason:
                 runtime_gate_reason = trader_gate_reason
+            if live_eligible and market_closed:
+                runtime_gate_reason = "Market closed; new stock entries pause until the next session."
+            elif live_eligible and trader_gate_reason:
+                runtime_gate_reason = trader_gate_reason
+            live_status_txt = ""
+            if live_row and (not live_score_outlier):
+                if live_eligible:
+                    live_status_txt = "MANUAL / EXECUTION GATED" if runtime_gate_reason else "MANUAL / ENTRY READY"
+                elif live_side in {"LONG", "SHORT"}:
+                    live_status_txt = "MANUAL / ENTRY GATED"
+                else:
+                    live_status_txt = "MANUAL / WATCH ONLY"
             status_txt = (
-                "MANUAL / EXECUTION GATED"
-                if (eligible and runtime_gate_reason)
+                live_status_txt
+                if live_status_txt
                 else (
-                    "MANUAL / ENTRY READY"
-                    if eligible
+                    "MANUAL / EXECUTION GATED"
+                    if (eligible and runtime_gate_reason)
                     else (
-                        "MANUAL / PREVIEW READY"
-                        if bool(preview)
+                        "MANUAL / ENTRY READY"
+                        if eligible
                         else (
-                            "MANUAL / WARMING"
-                            if str((meta or {}).get("historical_warmup_status", "") or "").strip().lower() != "ready"
-                            else "MANUAL / PENDING"
+                            "MANUAL / PREVIEW READY"
+                            if bool(preview)
+                            else (
+                                "MANUAL / WARMING"
+                                if str((meta or {}).get("historical_warmup_status", "") or "").strip().lower() != "ready"
+                                else "MANUAL / PENDING"
+                            )
                         )
                     )
                 )
             )
-            why_txt = runtime_gate_reason or (", ".join(blockers[:3]) if blockers else "Manually added to watchlist.")
-            logic_txt = str(preview.get("stock_pnl_quality_reason", "") or "").strip() or str(preview.get("explanation", "") or "").strip()
-            trigger_txt = str(preview.get("predicted_exit_trigger", "Preview pending") or "Preview pending")
-            if runtime_gate_reason:
-                trigger_txt = runtime_gate_reason
-            sell_in_txt = "On signal"
-            if bool(preview):
+            if live_row and (not live_score_outlier):
+                note_logic, _note_data = self._market_reason_parts("stocks", live_row)
+                why_txt = runtime_gate_reason or str(note_logic or "").strip() or "Live stock model has a current scored view for this manual symbol."
+                logic_txt = str(note_logic or live_row.get("reason", "") or "").strip()
+                trigger_bits: List[str] = []
+                if live_calib_prob > 0.0:
+                    trigger_bits.append(f"calib {live_calib_prob:.2f}")
+                if live_last_price > 0.0:
+                    trigger_bits.append(f"last {_fmt_price(live_last_price)}")
+                trigger_suffix = f" ({' | '.join(trigger_bits)})" if trigger_bits else ""
+                if live_eligible:
+                    if runtime_gate_reason:
+                        trigger_txt = f"Model entry is ready for {ident}, but execution is currently gated: {runtime_gate_reason}{trigger_suffix}"
+                    else:
+                        trigger_txt = f"Trader step can open {live_side} on the next cycle if {ident} keeps this setup and capacity is available{trigger_suffix}."
+                elif live_side in {"LONG", "SHORT"}:
+                    trigger_txt = f"Needs {live_side} setup to stay qualified through the next trader cycle{trigger_suffix}."
+                else:
+                    trigger_txt = f"Needs scanner promotion from WATCH to a tradable side before entry can start{trigger_suffix}."
+                entry_val = live_last_price if live_last_price > 0.0 else 0.0
+                exit_val = 0.0
+                if entry_val > 0.0 and profit_target_pct > 0.0:
+                    pct = profit_target_pct / 100.0
+                    if live_side == "SHORT":
+                        exit_val = entry_val * (1.0 - pct)
+                    else:
+                        exit_val = entry_val * (1.0 + pct)
+                gain_pct = 0.0
+                if entry_val > 0.0 and exit_val > 0.0:
+                    if live_side == "SHORT":
+                        gain_pct = ((entry_val / exit_val) - 1.0) * 100.0
+                    else:
+                        gain_pct = ((exit_val / entry_val) - 1.0) * 100.0
+                gain_txt = "N/A"
+                if entry_val > 0.0 and exit_val > 0.0 and math.isfinite(gain_pct) and abs(float(gain_pct)) <= 250.0:
+                    gain_txt = f"{gain_pct:+.2f}%"
+                proj_dir_txt = self._projection_direction_label(live_side, live_score)
+                score_txt = f"{float(live_score):+.4f}" if (live_score is not None and math.isfinite(float(live_score))) else "N/A"
                 sell_in_txt = self._projected_sell_timing_label(
-                    projected_move_pct=projected_move_pct,
-                    change_6h_pct=0.0,
-                    change_24h_pct=0.0,
+                    projected_move_pct=gain_pct,
+                    change_6h_pct=live_change_6h_pct,
+                    change_24h_pct=live_change_24h_pct,
                 )
-            out.append(
-                {
-                    "symbol": ident,
-                    "projection": direction_label,
-                    "score": f"{conf:+.4f}" if conf > 0.0 else "N/A",
-                    "entry": "Preview",
-                    "exit": "Model",
-                    "gain": f"{projected_move_pct:+.2f}%" if math.isfinite(projected_move_pct) else "N/A",
-                    "sell_in": sell_in_txt,
-                    "status": status_txt,
-                    "why": why_txt,
-                    "logic": logic_txt,
-                    "trigger": trigger_txt,
-                }
-            )
+                out.append(
+                    {
+                        "symbol": ident,
+                        "projection": proj_dir_txt,
+                        "score": score_txt,
+                        "horizon": "Next 1h",
+                        "entry": _fmt_price(entry_val) if entry_val > 0.0 else "N/A",
+                        "exit": _fmt_price(exit_val) if exit_val > 0.0 else "N/A",
+                        "gain": gain_txt,
+                        "sell_in": sell_in_txt,
+                        "status": status_txt,
+                        "why": why_txt,
+                        "logic": logic_txt,
+                        "trigger": trigger_txt,
+                    }
+                )
+            else:
+                live_reject_reason = ""
+                if rejected_row:
+                    reason_code = str(rejected_row.get("reason", "") or "").strip().lower()
+                    if reason_code == "price_band":
+                        try:
+                            reject_price = float(rejected_row.get("price", 0.0) or 0.0)
+                        except Exception:
+                            reject_price = 0.0
+                        live_reject_reason = (
+                            f"Live stock scan rejected {ident}: price band filter "
+                            f"({(_fmt_price(reject_price) if reject_price > 0.0 else 'out of configured range')})."
+                        )
+                    elif reason_code == "spread":
+                        try:
+                            spread_bps = float(rejected_row.get("spread_bps", 0.0) or 0.0)
+                        except Exception:
+                            spread_bps = 0.0
+                        live_reject_reason = (
+                            f"Live stock scan rejected {ident}: spread too wide"
+                            + (f" ({spread_bps:.1f} bps)." if spread_bps > 0.0 else ".")
+                        )
+                    elif reason_code == "liquidity":
+                        live_reject_reason = f"Live stock scan rejected {ident}: liquidity filter."
+                    elif reason_code == "insufficient_bars":
+                        live_reject_reason = f"Live stock scan rejected {ident}: insufficient bars."
+                    elif reason_code == "warmup_pending":
+                        live_reject_reason = f"Live stock scan is still warming {ident}."
+                    elif reason_code:
+                        live_reject_reason = f"Live stock scan rejected {ident}: {reason_code}."
+                why_txt = runtime_gate_reason or live_reject_reason or (", ".join(blockers[:3]) if blockers else "Manually added to watchlist.")
+                logic_txt = str(preview.get("stock_pnl_quality_reason", "") or "").strip() or str(preview.get("explanation", "") or "").strip()
+                if rejected_row and live_reject_reason:
+                    logic_txt = live_reject_reason
+                trigger_txt = str(preview.get("predicted_exit_trigger", "Preview pending") or "Preview pending")
+                if runtime_gate_reason:
+                    trigger_txt = runtime_gate_reason
+                elif live_reject_reason:
+                    trigger_txt = live_reject_reason
+                sell_in_txt = "On signal"
+                if bool(preview):
+                    sell_in_txt = self._projected_sell_timing_label(
+                        projected_move_pct=projected_move_pct,
+                        change_6h_pct=0.0,
+                        change_24h_pct=0.0,
+                    )
+                out.append(
+                    {
+                        "symbol": ident,
+                        "projection": direction_label,
+                        "score": f"{conf:+.4f}" if conf > 0.0 else "N/A",
+                        "horizon": ("Next 1h" if live_reject_reason else "Preview window"),
+                        "entry": "Preview",
+                        "exit": "Model",
+                        "gain": f"{projected_move_pct:+.2f}%" if math.isfinite(projected_move_pct) else "N/A",
+                        "sell_in": ("Blocked" if live_reject_reason else sell_in_txt),
+                        "status": ("MANUAL / SCAN REJECTED" if live_reject_reason else status_txt),
+                        "why": why_txt,
+                        "logic": logic_txt,
+                        "trigger": trigger_txt,
+                    }
+                )
         return out
 
     def _market_watchlist_rows(
@@ -10264,6 +10567,7 @@ class PowerTraderHub(tk.Tk):
                     "symbol": ident,
                     "projection": proj_dir_txt,
                     "score": score_txt,
+                    "horizon": "Next 1h",
                     "entry": _fmt_price(entry_val) if entry_val > 0.0 else "N/A",
                     "exit": _fmt_price(exit_val) if exit_val > 0.0 else "N/A",
                     "gain": gain_txt,
@@ -13060,6 +13364,12 @@ class PowerTraderHub(tk.Tk):
                 full_history_rows = safe_read_jsonl_dicts(history_path, limit=5000)
             except Exception:
                 full_history_rows = []
+            if history_path and not any(
+                str((row or {}).get("event", "") or "").strip().lower() in {"entry", "exit"}
+                for row in full_history_rows
+                if isinstance(row, dict)
+            ):
+                full_history_rows = self._read_market_completed_history_rows(history_path, limit=250)
             if full_history_rows:
                 history_rows = full_history_rows
 
@@ -13163,6 +13473,33 @@ class PowerTraderHub(tk.Tk):
             visible_entry_markers.add(ident)
 
         return list((window_rows + synthetic_rows)[-250:])
+
+    @staticmethod
+    def _read_market_completed_history_rows(history_path: str, limit: int = 250) -> List[Dict[str, Any]]:
+        path = str(history_path or "").strip()
+        if not path:
+            return []
+        max_rows = max(1, int(limit or 250))
+        kept: deque[Dict[str, Any]] = deque(maxlen=max_rows)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    txt = str(line or "").strip()
+                    if not txt:
+                        continue
+                    try:
+                        row = fast_json_loads(txt, default=None)
+                    except Exception:
+                        continue
+                    if not isinstance(row, dict):
+                        continue
+                    event = str(row.get("event", "") or "").strip().lower()
+                    if event not in {"entry", "exit"}:
+                        continue
+                    kept.append(dict(row))
+        except Exception:
+            return []
+        return list(kept)
 
     def _set_market_history(self, market_key: str, lines: List[Any]) -> None:
         panel = self.market_panels.get(market_key, {})
@@ -20259,6 +20596,7 @@ class PowerTraderHub(tk.Tk):
                     "coin": str(row.get("coin", "") or "").strip().upper(),
                     "projection": proj_dir_txt,
                     "score": score_txt,
+                    "horizon": "Next 1h",
                     "entry": _fmt_price(entry_val) if entry_val > 0.0 else "N/A",
                     "exit": _fmt_price(exit_val) if exit_val > 0.0 else "N/A",
                     "gain": gain_txt,

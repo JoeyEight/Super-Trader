@@ -213,7 +213,17 @@ class MarketPositionsTableTests(unittest.TestCase):
 
     def test_stock_market_position_rows_include_current_trade_details(self) -> None:
         hub = self._hub()
-        hub._read_market_thinker_status = lambda market_key: {}
+        hub._read_market_thinker_status = lambda market_key: {
+            "leaders": [
+                {
+                    "symbol": "AMZN",
+                    "score": 0.8,
+                    "change_6h_pct": 0.6,
+                    "change_24h_pct": 2.4,
+                    "calibration_effective_prob": 0.73,
+                }
+            ]
+        }
         payload = PowerTraderHub._market_position_rows(
             hub,
             "stocks",
@@ -236,6 +246,9 @@ class MarketPositionsTableTests(unittest.TestCase):
         row = payload["rows"][0]
         self.assertEqual(payload["schema"]["columns"][0], "symbol")
         self.assertEqual(row["symbol"], "AMZN")
+        self.assertEqual(row["projection"], "Upward")
+        self.assertEqual(row["score"], "+0.8000")
+        self.assertEqual(row["horizon"], "Next 1h")
         self.assertEqual(row["side"], "LONG")
         self.assertEqual(row["qty"], "0.230557")
         self.assertEqual(row["value"], "$48.39")
@@ -245,11 +258,23 @@ class MarketPositionsTableTests(unittest.TestCase):
         self.assertEqual(row["ask_price"], "$209.875")
         self.assertEqual(row["day_pct"], "-1.31%")
         self.assertEqual(row["qty_available"], "0.230557")
+        self.assertEqual(row["pred_move"], "+0.20%")
         self.assertIn("Open trades: 1", payload["summary"])
 
     def test_forex_market_position_rows_include_current_trade_details(self) -> None:
         hub = self._hub()
-        hub._read_market_thinker_status = lambda market_key: {"leaders": [{"pair": "AUD_HKD", "last": 5.54851}]}
+        hub._read_market_thinker_status = lambda market_key: {
+            "leaders": [
+                {
+                    "pair": "AUD_HKD",
+                    "last": 5.54851,
+                    "score": -0.9,
+                    "change_6h_pct": -0.9,
+                    "change_24h_pct": -3.6,
+                    "calibration_effective_prob": 0.8,
+                }
+            ]
+        }
         payload = PowerTraderHub._market_position_rows(
             hub,
             "forex",
@@ -279,6 +304,9 @@ class MarketPositionsTableTests(unittest.TestCase):
         row = payload["rows"][0]
         self.assertEqual(payload["schema"]["columns"][0], "pair")
         self.assertEqual(row["pair"], "AUD_HKD")
+        self.assertEqual(row["projection"], "Downward")
+        self.assertEqual(row["score"], "-0.9000")
+        self.assertEqual(row["horizon"], "Next 1h")
         self.assertEqual(row["side"], "SHORT")
         self.assertEqual(row["units"], "2")
         self.assertEqual(row["value"], "$0.14")
@@ -290,6 +318,7 @@ class MarketPositionsTableTests(unittest.TestCase):
         self.assertEqual(row["margin"], "0.1417 USD")
         self.assertEqual(row["financing"], "+0.0000 USD")
         self.assertEqual(row["trades"], "1")
+        self.assertEqual(row["pred_move"], "-0.28%")
         self.assertIn("Value $0.14", payload["summary"])
         self.assertIn("Notional $1.42", payload["summary"])
 
@@ -396,6 +425,9 @@ class MarketPositionsTableTests(unittest.TestCase):
             row["values"],
             (
                 "AMZN",
+                "Neutral",
+                "N/A",
+                "Signal",
                 "LONG",
                 "0.230557",
                 "$48.39",
@@ -405,6 +437,7 @@ class MarketPositionsTableTests(unittest.TestCase):
                 "$209.875",
                 "-1.31%",
                 "0.230557",
+                "N/A",
                 "TBD",
                 "Blocked",
             ),
@@ -652,8 +685,8 @@ class MarketPositionsTableTests(unittest.TestCase):
 
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["symbol"], "AUD_USD")
-        self.assertEqual(rows[0]["status"], "ENTRY WAIT")
-        self.assertEqual(rows[0]["status"], "ENTRY WAIT")
+        self.assertEqual(rows[0]["status"], "SCAN READY / ENTRY GATED")
+        self.assertEqual(rows[0]["horizon"], "Next 1h")
         self.assertIn("-0.6607", rows[0]["score"])
         self.assertTrue(bool(str(rows[0].get("why", "") or "").strip()))
         self.assertIn("Needs SHORT setup", rows[0]["trigger"])
@@ -680,7 +713,8 @@ class MarketPositionsTableTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(rows[0]["status"], "READY")
+        self.assertEqual(rows[0]["status"], "SCAN READY / ENTRY READY")
+        self.assertEqual(rows[0]["horizon"], "Next 1h")
         self.assertIn("Trader step can open LONG", rows[0]["trigger"])
         self.assertIn("last $6.96", rows[0]["trigger"])
 
@@ -721,6 +755,7 @@ class MarketPositionsTableTests(unittest.TestCase):
 
             self.assertEqual(rows[0]["symbol"], "MU")
             self.assertEqual(rows[0]["status"], "MANUAL / EXECUTION GATED")
+            self.assertEqual(rows[0]["horizon"], "Preview window")
             self.assertIn("Market closed", rows[0]["why"])
             self.assertIn("Market closed", rows[0]["trigger"])
 
@@ -760,6 +795,119 @@ class MarketPositionsTableTests(unittest.TestCase):
                 rows = PowerTraderHub._stock_manual_watchlist_rows(hub, limit=5)
 
             self.assertEqual(rows[0]["status"], "MANUAL / ENTRY READY")
+            self.assertEqual(rows[0]["horizon"], "Preview window")
+
+    def test_stock_manual_watchlist_rows_upgrade_to_live_thinker_detail_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            previews_dir = os.path.join(td, "previews")
+            os.makedirs(previews_dir, exist_ok=True)
+            manual_watchlist_path = os.path.join(td, "manual_watchlist.json")
+            trader_path = os.path.join(td, "stock_trader_status.json")
+            thinker_path = os.path.join(td, "stock_thinker_status.json")
+            with open(manual_watchlist_path, "w", encoding="utf-8") as fh:
+                json.dump({"symbols": {"NVDA": {"historical_warmup_status": "ready"}}}, fh)
+            with open(os.path.join(previews_dir, "NVDA.json"), "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "predicted_direction": "up",
+                        "predicted_pnl_trend": "up",
+                        "confidence": 0.58,
+                        "common_historical_outcomes": {"average_pnl_pct": 3.81},
+                        "stock_readiness": {"trade_eligible": True, "trade_blockers": []},
+                    },
+                    fh,
+                )
+            with open(trader_path, "w", encoding="utf-8") as fh:
+                json.dump({}, fh)
+            with open(thinker_path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "market_open": True,
+                        "ai_state": "Ready",
+                        "leaders": [
+                            {
+                                "symbol": "NVDA",
+                                "side": "long",
+                                "score": 0.5878,
+                                "confidence": "HIGH",
+                                "eligible_for_entry": True,
+                                "last": 219.90,
+                                "change_6h_pct": 0.8,
+                                "change_24h_pct": 2.4,
+                                "calibration_effective_prob": 0.72,
+                                "reason": "Near-term weakness; kept on watchlist for reversal confirmation",
+                            }
+                        ],
+                    },
+                    fh,
+                )
+
+            hub = self._hub()
+            hub.hub_dir = td
+            hub.settings = {"stock_profit_target_pct": 0.35}
+            hub.stock_manual_watchlist_path = manual_watchlist_path
+            hub.market_trader_paths = {"stocks": trader_path}
+            hub.market_thinker_paths = {"stocks": thinker_path}
+
+            with patch("ui.pt_hub.model_quality_pass._stock_watchlist_preview_path", return_value=os.path.join(previews_dir, "NVDA.json")):
+                rows = PowerTraderHub._stock_manual_watchlist_rows(hub, limit=5)
+
+            self.assertEqual(rows[0]["symbol"], "NVDA")
+            self.assertEqual(rows[0]["status"], "MANUAL / ENTRY READY")
+            self.assertEqual(rows[0]["horizon"], "Next 1h")
+            self.assertEqual(rows[0]["entry"], "$219.9")
+            self.assertEqual(rows[0]["exit"], "$220.67")
+            self.assertEqual(rows[0]["score"], "+0.5878")
+            self.assertIn("Trader step can open LONG", rows[0]["trigger"])
+
+    def test_stock_manual_watchlist_rows_surface_live_scan_rejection_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            previews_dir = os.path.join(td, "previews")
+            os.makedirs(previews_dir, exist_ok=True)
+            manual_watchlist_path = os.path.join(td, "manual_watchlist.json")
+            trader_path = os.path.join(td, "stock_trader_status.json")
+            thinker_path = os.path.join(td, "stock_thinker_status.json")
+            with open(manual_watchlist_path, "w", encoding="utf-8") as fh:
+                json.dump({"symbols": {"MU": {"historical_warmup_status": "ready"}}}, fh)
+            with open(os.path.join(previews_dir, "MU.json"), "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "predicted_direction": "up",
+                        "predicted_pnl_trend": "up",
+                        "confidence": 0.85,
+                        "common_historical_outcomes": {"average_pnl_pct": 3.46},
+                        "stock_readiness": {"trade_eligible": True, "trade_blockers": []},
+                    },
+                    fh,
+                )
+            with open(trader_path, "w", encoding="utf-8") as fh:
+                json.dump({}, fh)
+            with open(thinker_path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "market_open": True,
+                        "ai_state": "Ready",
+                        "rejected": [
+                            {"symbol": "MU", "reason": "price_band", "price": 1062.51},
+                        ],
+                    },
+                    fh,
+                )
+
+            hub = self._hub()
+            hub.hub_dir = td
+            hub.stock_manual_watchlist_path = manual_watchlist_path
+            hub.market_trader_paths = {"stocks": trader_path}
+            hub.market_thinker_paths = {"stocks": thinker_path}
+            hub._projected_sell_timing_label = lambda **kwargs: "On signal"
+
+            with patch("ui.pt_hub.model_quality_pass._stock_watchlist_preview_path", return_value=os.path.join(previews_dir, "MU.json")):
+                rows = PowerTraderHub._stock_manual_watchlist_rows(hub, limit=5)
+
+            self.assertEqual(rows[0]["status"], "MANUAL / SCAN REJECTED")
+            self.assertEqual(rows[0]["horizon"], "Next 1h")
+            self.assertEqual(rows[0]["sell_in"], "Blocked")
+            self.assertIn("price band", rows[0]["why"].lower())
 
     def test_resolve_market_focus_chart_rows_keeps_selected_symbol_pinned_to_cache(self) -> None:
         hub = self._hub()
@@ -984,6 +1132,33 @@ class MarketPositionsTableTests(unittest.TestCase):
             self.assertIn("AUD_HKD", idents)
             self.assertIn("GBP_USD", idents)
             self.assertEqual(sum(1 for ident in idents if ident == "AUD_HKD"), 1)
+
+    def test_resolved_market_history_rows_recovers_completed_stock_trades_past_noisy_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            stocks_dir = os.path.join(td, "stocks")
+            os.makedirs(stocks_dir, exist_ok=True)
+            audit_path = os.path.join(stocks_dir, "execution_audit.jsonl")
+            with open(audit_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"event": "entry", "symbol": "XOM", "side": "buy", "price": 100.0, "ts": 10, "ok": True}) + "\n")
+                f.write(json.dumps({"event": "exit", "symbol": "XOM", "side": "sell", "price": 101.0, "qty": 1.0, "pnl_usd": 1.0, "ts": 20, "ok": True}) + "\n")
+                for idx in range(6000):
+                    f.write(json.dumps({"event": "shadow_live_divergence", "symbol": "NVDA", "ts": 100 + idx}) + "\n")
+
+            hub = self._hub()
+            hub.project_dir = td
+            hub.hub_dir = td
+            hub.market_state_dirs = {"stocks": stocks_dir}
+
+            rows = PowerTraderHub._resolved_market_history_rows(
+                hub,
+                "stocks",
+                [{"event": "shadow_live_divergence", "symbol": "NVDA", "ts": 999}],
+                status_data={"raw_positions": []},
+            )
+
+            events = [(str(row.get("event", "")).strip().lower(), str(row.get("symbol", "")).strip().upper()) for row in rows]
+            self.assertIn(("entry", "XOM"), events)
+            self.assertIn(("exit", "XOM"), events)
 
     def test_set_market_history_populates_listbox_like_crypto(self) -> None:
         hub = self._hub()
