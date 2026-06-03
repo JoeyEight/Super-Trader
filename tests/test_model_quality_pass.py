@@ -2811,6 +2811,46 @@ class TestModelQualityPass(unittest.TestCase):
         self.assertEqual(rows[0].get("predictor_mode"), "shadow_live_v1")
         self.assertTrue(bool(diag.get("live_decision_source_available")))
 
+    def test_completed_live_decision_rows_builds_stock_row(self) -> None:
+        rows, diag = _completed_live_decision_rows(
+            market="stocks",
+            events=[],
+            closed_rows=[
+                {
+                    "symbol": "NVDA",
+                    "entry_ts": 100,
+                    "exit_ts": 200,
+                    "entry_price": 100.0,
+                    "exit_price": 104.0,
+                    "hold_hours": 2.0,
+                    "actual_exit_trigger": "Trailing",
+                    "decision_snapshot_id": "snap-stock-1",
+                    "entry_snapshot_selected_action": "buy",
+                    "entry_snapshot_predicted_direction": "up",
+                    "entry_snapshot_predicted_exit_trigger": "Trailing",
+                    "entry_snapshot_predicted_pnl_trend": "up",
+                    "entry_snapshot_predicted_confidence": 0.71,
+                    "entry_snapshot_selected_predictor": "local_market_model",
+                    "entry_snapshot_predictor_variant": "live",
+                }
+            ],
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].get("source_type"), "completed_live_decision_snapshot")
+        self.assertEqual(rows[0].get("predicted_direction"), "up")
+        self.assertEqual(rows[0].get("predicted_exit_trigger"), "Trailing")
+        self.assertTrue(bool(rows[0].get("eligible_for_future_learning")))
+        self.assertTrue(bool(diag.get("live_decision_source_available")))
+
+    def test_completed_live_decision_rows_do_not_exist_before_close(self) -> None:
+        rows, diag = _completed_live_decision_rows(
+            market="crypto",
+            events=[{"event": "entry", "symbol": "BTC-USD", "ts": 100}],
+            closed_rows=[],
+        )
+        self.assertEqual(rows, [])
+        self.assertFalse(bool(diag.get("live_decision_source_available")))
+
     def test_model_quality_keeps_live_rows_supplemental_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             rows = []
@@ -3019,6 +3059,122 @@ class TestModelQualityPass(unittest.TestCase):
                         with mock.patch("app.model_quality_pass.build_shadow_scorecards", return_value={}):
                             out = run_model_quality_full_pass(base_dir=td, hub_dir=td, settings={})
             self.assertEqual(out.get("replay_generation", {}).get("forex", {}).get("model_quality_source_priority_used"), "execution_log")
+
+    def test_run_model_quality_full_pass_reports_existing_live_settings_without_modifying_them(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            settings = {
+                "market_rollout_stage": "live",
+                "market_crypto_enabled": True,
+                "market_stocks_enabled": True,
+                "market_forex_enabled": True,
+                "stock_auto_trade_enabled": True,
+                "forex_auto_trade_enabled": True,
+                "alpaca_paper_mode": False,
+                "oanda_practice_mode": False,
+                "stock_trade_notional_usd": 12.75,
+                "stock_max_total_exposure_pct": 60.0,
+                "forex_trade_units": 190,
+                "forex_max_total_exposure_pct": 60.0,
+            }
+            original = dict(settings)
+            with mock.patch("app.model_quality_pass.get_robinhood_creds_from_env", return_value=("rk", "rs")):
+                with mock.patch("app.model_quality_pass.get_robinhood_creds_from_files", return_value=("", "")):
+                    with mock.patch("app.model_quality_pass.get_alpaca_creds", return_value=("ak", "as")):
+                        with mock.patch("app.model_quality_pass.get_oanda_creds", return_value=("oa", "ot")):
+                            with mock.patch("app.model_quality_pass.build_crypto_historical_strategy_replay", return_value={"state": "NO_DATA", "rows": [], "diagnostics": {"historical_strategy_replay_rows": 0, "historical_strategy_replay_symbols": []}}):
+                                with mock.patch("app.model_quality_pass._generate_stock_historical_replay_closed_trades", return_value={"rows": [], "diagnostics": {}}):
+                                    with mock.patch("app.model_quality_pass.build_all_market_regimes", return_value={}):
+                                        with mock.patch("app.model_quality_pass.build_walkforward_report", return_value={}):
+                                            with mock.patch("app.model_quality_pass.build_confidence_calibration_payload", return_value={}):
+                                                with mock.patch("app.model_quality_pass.build_shadow_scorecards", return_value={}):
+                                                    out = run_model_quality_full_pass(base_dir=td, hub_dir=td, settings=settings)
+            self.assertEqual(settings, original)
+            existing = out.get("existing_runtime_settings", {})
+            self.assertTrue(bool(existing.get("settings_used_as_is")))
+            self.assertTrue(bool(existing.get("existing_crypto_live_enabled")))
+            self.assertTrue(bool(existing.get("existing_stocks_live_enabled")))
+            self.assertTrue(bool(existing.get("existing_forex_live_enabled")))
+
+    def test_market_readiness_allows_crypto_live_while_model_quality_blockers_remain_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            settings = {
+                "market_rollout_stage": "live",
+                "market_crypto_enabled": True,
+                "market_stocks_enabled": True,
+                "market_forex_enabled": True,
+                "stock_auto_trade_enabled": True,
+                "forex_auto_trade_enabled": True,
+                "alpaca_paper_mode": False,
+                "oanda_practice_mode": False,
+            }
+            with mock.patch("app.model_quality_pass.get_robinhood_creds_from_env", return_value=("rk", "rs")):
+                with mock.patch("app.model_quality_pass.get_robinhood_creds_from_files", return_value=("", "")):
+                    with mock.patch("app.model_quality_pass.get_alpaca_creds", return_value=("ak", "as")):
+                        with mock.patch("app.model_quality_pass.get_oanda_creds", return_value=("oa", "ot")):
+                            with mock.patch("app.model_quality_pass.build_crypto_historical_strategy_replay", return_value={"state": "NO_DATA", "rows": [], "diagnostics": {"historical_strategy_replay_rows": 0, "historical_strategy_replay_symbols": []}}):
+                                with mock.patch("app.model_quality_pass._generate_stock_historical_replay_closed_trades", return_value={"rows": [], "diagnostics": {}}):
+                                    with mock.patch("app.model_quality_pass.build_all_market_regimes", return_value={}):
+                                        with mock.patch("app.model_quality_pass.build_walkforward_report", return_value={}):
+                                            with mock.patch("app.model_quality_pass.build_confidence_calibration_payload", return_value={}):
+                                                with mock.patch("app.model_quality_pass.build_shadow_scorecards", return_value={}):
+                                                    out = run_model_quality_full_pass(base_dir=td, hub_dir=td, settings=settings)
+            readiness = out.get("model_quality_market_readiness", {}).get("markets", {}).get("crypto", {})
+            self.assertTrue(bool(readiness.get("existing_live_setting")))
+            self.assertTrue(bool(readiness.get("live_allowed_based_on_existing_setting")))
+            self.assertFalse(bool(readiness.get("full_promotion_eligible")))
+            self.assertTrue(bool(readiness.get("model_quality_blockers_visible")))
+            self.assertFalse(bool(readiness.get("whether_blockers_prevent_live_trading")))
+            self.assertEqual(readiness.get("runtime_status"), "live_learning_production")
+
+    def test_completed_live_decision_artifacts_are_written_as_supplemental(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            self._write_jsonl(
+                os.path.join(td, "stocks", "execution_audit.jsonl"),
+                [
+                    {
+                        "ts": 1_700_000_000,
+                        "event": "exit",
+                        "symbol": "NVDA",
+                        "qty": 1.0,
+                        "price": 104.0,
+                        "avg_entry_price": 100.0,
+                        "hold_s": 7200,
+                        "pnl_pct": 4.0,
+                        "tag": "Trailing",
+                        "decision_snapshot_id": "snap-stock-1",
+                        "entry_snapshot_predicted_direction": "up",
+                        "entry_snapshot_predicted_exit_trigger": "Trailing",
+                        "entry_snapshot_predicted_pnl_trend": "up",
+                        "entry_snapshot_predicted_confidence": 0.77,
+                        "entry_snapshot_selected_predictor": "local_market_model",
+                        "entry_snapshot_predictor_variant": "live",
+                        "entry_snapshot_selected_action": "buy",
+                        "entry_snapshot_live_trading_allowed": True,
+                    }
+                ],
+            )
+            settings = {
+                "market_rollout_stage": "live",
+                "market_stocks_enabled": True,
+                "stock_auto_trade_enabled": True,
+                "alpaca_paper_mode": False,
+            }
+            with mock.patch("app.model_quality_pass.get_robinhood_creds_from_env", return_value=("rk", "rs")):
+                with mock.patch("app.model_quality_pass.get_robinhood_creds_from_files", return_value=("", "")):
+                    with mock.patch("app.model_quality_pass.get_alpaca_creds", return_value=("ak", "as")):
+                        with mock.patch("app.model_quality_pass.get_oanda_creds", return_value=("oa", "ot")):
+                            with mock.patch("app.model_quality_pass.build_crypto_historical_strategy_replay", return_value={"state": "NO_DATA", "rows": [], "diagnostics": {"historical_strategy_replay_rows": 0, "historical_strategy_replay_symbols": []}}):
+                                with mock.patch("app.model_quality_pass._generate_stock_historical_replay_closed_trades", return_value={"rows": [], "diagnostics": {}}):
+                                    with mock.patch("app.model_quality_pass.build_all_market_regimes", return_value={}):
+                                        with mock.patch("app.model_quality_pass.build_walkforward_report", return_value={}):
+                                            with mock.patch("app.model_quality_pass.build_confidence_calibration_payload", return_value={}):
+                                                with mock.patch("app.model_quality_pass.build_shadow_scorecards", return_value={}):
+                                                    out = run_model_quality_full_pass(base_dir=td, hub_dir=td, settings=settings)
+            art = out.get("completed_live_decision_artifacts", {})
+            self.assertTrue(os.path.exists(art.get("per_market", {}).get("stocks", {}).get("path", "")))
+            self.assertTrue(os.path.exists(art.get("unified", {}).get("path", "")))
+            self.assertTrue(bool(out.get("replay_generation", {}).get("stocks", {}).get("completed_live_rows_used_as_supplemental")))
+            self.assertFalse(bool(out.get("replay_generation", {}).get("stocks", {}).get("completed_live_rows_used_as_primary")))
 
     def test_stock_exit_shape_ignores_bars_after_exit(self) -> None:
         bars = []

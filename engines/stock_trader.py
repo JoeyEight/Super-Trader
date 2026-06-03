@@ -17,6 +17,7 @@ from app.runtime_logging import runtime_event
 from app.scanner_quality import effective_reject_pressure
 from app.stale_exit_policy import evaluate_stale_profit_hold
 from app.trade_quality import evaluate_trade_quality
+from app.decision_snapshot import attach_market_decision_snapshot
 from brokers.broker_alpaca import AlpacaBrokerClient
 
 BASE_DIR, _SETTINGS_PATH, HUB_DATA_DIR, _BOOT_SETTINGS = resolve_runtime_paths(__file__, "stock_trader")
@@ -50,13 +51,31 @@ def _safe_write_json(path: str, data: Dict[str, Any]) -> None:
         pass
 
 
-def _append_jsonl(path: str, row: Dict[str, Any]) -> None:
+def _append_jsonl(
+    path: str,
+    row: Dict[str, Any],
+    *,
+    settings: Dict[str, Any] | None = None,
+    attach_snapshot: bool = False,
+    source_function: str = "_append_jsonl",
+) -> Dict[str, Any]:
+    payload = dict(row or {})
     try:
+        if attach_snapshot:
+            payload = attach_market_decision_snapshot(
+                payload,
+                market="stocks",
+                hub_dir=HUB_DATA_DIR,
+                settings=settings if isinstance(settings, dict) else {},
+                source_module="engines.stock_trader",
+                source_function=source_function,
+            )
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(row, separators=(",", ":")) + "\n")
+            f.write(json.dumps(payload, separators=(",", ":")) + "\n")
     except Exception:
         pass
+    return payload
 
 
 def _latest_entry_ts_from_audit(hub_dir: str, symbols: List[str], max_lines: int = 12000) -> Dict[str, float]:
@@ -1037,13 +1056,13 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             last_pnl = float(meta.get("last_pnl_pct", 0.0) or 0.0)
             mfe = max(float(meta.get("mfe_pct", last_pnl) or last_pnl), last_pnl)
             mae = min(float(meta.get("mae_pct", last_pnl) or last_pnl), last_pnl)
-            open_meta[symbol] = {"entry_ts": entry_ts, "mfe_pct": mfe, "mae_pct": mae, "last_pnl_pct": last_pnl}
+            open_meta[symbol] = {**meta, "entry_ts": entry_ts, "mfe_pct": mfe, "mae_pct": mae, "last_pnl_pct": last_pnl}
             continue
         pnl = ((mid - avg) / avg) * 100.0
         pnl_usd = (mid - avg) * qty
         mfe = max(float(meta.get("mfe_pct", pnl) or pnl), pnl)
         mae = min(float(meta.get("mae_pct", pnl) or pnl), pnl)
-        open_meta[symbol] = {"entry_ts": entry_ts, "mfe_pct": mfe, "mae_pct": mae, "last_pnl_pct": pnl}
+        open_meta[symbol] = {**meta, "entry_ts": entry_ts, "mfe_pct": mfe, "mae_pct": mae, "last_pnl_pct": pnl}
         st = trail_state.get(symbol, {}) or {}
         armed = bool(st.get("armed", False))
         peak = float(st.get("peak_pct", pnl) or pnl)
@@ -1196,10 +1215,28 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                     "intraday_exception_used": bool(intraday_exception_used),
                     "stale_alignment_streak": int(stale_streak),
                     "stale_alignment_reasons": [str(r) for r in align_reasons[:3]],
+                    "decision_snapshot_id": _s(meta.get("entry_decision_snapshot_id", "")),
+                    "entry_snapshot_predicted_direction": meta.get("entry_snapshot_predicted_direction"),
+                    "entry_snapshot_predicted_exit_trigger": meta.get("entry_snapshot_predicted_exit_trigger"),
+                    "entry_snapshot_predicted_pnl_trend": meta.get("entry_snapshot_predicted_pnl_trend"),
+                    "entry_snapshot_predicted_confidence": meta.get("entry_snapshot_predicted_confidence"),
+                    "entry_snapshot_selected_predictor": meta.get("entry_snapshot_selected_predictor"),
+                    "entry_snapshot_predictor_variant": meta.get("entry_snapshot_predictor_variant"),
+                    "entry_snapshot_source_used": meta.get("entry_snapshot_source_used"),
+                    "entry_snapshot_trade_quality_score": meta.get("entry_snapshot_trade_quality_score"),
+                    "entry_snapshot_pnl_quality_score": meta.get("entry_snapshot_pnl_quality_score"),
+                    "entry_snapshot_selected_action": meta.get("entry_snapshot_selected_action"),
+                    "entry_snapshot_raw_rule_reason": meta.get("entry_snapshot_raw_rule_reason"),
+                    "entry_snapshot_normalized_trigger": meta.get("entry_snapshot_normalized_trigger"),
+                    "entry_snapshot_runtime_mode": meta.get("entry_snapshot_runtime_mode"),
+                    "entry_snapshot_live_trading_allowed": meta.get("entry_snapshot_live_trading_allowed"),
                     "ok": ok,
                     "msg": msg,
                     "payload": payload if isinstance(payload, dict) else {},
                 },
+                settings=settings,
+                attach_snapshot=True,
+                source_function="run_step.exit_policy_stale",
             )
             if ok:
                 stale_exit_count += 1
@@ -1286,10 +1323,28 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                         "hold_s": hold_s,
                         "same_day_roundtrip": bool(same_day_roundtrip),
                         "intraday_exception_used": bool(intraday_exception_used),
+                        "decision_snapshot_id": _s(meta.get("entry_decision_snapshot_id", "")),
+                        "entry_snapshot_predicted_direction": meta.get("entry_snapshot_predicted_direction"),
+                        "entry_snapshot_predicted_exit_trigger": meta.get("entry_snapshot_predicted_exit_trigger"),
+                        "entry_snapshot_predicted_pnl_trend": meta.get("entry_snapshot_predicted_pnl_trend"),
+                        "entry_snapshot_predicted_confidence": meta.get("entry_snapshot_predicted_confidence"),
+                        "entry_snapshot_selected_predictor": meta.get("entry_snapshot_selected_predictor"),
+                        "entry_snapshot_predictor_variant": meta.get("entry_snapshot_predictor_variant"),
+                        "entry_snapshot_source_used": meta.get("entry_snapshot_source_used"),
+                        "entry_snapshot_trade_quality_score": meta.get("entry_snapshot_trade_quality_score"),
+                        "entry_snapshot_pnl_quality_score": meta.get("entry_snapshot_pnl_quality_score"),
+                        "entry_snapshot_selected_action": meta.get("entry_snapshot_selected_action"),
+                        "entry_snapshot_raw_rule_reason": meta.get("entry_snapshot_raw_rule_reason"),
+                        "entry_snapshot_normalized_trigger": meta.get("entry_snapshot_normalized_trigger"),
+                        "entry_snapshot_runtime_mode": meta.get("entry_snapshot_runtime_mode"),
+                        "entry_snapshot_live_trading_allowed": meta.get("entry_snapshot_live_trading_allowed"),
                         "ok": ok,
                         "msg": msg,
                         "payload": payload if isinstance(payload, dict) else {},
                     },
+                    settings=settings,
+                    attach_snapshot=True,
+                    source_function="run_step.exit_trailing",
                 )
                 if ok:
                     trail_state.pop(symbol, None)
@@ -1677,7 +1732,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                             "ok": bool(ok),
                         },
                     )
-                _append_jsonl(
+                entry_audit = _append_jsonl(
                     audit_path,
                     {
                         "ts": now_ts,
@@ -1704,12 +1759,48 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                         "ok": ok,
                         "msg": msg,
                         "payload": payload if isinstance(payload, dict) else {},
+                        "predicted_direction": "up",
+                        "predicted_pnl_trend": "up",
+                        "predicted_exit_trigger": None,
+                        "selected_predictor_name": "local_market_model",
+                        "predictor_variant": "live",
+                        "source_used": "execution_log",
+                        "trade_quality_score": (selected_quality_eval.get("confidence_score") if isinstance(selected_quality_eval, dict) else None),
+                        "pnl_quality_score": (selected_quality_eval.get("confidence_score") if isinstance(selected_quality_eval, dict) else None),
+                        "entry_reason": str(msg or ""),
+                        "signal_side": signal_side,
+                        "signal_margin": round(float(selected_score - alignment_required_score), 6),
+                        "model_quality_blockers_visible": True,
+                        "full_promotion_eligible": None,
                     },
+                    settings=settings,
+                    attach_snapshot=True,
+                    source_function="run_step.entry",
                 )
                 entry_msg = f"Entry {'placed' if ok else 'failed'} for {selected_symbol}"
                 if ok:
                     opened_today[selected_symbol] = now_ts
-                    open_meta[selected_symbol] = {"entry_ts": now_ts, "mfe_pct": 0.0, "mae_pct": 0.0, "last_pnl_pct": 0.0}
+                    open_meta[selected_symbol] = {
+                        "entry_ts": now_ts,
+                        "mfe_pct": 0.0,
+                        "mae_pct": 0.0,
+                        "last_pnl_pct": 0.0,
+                        "entry_decision_snapshot_id": str(entry_audit.get("decision_snapshot_id", "") or ""),
+                        "entry_snapshot_predicted_direction": entry_audit.get("predicted_direction"),
+                        "entry_snapshot_predicted_exit_trigger": entry_audit.get("predicted_exit_trigger"),
+                        "entry_snapshot_predicted_pnl_trend": entry_audit.get("predicted_pnl_trend"),
+                        "entry_snapshot_predicted_confidence": entry_audit.get("calib_prob", entry_audit.get("predicted_confidence")),
+                        "entry_snapshot_selected_predictor": entry_audit.get("selected_predictor_name"),
+                        "entry_snapshot_predictor_variant": entry_audit.get("predictor_variant"),
+                        "entry_snapshot_source_used": entry_audit.get("source_used"),
+                        "entry_snapshot_trade_quality_score": entry_audit.get("trade_quality_score"),
+                        "entry_snapshot_pnl_quality_score": entry_audit.get("pnl_quality_score"),
+                        "entry_snapshot_selected_action": "buy",
+                        "entry_snapshot_raw_rule_reason": entry_audit.get("raw_rule_reason", entry_audit.get("msg")),
+                        "entry_snapshot_normalized_trigger": entry_audit.get("normalized_trigger"),
+                        "entry_snapshot_runtime_mode": entry_audit.get("runtime_mode"),
+                        "entry_snapshot_live_trading_allowed": entry_audit.get("live_trading_allowed_from_existing_settings"),
+                    }
                     pending = {"symbol": selected_symbol, "side": "buy", "ts": now_ts, "order_id": oid, "client_order_id": client_id}
                     recon_positions = _parse_positions(client.list_positions())
                     if selected_symbol not in recon_positions:

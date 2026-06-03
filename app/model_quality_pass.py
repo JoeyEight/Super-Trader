@@ -14,7 +14,13 @@ from app.confidence_calibration import build_confidence_calibration_payload
 from app.crypto_artifacts import discover_crypto_trained_artifacts, load_crypto_artifact_features
 import app.crypto_historical_replay as crypto_historical_replay
 from app.crypto_historical_replay import build_crypto_historical_strategy_replay
-from app.credential_utils import get_alpaca_creds, get_twelvedata_api_key
+from app.credential_utils import (
+    get_alpaca_creds,
+    get_oanda_creds,
+    get_robinhood_creds_from_env,
+    get_robinhood_creds_from_files,
+    get_twelvedata_api_key,
+)
 from app.regime_classifier import build_all_market_regimes
 from app.settings_utils import sanitize_settings
 from app.shadow_scorecard import build_shadow_scorecards
@@ -94,6 +100,102 @@ def _env_int(name: str, default: int) -> int:
 
 def _env_str(name: str, default: str = "") -> str:
     return _s(os.environ.get(name, default)) or default
+
+
+def _bool_setting(cfg: Dict[str, Any], key: str, default: bool = False) -> bool:
+    return bool(cfg.get(key, default))
+
+
+def _market_live_allowed_from_existing_settings(cfg: Dict[str, Any], market: str) -> bool:
+    mk = _s(market).lower()
+    stage = _s(cfg.get("market_rollout_stage", "legacy")).lower() or "legacy"
+    live_stage = stage in {"live", "live_guarded", "execution_v2", "risk_caps", "scan_expanded"}
+    if mk == "stocks":
+        return (
+            _bool_setting(cfg, "market_stocks_enabled", True)
+            and _bool_setting(cfg, "stock_auto_trade_enabled", False)
+            and (not _bool_setting(cfg, "alpaca_paper_mode", True))
+            and live_stage
+        )
+    if mk == "forex":
+        return (
+            _bool_setting(cfg, "market_forex_enabled", True)
+            and _bool_setting(cfg, "forex_auto_trade_enabled", False)
+            and (not _bool_setting(cfg, "oanda_practice_mode", True))
+            and live_stage
+        )
+    if mk == "crypto":
+        return _bool_setting(cfg, "market_crypto_enabled", True) and live_stage
+    return False
+
+
+def _market_existing_live_enabled(cfg: Dict[str, Any], market: str) -> bool:
+    return _market_live_allowed_from_existing_settings(cfg, market)
+
+
+def _existing_market_risk_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "crypto": {
+            "max_open_positions": cfg.get("crypto_max_open_positions"),
+            "min_calib_prob_live_guarded": cfg.get("crypto_min_calib_prob_live_guarded"),
+            "min_samples_live_guarded": cfg.get("crypto_min_samples_live_guarded"),
+            "allocator_signal_floor": cfg.get("crypto_allocator_signal_floor"),
+            "max_spread_bps": cfg.get("crypto_max_spread_bps"),
+        },
+        "stocks": {
+            "trade_notional_usd": cfg.get("stock_trade_notional_usd"),
+            "max_open_positions": cfg.get("stock_max_open_positions"),
+            "max_position_usd_per_symbol": cfg.get("stock_max_position_usd_per_symbol"),
+            "max_total_exposure_pct": cfg.get("stock_max_total_exposure_pct"),
+            "max_daily_loss_usd": cfg.get("stock_max_daily_loss_usd"),
+            "max_daily_loss_pct": cfg.get("stock_max_daily_loss_pct"),
+        },
+        "forex": {
+            "trade_units": cfg.get("forex_trade_units"),
+            "max_open_positions": cfg.get("forex_max_open_positions"),
+            "max_position_usd_per_pair": cfg.get("forex_max_position_usd_per_pair"),
+            "max_total_exposure_pct": cfg.get("forex_max_total_exposure_pct"),
+            "max_daily_loss_usd": cfg.get("forex_max_daily_loss_usd"),
+            "max_daily_loss_pct": cfg.get("forex_max_daily_loss_pct"),
+        },
+    }
+
+
+def _existing_runtime_settings_diagnostics(cfg: Dict[str, Any], base_dir: str) -> Dict[str, Any]:
+    robinhood_key, robinhood_secret = get_robinhood_creds_from_env()
+    if (not robinhood_key) or (not robinhood_secret):
+        fk, fs = get_robinhood_creds_from_files(base_dir)
+        robinhood_key = robinhood_key or fk
+        robinhood_secret = robinhood_secret or fs
+    alpaca_key, alpaca_secret = get_alpaca_creds(cfg, base_dir=base_dir)
+    oanda_account, oanda_token = get_oanda_creds(cfg, base_dir=base_dir)
+    return {
+        "existing_crypto_live_enabled": bool(_market_existing_live_enabled(cfg, "crypto")),
+        "existing_stocks_live_enabled": bool(_market_existing_live_enabled(cfg, "stocks")),
+        "existing_forex_live_enabled": bool(_market_existing_live_enabled(cfg, "forex")),
+        "existing_position_sizing_mode": "configured_market_specific",
+        "existing_market_risk_settings": _existing_market_risk_settings(cfg),
+        "existing_broker_modes": {
+            "crypto_runtime_stage": _s(cfg.get("market_rollout_stage", "")),
+            "stocks_paper_mode": bool(cfg.get("alpaca_paper_mode", True)),
+            "forex_practice_mode": bool(cfg.get("oanda_practice_mode", True)),
+        },
+        "existing_market_enable_flags": {
+            "crypto": bool(cfg.get("market_crypto_enabled", True)),
+            "stocks": bool(cfg.get("market_stocks_enabled", True)),
+            "forex": bool(cfg.get("market_forex_enabled", True)),
+        },
+        "existing_market_auto_trade_flags": {
+            "stocks": bool(cfg.get("stock_auto_trade_enabled", False)),
+            "forex": bool(cfg.get("forex_auto_trade_enabled", False)),
+        },
+        "existing_credential_availability": {
+            "crypto": bool(robinhood_key and robinhood_secret),
+            "stocks": bool(alpaca_key and alpaca_secret),
+            "forex": bool(oanda_account and oanda_token),
+        },
+        "settings_used_as_is": True,
+    }
 
 
 def _safe_read_jsonl(path: str, max_lines: int = 800000) -> List[Dict[str, Any]]:
@@ -506,36 +608,67 @@ def _completed_live_decision_rows(
     by_predictor: Dict[str, int] = {}
     found = 0
     completed = 0
-    if mk != "crypto":
-        return [], {
-            "live_decision_source_available": False,
-            "live_decision_rows_found": 0,
-            "live_decision_rows_completed": 0,
-            "live_decision_join_rate_pct": 0.0,
-            "live_decision_rows_by_market": by_market,
-            "live_decision_rows_by_predictor": {},
-            "live_decision_missing_reason": "completed_live_decision_snapshots_not_available_for_market",
-            "model_quality_source_priority_used": "",
-        }
     for row in list(closed_rows or []):
         if not isinstance(row, dict):
             continue
-        pred_dir = _s(row.get("predicted_direction", "")) or _predicted_direction_from_action(_s(row.get("entry_snapshot_selected_action", "")), mk)
-        pred_trigger = _s(row.get("predicted_exit_trigger", "")) or _s(row.get("entry_snapshot_normalized_trigger", ""))
-        pred_conf = _extract_live_prediction_field(row, ("predicted_confidence", "entry_snapshot_ai_confidence", "entry_snapshot_strategy_score"))
-        predictor_name = _s(_extract_live_prediction_field(row, ("predictor_name", "entry_snapshot_policy_mode", "entry_snapshot_profile"))) or "live_snapshot"
-        predictor_variant = _s(_extract_live_prediction_field(row, ("predictor_variant", "entry_snapshot_entry_alignment_mode", "entry_snapshot_signal_gate_mode"))) or "live"
-        trigger_scores = _extract_live_prediction_field(row, ("trigger_scores",))
-        direction_scores = _extract_live_prediction_field(row, ("direction_scores",))
-        if pred_dir or pred_trigger or pred_conf is not None:
-            found += 1
-        if not pred_dir or pred_conf is None:
-            continue
-        completed += 1
+        pred_dir = (
+            _s(row.get("predicted_direction", ""))
+            or _s(row.get("entry_snapshot_predicted_direction", ""))
+            or _predicted_direction_from_action(_s(row.get("entry_snapshot_selected_action", "")), mk)
+        )
+        pred_trigger = (
+            _s(row.get("predicted_exit_trigger", ""))
+            or _s(row.get("entry_snapshot_predicted_exit_trigger", ""))
+            or _s(row.get("entry_snapshot_normalized_trigger", ""))
+        )
+        pred_pnl = (
+            _s(row.get("predicted_pnl_trend", ""))
+            or _s(row.get("entry_snapshot_predicted_pnl_trend", ""))
+            or (pred_dir if pred_dir in {"up", "down", "flat"} else "")
+        )
+        pred_conf = _extract_live_prediction_field(
+            row,
+            (
+                "predicted_confidence",
+                "entry_snapshot_predicted_confidence",
+                "entry_snapshot_ai_confidence",
+                "entry_snapshot_strategy_score",
+            ),
+        )
+        predictor_name = _s(
+            _extract_live_prediction_field(
+                row,
+                (
+                    "predictor_name",
+                    "selected_predictor_name",
+                    "entry_snapshot_selected_predictor",
+                    "entry_snapshot_policy_mode",
+                    "entry_snapshot_profile",
+                ),
+            )
+        ) or "live_snapshot"
+        predictor_variant = _s(
+            _extract_live_prediction_field(
+                row,
+                (
+                    "predictor_variant",
+                    "entry_snapshot_predictor_variant",
+                    "entry_snapshot_entry_alignment_mode",
+                    "entry_snapshot_signal_gate_mode",
+                ),
+            )
+        ) or "live"
+        trigger_scores = _extract_live_prediction_field(row, ("trigger_scores", "entry_snapshot_trigger_scores"))
+        direction_scores = _extract_live_prediction_field(row, ("direction_scores", "entry_snapshot_direction_scores"))
+        decision_snapshot_id = _s(row.get("decision_snapshot_id", "")) or _s(row.get("entry_decision_snapshot_id", ""))
         item = dict(row)
-        item["predicted_direction"] = pred_dir
-        item["predicted_exit_trigger"] = pred_trigger or "Unknown"
-        item["predicted_confidence"] = round(_f(pred_conf, 0.0), 6)
+        item["decision_snapshot_id"] = decision_snapshot_id or None
+        item["trade_id"] = _s(row.get("trade_id", row.get("position_id", row.get("order_id", "")))) or None
+        item["market"] = mk
+        item["predicted_direction"] = pred_dir or None
+        item["predicted_exit_trigger"] = pred_trigger or None
+        item["predicted_pnl_trend"] = pred_pnl or None
+        item["predicted_confidence"] = round(_f(pred_conf, 0.0), 6) if pred_conf is not None else None
         if isinstance(trigger_scores, dict):
             item["trigger_scores"] = dict(trigger_scores)
         if isinstance(direction_scores, dict):
@@ -544,9 +677,45 @@ def _completed_live_decision_rows(
         item["predictor_mode"] = predictor_name
         item["predictor_variant"] = predictor_variant
         item["source_type"] = "completed_live_decision_snapshot"
+        item["source"] = "live_execution"
         item["raw_rule_reason"] = _s(row.get("entry_snapshot_raw_rule_reason", "")) or _s(row.get("raw_rule_reason", ""))
         item["event_exit_tag"] = _s(row.get("event_exit_tag", ""))
         item["actual_direction"] = _trade_direction(item)
+        item["actual_pnl_trend"] = item["actual_direction"]
+        item["actual_exit_trigger"] = _norm_exit_trigger(
+            _s(row.get("actual_exit_trigger", "")),
+            _s(row.get("normalized_exit_trigger", "")),
+            _s(row.get("event_exit_tag", "")),
+            _s(row.get("raw_rule_reason", "")),
+        ) or "Unknown"
+        item["exit_rule_reason"] = _s(row.get("raw_rule_reason", row.get("event_exit_tag", ""))) or None
+        item["normalized_exit_trigger"] = item["actual_exit_trigger"]
+        item["hold_time"] = row.get("hold_hours", row.get("hold_time"))
+        item["fees_usd"] = row.get("fees_usd")
+        item["pnl"] = row.get("pnl_usd")
+        item["pnl_usd"] = row.get("pnl_usd")
+        item["pnl_pct"] = row.get("pnl_pct", _trade_return_pct(item))
+        item["live_trading_allowed_from_existing_settings"] = row.get("entry_snapshot_live_trading_allowed")
+        item["direction_correct"] = bool(
+            _s(item.get("predicted_direction", "")).lower() == _s(item.get("actual_direction", "")).lower()
+        )
+        item["trigger_correct"] = bool(
+            _s(item.get("predicted_exit_trigger", "")).lower() == _s(item.get("actual_exit_trigger", "")).lower()
+        )
+        item["pnl_trend_correct"] = bool(
+            _s(item.get("predicted_pnl_trend", "")).lower() == _s(item.get("actual_pnl_trend", "")).lower()
+        )
+        missing_fields: List[str] = []
+        for key in ("decision_snapshot_id", "predicted_direction", "predicted_pnl_trend", "predicted_confidence"):
+            if item.get(key) in (None, ""):
+                missing_fields.append(key)
+        item["missing_prediction_fields"] = missing_fields
+        eligible = len(missing_fields) == 0
+        item["eligible_for_future_learning"] = bool(eligible)
+        item["ineligible_reason"] = "" if eligible else "missing_prediction_fields"
+        found += 1
+        if eligible:
+            completed += 1
         by_predictor[predictor_name] = int(by_predictor.get(predictor_name, 0) + 1)
         rows_out.append(item)
     rows_out.sort(key=_stable_row_sort_key)
@@ -604,8 +773,17 @@ def _closed_trades_from_exits(events: Iterable[Dict[str, Any]], market: str) -> 
                 "source_type": "execution_log",
                 "raw_rule_reason": _s(row.get("tag", "")),
                 "pnl_pct": round(float(_f(row.get("pnl_pct", 0.0), 0.0)), 6),
+                "decision_snapshot_id": _s(row.get("decision_snapshot_id", "")),
+                "trade_id": _s(row.get("trade_id", row.get("position_id", row.get("order_id", "")))),
+                "fees_usd": row.get("fees_usd"),
+                "entry_decision_snapshot_id": _s(row.get("decision_snapshot_id", "")),
             }
         )
+        if out:
+            latest = out[-1]
+            for key, value in row.items():
+                if key.startswith("entry_snapshot_") or key.startswith("predicted_"):
+                    latest[key] = value
     out.sort(key=lambda r: (int(r.get("entry_ts", 0)), _s(r.get("symbol", ""))))
     return out
 
@@ -789,6 +967,148 @@ def build_market_dataset_quality(hub_dir: str, market: str) -> Dict[str, Any]:
             "missing_feature_reason": "historical candle-context join not yet implemented for forex replay",
         }
     return out
+
+
+def _write_json(path: str, payload: Dict[str, Any]) -> str:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload if isinstance(payload, dict) else {}, f, indent=2)
+    return path
+
+
+def _write_completed_live_decision_artifacts(
+    hub_dir: str,
+    rows_by_market: Dict[str, List[Dict[str, Any]]],
+) -> Dict[str, Any]:
+    per_market: Dict[str, Dict[str, Any]] = {}
+    unified: List[Dict[str, Any]] = []
+    for market, rows in rows_by_market.items():
+        mk = _s(market).lower()
+        market_rows = list(rows or [])
+        path = os.path.join(hub_dir, mk, "completed_live_decisions.jsonl")
+        _write_jsonl(path, market_rows)
+        per_market[mk] = {
+            "path": path,
+            "rows": int(len(market_rows)),
+            "sha256": _sha256_file(path),
+        }
+        unified.extend(market_rows)
+    unified.sort(key=_stable_row_sort_key)
+    unified_path = os.path.join(hub_dir, "completed_live_decisions.jsonl")
+    _write_jsonl(unified_path, unified)
+    return {
+        "per_market": per_market,
+        "unified": {
+            "path": unified_path,
+            "rows": int(len(unified)),
+            "sha256": _sha256_file(unified_path),
+        },
+    }
+
+
+def _market_operational_blockers(cfg: Dict[str, Any], base_dir: str, market: str) -> List[str]:
+    mk = _s(market).lower()
+    blockers: List[str] = []
+    if not _market_live_allowed_from_existing_settings(cfg, mk):
+        blockers.append("live_disabled_by_existing_settings")
+    if mk == "stocks":
+        key, secret = get_alpaca_creds(cfg, base_dir=base_dir)
+        if not (key and secret):
+            blockers.append("missing_broker_credentials")
+    elif mk == "forex":
+        account_id, token = get_oanda_creds(cfg, base_dir=base_dir)
+        if not (account_id and token):
+            blockers.append("missing_broker_credentials")
+    elif mk == "crypto":
+        key, secret = get_robinhood_creds_from_env()
+        if (not key) or (not secret):
+            fk, fs = get_robinhood_creds_from_files(base_dir)
+            key = key or fk
+            secret = secret or fs
+        if not (key and secret):
+            blockers.append("missing_broker_credentials")
+    return blockers
+
+
+def _market_runtime_status(
+    cfg: Dict[str, Any],
+    market: str,
+    full_promotion_eligible: bool,
+    blockers: List[str],
+) -> str:
+    mk = _s(market).lower()
+    live_allowed = _market_live_allowed_from_existing_settings(cfg, mk)
+    if not live_allowed:
+        return "disabled_by_existing_settings"
+    if blockers:
+        return "blocked_operationally"
+    if mk == "crypto" and (not full_promotion_eligible):
+        return "live_learning_production"
+    return "live_production" if full_promotion_eligible else "live_learning_production"
+
+
+def _build_market_readiness_artifact(
+    *,
+    base_dir: str,
+    hub_dir: str,
+    settings: Dict[str, Any],
+    replay_generation: Dict[str, Any],
+    replay_diag: Dict[str, Any],
+    promotion_readiness: Dict[str, Any],
+    completed_live_artifacts: Dict[str, Any],
+    existing_runtime_settings: Dict[str, Any],
+) -> Dict[str, Any]:
+    markets = ["crypto", "stocks", "forex"]
+    created_ts = int(time.time())
+    payload: Dict[str, Any] = {
+        "ts": created_ts,
+        "created_local": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(created_ts)),
+        "settings_used_as_is": True,
+        "existing_runtime_settings": existing_runtime_settings,
+        "markets": {},
+    }
+    per_market_artifacts = (
+        completed_live_artifacts.get("per_market", {})
+        if isinstance(completed_live_artifacts.get("per_market", {}), dict)
+        else {}
+    )
+    for mk in markets:
+        replay_meta = replay_generation.get(mk, {}) if isinstance(replay_generation.get(mk, {}), dict) else {}
+        metrics = replay_diag.get(mk, {}).get("headline_metrics", {}) if isinstance(replay_diag.get(mk, {}), dict) else {}
+        promo = promotion_readiness.get(mk, {}) if isinstance(promotion_readiness.get(mk, {}), dict) else {}
+        live_diag = replay_meta.get("live_decision_source_diagnostics", {}) if isinstance(replay_meta.get("live_decision_source_diagnostics", {}), dict) else {}
+        operational_blockers = _market_operational_blockers(settings, base_dir, mk)
+        live_allowed = _market_live_allowed_from_existing_settings(settings, mk)
+        full_promo = bool(promo.get("full_promotion_eligible", False))
+        payload["markets"][mk] = {
+            "existing_live_setting": bool(_market_existing_live_enabled(settings, mk)),
+            "live_allowed_based_on_existing_setting": bool(live_allowed),
+            "runtime_status": _market_runtime_status(settings, mk, full_promo, operational_blockers),
+            "full_promotion_eligible": full_promo,
+            "source_used": _s(replay_meta.get("model_quality_primary_source_used", replay_meta.get("source_type", ""))),
+            "latest_metrics": dict(metrics if isinstance(metrics, dict) else {}),
+            "blockers": list(promo.get("blockers", []) or []),
+            "whether_blockers_prevent_live_trading": bool(operational_blockers),
+            "model_quality_blockers_visible": bool(promo.get("blockers")),
+            "operational_blockers": operational_blockers,
+            "completed_live_logging_status": {
+                "rows_found": int(_f(live_diag.get("live_decision_rows_found", 0), 0.0)),
+                "rows_completed": int(_f(live_diag.get("live_decision_rows_completed", 0), 0.0)),
+                "join_rate_pct": round(_f(live_diag.get("live_decision_join_rate_pct", 0.0), 0.0), 4),
+                "artifact_path": _s(per_market_artifacts.get(mk, {}).get("path", "")),
+            },
+            "completed_live_learning_status": {
+                "supplemental_only": bool(not replay_meta.get("completed_live_rows_used_as_primary", False)),
+                "used_as_primary": bool(replay_meta.get("completed_live_rows_used_as_primary", False)),
+                "used_as_supplemental": bool(replay_meta.get("completed_live_rows_used_as_supplemental", False)),
+                "learning_ready": bool(int(_f(live_diag.get("live_decision_rows_completed", 0), 0.0)) >= 20),
+            },
+            "last_evaluated_timestamp": int(created_ts),
+        }
+    artifact_path = os.path.join(hub_dir, "model_quality_market_readiness.json")
+    payload["path"] = artifact_path
+    _write_json(artifact_path, payload)
+    return payload
 
 
 def _legacy_trade_source_paths(hub_dir: str) -> Dict[str, List[str]]:
@@ -6724,6 +7044,7 @@ def run_model_quality_full_pass(
     stock_backfill_max_symbols = _env_int("STOCK_REPLAY_BACKFILL_MAX_SYMBOLS", 50 if stock_backfill_enabled else 24)
     stock_backfill_force_refresh = _env_flag("STOCK_REPLAY_BACKFILL_FORCE_REFRESH")
     use_live_rows_as_primary = _env_flag("MODEL_QUALITY_USE_LIVE_ROWS_AS_PRIMARY")
+    use_completed_live_priors = _env_flag("MODEL_QUALITY_USE_COMPLETED_LIVE_PRIORS")
     use_legacy_replay_as_primary = _env_flag("MODEL_QUALITY_USE_LEGACY_REPLAY_AS_PRIMARY")
     ts = int(time.time())
     stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(ts))
@@ -6734,13 +7055,16 @@ def run_model_quality_full_pass(
     dataset_reports: Dict[str, Any] = {}
     snapshots: Dict[str, Any] = {}
     closed_by_market: Dict[str, List[Dict[str, Any]]] = {}
+    completed_live_rows_by_market: Dict[str, List[Dict[str, Any]]] = {}
     replay_generation: Dict[str, Any] = {}
     crypto_artifact_report: Dict[str, Any] = {}
+    existing_runtime_settings = _existing_runtime_settings_diagnostics(cfg, base_dir)
     for m in markets:
         loaded = load_market_trade_events(hub_dir, m)
         events = loaded.get("events", []) if isinstance(loaded.get("events", []), list) else []
         closed = build_closed_trades(events, m).get("closed_trades", [])
         live_rows, live_diag = _completed_live_decision_rows(market=m, events=events, closed_rows=list(closed or []))
+        completed_live_rows_by_market[m] = list(live_rows or [])
         if m == "crypto":
             crypto_rows_before = int(len(list(closed or [])))
             historical_replay = build_crypto_historical_strategy_replay(
@@ -6795,6 +7119,14 @@ def run_model_quality_full_pass(
                 "model_quality_live_rows_supplemental_only": not bool(use_live_rows_as_primary),
                 "completed_live_rows_used_as_primary": bool(primary_source_used == "completed_live_decision_snapshot"),
                 "completed_live_rows_used_as_supplemental": bool(live_rows),
+                "completed_live_rows_found": int(_f(live_diag.get("live_decision_rows_found", 0), 0.0)),
+                "completed_live_rows_completed": int(_f(live_diag.get("live_decision_rows_completed", 0), 0.0)),
+                "completed_live_join_rate_pct": round(_f(live_diag.get("live_decision_join_rate_pct", 0.0), 0.0), 4),
+                "completed_live_rows_by_market": dict(live_diag.get("live_decision_rows_by_market", {}) if isinstance(live_diag.get("live_decision_rows_by_market", {}), dict) else {}),
+                "completed_live_rows_by_predictor": dict(live_diag.get("live_decision_rows_by_predictor", {}) if isinstance(live_diag.get("live_decision_rows_by_predictor", {}), dict) else {}),
+                "completed_live_priors_enabled": bool(use_completed_live_priors),
+                "completed_live_prior_rows_used": 0,
+                "completed_live_learning_ready": bool(int(_f(live_diag.get("live_decision_rows_completed", 0), 0.0)) >= 20),
                 "source_selection_reason": source_selection_reason,
                 "rows_generated": int(len(list(closed or []))),
                 "historical_strategy_replay": (historical_replay.get("diagnostics", {}) if isinstance(historical_replay, dict) else {}),
@@ -6870,6 +7202,14 @@ def run_model_quality_full_pass(
             replay_generation[m]["model_quality_live_rows_supplemental_only"] = not bool(use_live_rows_as_primary)
             replay_generation[m]["completed_live_rows_used_as_primary"] = bool(primary_source_used == "completed_live_decision_snapshot")
             replay_generation[m]["completed_live_rows_used_as_supplemental"] = bool(live_rows)
+            replay_generation[m]["completed_live_rows_found"] = int(_f(live_diag.get("live_decision_rows_found", 0), 0.0))
+            replay_generation[m]["completed_live_rows_completed"] = int(_f(live_diag.get("live_decision_rows_completed", 0), 0.0))
+            replay_generation[m]["completed_live_join_rate_pct"] = round(_f(live_diag.get("live_decision_join_rate_pct", 0.0), 0.0), 4)
+            replay_generation[m]["completed_live_rows_by_market"] = dict(live_diag.get("live_decision_rows_by_market", {}) if isinstance(live_diag.get("live_decision_rows_by_market", {}), dict) else {})
+            replay_generation[m]["completed_live_rows_by_predictor"] = dict(live_diag.get("live_decision_rows_by_predictor", {}) if isinstance(live_diag.get("live_decision_rows_by_predictor", {}), dict) else {})
+            replay_generation[m]["completed_live_priors_enabled"] = bool(use_completed_live_priors)
+            replay_generation[m]["completed_live_prior_rows_used"] = 0
+            replay_generation[m]["completed_live_learning_ready"] = bool(int(_f(live_diag.get("live_decision_rows_completed", 0), 0.0)) >= 20)
             replay_generation[m]["source_selection_reason"] = source_selection_reason
             replay_generation[m]["model_quality_source_priority_used"] = primary_source_used
         elif m != "crypto":
@@ -6886,6 +7226,14 @@ def run_model_quality_full_pass(
                 "model_quality_live_rows_supplemental_only": True,
                 "completed_live_rows_used_as_primary": False,
                 "completed_live_rows_used_as_supplemental": bool(live_rows),
+                "completed_live_rows_found": int(_f(live_diag.get("live_decision_rows_found", 0), 0.0)),
+                "completed_live_rows_completed": int(_f(live_diag.get("live_decision_rows_completed", 0), 0.0)),
+                "completed_live_join_rate_pct": round(_f(live_diag.get("live_decision_join_rate_pct", 0.0), 0.0), 4),
+                "completed_live_rows_by_market": dict(live_diag.get("live_decision_rows_by_market", {}) if isinstance(live_diag.get("live_decision_rows_by_market", {}), dict) else {}),
+                "completed_live_rows_by_predictor": dict(live_diag.get("live_decision_rows_by_predictor", {}) if isinstance(live_diag.get("live_decision_rows_by_predictor", {}), dict) else {}),
+                "completed_live_priors_enabled": bool(use_completed_live_priors),
+                "completed_live_prior_rows_used": 0,
+                "completed_live_learning_ready": bool(int(_f(live_diag.get("live_decision_rows_completed", 0), 0.0)) >= 20),
                 "source_selection_reason": "forex_execution_log_default_primary",
                 "model_quality_source_priority_used": "execution_log",
             }
@@ -6951,6 +7299,11 @@ def run_model_quality_full_pass(
                     )
                 dataset_reports[m]["feature_source_diagnostics"] = feature_diag
                 replay_generation[m]["crypto_feature_source_diagnostics"] = feature_diag
+
+    completed_live_decision_artifacts = _write_completed_live_decision_artifacts(
+        hub_dir,
+        completed_live_rows_by_market,
+    )
 
     # Build/refresh replay artifacts for all markets from normalized closed trades.
     openai_dir = os.path.join(hub_dir, "openai")
@@ -7175,13 +7528,26 @@ def run_model_quality_full_pass(
             "full_promotion_blockers": list(blockers),
         }
 
+    market_readiness = _build_market_readiness_artifact(
+        base_dir=base_dir,
+        hub_dir=hub_dir,
+        settings=cfg,
+        replay_generation=replay_generation,
+        replay_diag=replay_diag,
+        promotion_readiness=promotion_readiness,
+        completed_live_artifacts=completed_live_decision_artifacts,
+        existing_runtime_settings=existing_runtime_settings,
+    )
+
     return {
         "ts": ts,
         "created_local": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)),
         "base_dir": base_dir,
         "hub_dir": hub_dir,
+        "existing_runtime_settings": existing_runtime_settings,
         "dataset_quality": dataset_reports,
         "dataset_snapshots": snapshots,
+        "completed_live_decision_artifacts": completed_live_decision_artifacts,
         "synthetic_replay_artifacts": synthetic_paths,
         "replay_generation": replay_generation,
         "market_regimes": regimes,
@@ -7202,4 +7568,5 @@ def run_model_quality_full_pass(
         "promotion_minima": promotion_minima,
         "controlled_rollout_readiness": controlled_rollout_readiness,
         "promotion_readiness": promotion_readiness,
+        "model_quality_market_readiness": market_readiness,
     }
