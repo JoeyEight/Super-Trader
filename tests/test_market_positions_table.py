@@ -6,6 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 
 
 def _install_matplotlib_stubs() -> None:
@@ -682,6 +683,83 @@ class MarketPositionsTableTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "READY")
         self.assertIn("Trader step can open LONG", rows[0]["trigger"])
         self.assertIn("last $6.96", rows[0]["trigger"])
+
+    def test_stock_manual_watchlist_rows_show_execution_gated_when_market_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            previews_dir = os.path.join(td, "previews")
+            os.makedirs(previews_dir, exist_ok=True)
+            manual_watchlist_path = os.path.join(td, "manual_watchlist.json")
+            trader_path = os.path.join(td, "stock_trader_status.json")
+            thinker_path = os.path.join(td, "stock_thinker_status.json")
+            with open(manual_watchlist_path, "w", encoding="utf-8") as fh:
+                json.dump({"symbols": {"MU": {"historical_warmup_status": "ready"}}}, fh)
+            with open(os.path.join(previews_dir, "MU.json"), "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "predicted_direction": "up",
+                        "predicted_pnl_trend": "up",
+                        "confidence": 0.85,
+                        "common_historical_outcomes": {"average_pnl_pct": 3.46},
+                        "stock_readiness": {"trade_eligible": True, "trade_blockers": []},
+                    },
+                    fh,
+                )
+            with open(trader_path, "w", encoding="utf-8") as fh:
+                json.dump({"entry_eval_top_reason": "Thinker cached fallback active"}, fh)
+            with open(thinker_path, "w", encoding="utf-8") as fh:
+                json.dump({"market_open": False, "ai_state": "Market closed (cached)"}, fh)
+
+            hub = self._hub()
+            hub.hub_dir = td
+            hub.stock_manual_watchlist_path = manual_watchlist_path
+            hub.market_trader_paths = {"stocks": trader_path}
+            hub.market_thinker_paths = {"stocks": thinker_path}
+            hub._projected_sell_timing_label = lambda **kwargs: "On signal"
+
+            with patch("ui.pt_hub.model_quality_pass._stock_watchlist_preview_path", return_value=os.path.join(previews_dir, "MU.json")):
+                rows = PowerTraderHub._stock_manual_watchlist_rows(hub, limit=5)
+
+            self.assertEqual(rows[0]["symbol"], "MU")
+            self.assertEqual(rows[0]["status"], "MANUAL / EXECUTION GATED")
+            self.assertIn("Market closed", rows[0]["why"])
+            self.assertIn("Market closed", rows[0]["trigger"])
+
+    def test_stock_manual_watchlist_rows_stay_entry_ready_when_runtime_open(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            previews_dir = os.path.join(td, "previews")
+            os.makedirs(previews_dir, exist_ok=True)
+            manual_watchlist_path = os.path.join(td, "manual_watchlist.json")
+            trader_path = os.path.join(td, "stock_trader_status.json")
+            thinker_path = os.path.join(td, "stock_thinker_status.json")
+            with open(manual_watchlist_path, "w", encoding="utf-8") as fh:
+                json.dump({"symbols": {"MU": {"historical_warmup_status": "ready"}}}, fh)
+            with open(os.path.join(previews_dir, "MU.json"), "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "predicted_direction": "up",
+                        "predicted_pnl_trend": "up",
+                        "confidence": 0.85,
+                        "common_historical_outcomes": {"average_pnl_pct": 3.46},
+                        "stock_readiness": {"trade_eligible": True, "trade_blockers": []},
+                    },
+                    fh,
+                )
+            with open(trader_path, "w", encoding="utf-8") as fh:
+                json.dump({}, fh)
+            with open(thinker_path, "w", encoding="utf-8") as fh:
+                json.dump({"market_open": True, "ai_state": "Ready"}, fh)
+
+            hub = self._hub()
+            hub.hub_dir = td
+            hub.stock_manual_watchlist_path = manual_watchlist_path
+            hub.market_trader_paths = {"stocks": trader_path}
+            hub.market_thinker_paths = {"stocks": thinker_path}
+            hub._projected_sell_timing_label = lambda **kwargs: "On signal"
+
+            with patch("ui.pt_hub.model_quality_pass._stock_watchlist_preview_path", return_value=os.path.join(previews_dir, "MU.json")):
+                rows = PowerTraderHub._stock_manual_watchlist_rows(hub, limit=5)
+
+            self.assertEqual(rows[0]["status"], "MANUAL / ENTRY READY")
 
     def test_resolve_market_focus_chart_rows_keeps_selected_symbol_pinned_to_cache(self) -> None:
         hub = self._hub()

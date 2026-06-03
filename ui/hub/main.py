@@ -56,6 +56,7 @@ from app.settings_utils import (
     normalize_settings_profile,
 )
 from app.market_awareness import build_awareness_payload
+import app.model_quality_pass as model_quality_pass
 from app.health_rules import evaluate_runtime_alerts
 from app.notification_center import build_notification_center_from_hub
 from app.status_hydration import load_market_status_bundle, needs_market_snapshot_refresh, safe_read_jsonl_dicts
@@ -213,6 +214,8 @@ class PowerTraderHub(tk.Tk):
             "stocks": os.path.join(self.market_state_dirs["stocks"], "scan_diagnostics.json"),
             "forex": os.path.join(self.market_state_dirs["forex"], "scan_diagnostics.json"),
         }
+        self.stock_manual_watchlist_path = os.path.join(self.market_state_dirs["stocks"], "manual_watchlist.json")
+        self.stock_watchlist_preview_dir = os.path.join(self.market_state_dirs["stocks"], "watchlist_previews")
         self.market_panels: Dict[str, Dict[str, Any]] = {}
         self._market_test_busy: Dict[str, bool] = {}
         self._market_refresh_busy: Dict[str, bool] = {}
@@ -4904,9 +4907,9 @@ class PowerTraderHub(tk.Tk):
         system_box = ttk.LabelFrame(controls_left, text="System")
         system_box.pack(fill="x", padx=6, pady=(0, 6))
         system_header = ttk.Frame(system_box)
-        system_header.pack(fill="x", padx=6, pady=(4, 4))
+        system_header.pack(fill="x", padx=6, pady=(4, 2))
         health_chip_row = tk.Frame(system_header, bg=DARK_BG)
-        health_chip_row.pack(side="left", fill="x", expand=True)
+        health_chip_row.pack(fill="x", expand=True)
         self.crypto_chip_data = tk.Label(health_chip_row, text=" Data: N/A ", padx=8, pady=3)
         self.crypto_chip_broker = tk.Label(health_chip_row, text=" Broker: N/A ", padx=8, pady=3)
         self.crypto_chip_orders = tk.Label(health_chip_row, text=" Orders: N/A ", padx=8, pady=3)
@@ -4954,14 +4957,15 @@ class PowerTraderHub(tk.Tk):
             except Exception:
                 pass
 
+        system_toggle_row = ttk.Frame(system_box)
+        system_toggle_row.pack(fill="x", padx=6, pady=(0, 4))
         self.btn_crypto_system_toggle = ttk.Button(
-            system_header,
+            system_toggle_row,
             text="Show Details",
-            width=12,
             style="Compact.TButton",
             command=lambda: (self.crypto_system_details_visible_var.set(not bool(self.crypto_system_details_visible_var.get())), _apply_crypto_system_visibility()),
         )
-        self.btn_crypto_system_toggle.pack(side="right", padx=(8, 0))
+        self.btn_crypto_system_toggle.pack(fill="x")
 
         self.lbl_neural = ttk.Label(crypto_system_body, text="Neural: stopped")
         self.lbl_neural.pack(anchor="w", pady=(0, 2))
@@ -5036,27 +5040,14 @@ class PowerTraderHub(tk.Tk):
             command=self._run_crypto_scan_now,
         )
         self.btn_crypto_run_scan.grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=(0, 4))
-        self.btn_toggle_all = ttk.Button(
-            action_buttons,
-            text="Start Trades",
-            style="Compact.TButton",
-            command=self.toggle_all_scripts,
-        )
-        self.btn_toggle_all.grid(row=0, column=1, sticky="ew", padx=(4, 0), pady=(0, 4))
+        self.btn_toggle_all = None
         self.btn_crypto_refresh_snapshot = ttk.Button(
             action_buttons,
             text="Refresh Snapshot",
             style="Compact.TButton",
             command=self._refresh_crypto_dashboard_snapshot,
         )
-        self.btn_crypto_refresh_snapshot.grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=(0, 2))
-        self.btn_crypto_test_connection = ttk.Button(
-            action_buttons,
-            text="Test Robinhood Connection",
-            style="Compact.TButton",
-            command=lambda: self.open_settings_dialog("crypto_credentials"),
-        )
-        self.btn_crypto_test_connection.grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=(0, 2))
+        self.btn_crypto_refresh_snapshot.grid(row=0, column=1, sticky="ew", padx=(4, 0), pady=(0, 4))
 
         self.crypto_auto_scan_var = tk.BooleanVar(value=bool(self.settings.get("crypto_dynamic_enabled", True)))
         self.crypto_auto_step_var = tk.BooleanVar(value=bool(self.settings.get("auto_start_trading_when_all_trained", True)))
@@ -5227,12 +5218,11 @@ class PowerTraderHub(tk.Tk):
         self.logs_nb.pack(fill="both", expand=True, padx=6, pady=6)
 
         runtime_summary_tab = ttk.Frame(self.logs_nb)
-        self.logs_nb.add(runtime_summary_tab, text="Runtime")
         _build_runtime_summary_tab(runtime_summary_tab)
 
-        # Neural tab (crypto thinker/runner only)
+        # Runner tab (crypto thinker/runner only)
         runner_tab = ttk.Frame(self.logs_nb)
-        self.logs_nb.add(runner_tab, text="Neural")
+        self.logs_nb.add(runner_tab, text="Runner")
         self.runner_text = tk.Text(
             runner_tab,
             height=8,
@@ -5263,70 +5253,8 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             pass
 
-        # Supervisor tab (global runner/process log)
-        supervisor_tab = ttk.Frame(self.logs_nb)
-        self.logs_nb.add(supervisor_tab, text="Supervisor")
-        self.supervisor_text = tk.Text(
-            supervisor_tab,
-            height=8,
-            wrap="none",
-            font=self._live_log_font,
-            bg=DARK_PANEL,
-            fg=DARK_FG,
-            padx=8,
-            pady=6,
-            spacing1=1,
-            spacing3=1,
-            insertbackground=DARK_FG,
-            selectbackground=DARK_SELECT_BG,
-            selectforeground=DARK_SELECT_FG,
-            highlightbackground=DARK_BORDER,
-            highlightcolor=DARK_ACCENT,
-        )
-        supervisor_scroll = ttk.Scrollbar(supervisor_tab, orient="vertical", command=self.supervisor_text.yview)
-        self.supervisor_text.configure(yscrollcommand=supervisor_scroll.set)
-        self.supervisor_text.pack(side="left", fill="both", expand=True)
-        supervisor_scroll.pack(side="right", fill="y")
-        try:
-            self.supervisor_text.tag_configure("log_ts", foreground="#8FA5B8")
-            self.supervisor_text.tag_configure("log_warn", foreground="#FFCC66")
-            self.supervisor_text.tag_configure("log_err", foreground="#FF6B57")
-            self.supervisor_text.tag_configure("log_launch", foreground=DARK_ACCENT2)
-        except Exception:
-            pass
-
-        # Trader tab
-        trader_tab = ttk.Frame(self.logs_nb)
-        self.logs_nb.add(trader_tab, text="Trader")
-        self.trader_text = tk.Text(
-            trader_tab,
-            height=8,
-            wrap="none",
-            font=self._live_log_font,
-            bg=DARK_PANEL,
-            fg=DARK_FG,
-            padx=8,
-            pady=6,
-            spacing1=1,
-            spacing3=1,
-            insertbackground=DARK_FG,
-            selectbackground=DARK_SELECT_BG,
-            selectforeground=DARK_SELECT_FG,
-            highlightbackground=DARK_BORDER,
-            highlightcolor=DARK_ACCENT,
-        )
-
-        trader_scroll = ttk.Scrollbar(trader_tab, orient="vertical", command=self.trader_text.yview)
-        self.trader_text.configure(yscrollcommand=trader_scroll.set)
-        self.trader_text.pack(side="left", fill="both", expand=True)
-        trader_scroll.pack(side="right", fill="y")
-        try:
-            self.trader_text.tag_configure("log_ts", foreground="#8FA5B8")
-            self.trader_text.tag_configure("log_warn", foreground="#FFCC66")
-            self.trader_text.tag_configure("log_err", foreground="#FF6B57")
-            self.trader_text.tag_configure("log_launch", foreground=DARK_ACCENT2)
-        except Exception:
-            pass
+        self.supervisor_text = None
+        self.trader_text = None
 
         # Training tab (statuses + trainer controls/logs)
         training_tab = ttk.Frame(self.logs_nb)
@@ -5719,10 +5647,12 @@ class PowerTraderHub(tk.Tk):
         watch_table_wrap.rowconfigure(0, weight=1)
         watch_cols = (
             "coin",
+            "projection",
             "score",
             "entry",
             "exit",
             "gain",
+            "sell_in",
             "status",
             "why",
             "logic",
@@ -5730,22 +5660,26 @@ class PowerTraderHub(tk.Tk):
         )
         watch_headings = {
             "coin": "Coin",
+            "projection": "Projection",
             "score": "Score",
             "entry": "Proj Entry",
             "exit": "Proj Exit",
-            "gain": "Proj Gain",
-            "status": "Status",
+            "gain": "Pred Move",
+            "sell_in": "Sell In",
+            "status": "Scan / Entry",
             "why": "Why Not Bought",
             "logic": "Logic",
             "trigger": "Buy Trigger",
         }
         watch_widths = {
             "coin": 70,
+            "projection": 118,
             "score": 90,
             "entry": 110,
             "exit": 110,
             "gain": 96,
-            "status": 90,
+            "sell_in": 88,
+            "status": 240,
             "why": 320,
             "logic": 320,
             "trigger": 320,
@@ -6404,9 +6338,9 @@ class PowerTraderHub(tk.Tk):
         system_box = ttk.LabelFrame(market_dash_body, text="System")
         system_box.pack(fill="x", padx=6, pady=(6, 6))
         system_header = ttk.Frame(system_box)
-        system_header.pack(fill="x", padx=6, pady=(4, 4))
+        system_header.pack(fill="x", padx=6, pady=(4, 2))
         health_chip_row = tk.Frame(system_header, bg=DARK_BG)
-        health_chip_row.pack(side="left", fill="x", expand=True)
+        health_chip_row.pack(fill="x", expand=True)
         chip_data = tk.Label(health_chip_row, text=" Data: N/A ", padx=8, pady=3)
         chip_broker = tk.Label(health_chip_row, text=" Broker: N/A ", padx=8, pady=3)
         chip_orders = tk.Label(health_chip_row, text=" Orders: N/A ", padx=8, pady=3)
@@ -6448,14 +6382,15 @@ class PowerTraderHub(tk.Tk):
             except Exception:
                 pass
 
+        system_toggle_row = ttk.Frame(system_box)
+        system_toggle_row.pack(fill="x", padx=6, pady=(0, 4))
         system_toggle_btn = ttk.Button(
-            system_header,
+            system_toggle_row,
             text="Hide Details",
-            width=12,
             style="Compact.TButton",
             command=lambda: (system_details_visible_var.set(not bool(system_details_visible_var.get())), _apply_system_detail_visibility()),
         )
-        system_toggle_btn.pack(side="right")
+        system_toggle_btn.pack(fill="x")
 
         action_box = ttk.LabelFrame(market_dash_body, text="Action Center")
         action_box.pack(fill="x", padx=6, pady=(0, 6))
@@ -6468,22 +6403,6 @@ class PowerTraderHub(tk.Tk):
             style="Accent.TButton",
             command=lambda mk=market_key: self._run_market_thinker_scan(mk, force=True, min_interval_s=0.0),
         )
-        if market_key == "stocks":
-            trader_step_btn = ttk.Button(
-                action_buttons,
-                text="Run Stocks Step",
-                width=16,
-                style="Compact.TButton",
-                command=lambda: self._run_stock_trader_step(force=True, min_interval_s=0.0),
-            )
-        else:
-            trader_step_btn = ttk.Button(
-                action_buttons,
-                text="Run Forex Step",
-                width=16,
-                style="Compact.TButton",
-                command=lambda: self._run_forex_trader_step(force=True, min_interval_s=0.0),
-            )
         refresh_btn = ttk.Button(
             action_buttons,
             text="Refresh Snapshot",
@@ -6491,15 +6410,8 @@ class PowerTraderHub(tk.Tk):
             style="Compact.TButton",
             command=lambda mk=market_key: self._schedule_market_snapshot_refresh(mk, every_s=0.0),
         )
-        test_btn = ttk.Button(
-            action_buttons,
-            text=f"Test {broker_name} Connection",
-            style="Compact.TButton",
-            command=lambda mk=market_key: self._run_market_connection_test(mk),
-        )
-        trader_step_market_key = market_key
 
-        action_status_var = tk.StringVar(value="Next: configure broker credentials, then test connection.")
+        action_status_var = tk.StringVar(value="Next: configure broker credentials in API Settings.")
         auto_scan_var = tk.BooleanVar(value=True)
         auto_step_var = tk.BooleanVar(value=True)
 
@@ -6569,7 +6481,7 @@ class PowerTraderHub(tk.Tk):
                 col = idx % cols
                 widget.grid(row=row, column=col, sticky="ew", padx=(0 if col == 0 else 6, 0), pady=(0, 4))
 
-        action_widgets = [run_btn, trader_step_btn, refresh_btn, test_btn]
+        action_widgets = [run_btn, refresh_btn]
         chip_widgets = [chip_data, chip_broker, chip_orders, chip_cycle]
 
         def _reflow_market_dashboard(_e: Any = None) -> None:
@@ -6637,47 +6549,10 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             pass
 
-        thinker_tab = ttk.Frame(live_nb)
-        live_nb.add(thinker_tab, text="Thinker")
-        logs_header = ttk.Frame(thinker_tab)
-        logs_header.pack(fill="x", padx=6, pady=(6, 0))
         logs_age_var = tk.StringVar(value="Updated: N/A")
-        ttk.Label(logs_header, textvariable=logs_age_var, foreground=DARK_MUTED).pack(side="left")
         log_filter_var = tk.StringVar(value="All")
-        ttk.Label(logs_header, text="Filter:", foreground=DARK_MUTED).pack(side="left", padx=(12, 4))
-        log_filter_combo = ttk.Combobox(logs_header, values=["All", "Thinker", "Trader", "Broker"], state="readonly", width=9, textvariable=log_filter_var)
-        log_filter_combo.pack(side="left")
         logs_autoscroll_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(logs_header, text="Auto-scroll", variable=logs_autoscroll_var).pack(side="right")
-        log_text = tk.Text(
-            thinker_tab,
-            height=(6 if compact_mode else 8),
-            wrap="none",
-            font=self._live_log_font,
-            bg=DARK_PANEL,
-            fg=DARK_FG,
-            padx=8,
-            pady=6,
-            spacing1=1,
-            spacing3=1,
-            relief="flat",
-            bd=0,
-            highlightbackground=DARK_BORDER,
-            highlightcolor=DARK_ACCENT,
-        )
-        log_scroll = ttk.Scrollbar(thinker_tab, orient="vertical", command=log_text.yview)
-        log_text.configure(yscrollcommand=log_scroll.set)
-        log_text.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=(4, 6))
-        log_scroll.pack(side="right", fill="y", padx=(0, 6), pady=(4, 6))
-        log_text.configure(state="disabled")
-        try:
-            log_text.tag_configure("log_ts", foreground="#8FA5B8")
-            log_text.tag_configure("log_warn", foreground="#FFCC66")
-            log_text.tag_configure("log_err", foreground="#FF6B57")
-            log_text.tag_configure("log_launch", foreground=DARK_ACCENT2)
-        except Exception:
-            pass
-        log_filter_combo.bind("<<ComboboxSelected>>", lambda _e, mk=market_key: self._render_market_log(mk))
+        log_text = None
 
         training_tab = ttk.Frame(live_nb)
         live_nb.add(training_tab, text="Training")
@@ -6716,18 +6591,8 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             pass
 
-        status_tab = ttk.Frame(live_nb)
-        live_nb.add(status_tab, text="Status")
-        status_wrap = ttk.Frame(status_tab)
-        status_wrap.pack(fill="both", expand=True, padx=6, pady=6)
-        action_status_lbl = ttk.Label(
-            status_wrap,
-            textvariable=action_status_var,
-            foreground=DARK_MUTED,
-            justify="left",
-            wraplength=500,
-        )
-        action_status_lbl.pack(fill="both", expand=True)
+        # Thinker/Status tabs intentionally hidden in market Live Output to keep
+        # the panel focused on Runner + Training and reduce UI churn.
 
         notes_text = None
         notes_toggle_btn = None
@@ -6893,33 +6758,69 @@ class PowerTraderHub(tk.Tk):
         watch_header.pack(fill="x", padx=6, pady=(4, 2))
         watch_meta_var = tk.StringVar(value="No watchlist candidates yet.")
         ttk.Label(watch_header, textvariable=watch_meta_var, foreground=DARK_MUTED).pack(side="left", fill="x", expand=True)
+        stock_watchlist_search_var = tk.StringVar(value="") if market_key == "stocks" else None
+        stock_watchlist_action_var = tk.StringVar(value="") if market_key == "stocks" else None
+        if market_key == "stocks":
+            ttk.Label(watch_header, text="Add ticker:", foreground=DARK_MUTED).pack(side="left", padx=(8, 4))
+            stock_watch_entry = ttk.Entry(watch_header, textvariable=stock_watchlist_search_var, width=12)
+            stock_watch_entry.pack(side="left")
+            ttk.Button(
+                watch_header,
+                text="Add",
+                style="Compact.TButton",
+                command=lambda mk=market_key: self._start_stock_watchlist_add_flow(mk),
+            ).pack(side="left", padx=(4, 0))
+            ttk.Button(
+                watch_header,
+                text="View Preview",
+                style="Compact.TButton",
+                command=lambda mk=market_key: self._open_stock_watchlist_preview(mk),
+            ).pack(side="left", padx=(4, 0))
+            ttk.Label(
+                watch_box,
+                textvariable=stock_watchlist_action_var,
+                foreground=DARK_ACCENT2,
+                justify="left",
+                wraplength=980,
+            ).pack(fill="x", padx=6, pady=(0, 4))
         watch_wrap = ttk.Frame(watch_box)
         watch_wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         watch_wrap.columnconfigure(0, weight=1)
-        watch_wrap.rowconfigure(0, weight=1)
-        watch_cols = ("symbol", "score", "entry", "exit", "gain", "status", "why", "logic", "trigger")
+        watch_wrap.rowconfigure(1, weight=1)
+        watch_cols = ("symbol", "projection", "score", "entry", "exit", "gain", "sell_in", "status", "why", "logic", "trigger")
         watch_headings = {
             "symbol": ("Pair" if market_key == "forex" else "Symbol"),
+            "projection": "Projection",
             "score": "Score",
             "entry": "Proj Entry",
             "exit": "Proj Exit",
-            "gain": "Proj Gain",
-            "status": "Status",
+            "gain": "Pred Move",
+            "sell_in": "Sell In",
+            "status": "Scan / Entry",
             "why": "Why Not Traded",
             "logic": "Logic",
             "trigger": "Trade Trigger",
         }
         watch_widths = {
             "symbol": 92,
+            "projection": 118,
             "score": 92,
             "entry": 110,
             "exit": 110,
             "gain": 96,
-            "status": 100,
+            "sell_in": 88,
+            "status": 240,
             "why": 320,
             "logic": 320,
             "trigger": 320,
         }
+        watch_header_canvas = tk.Canvas(
+            watch_wrap,
+            background=DARK_PANEL2,
+            highlightthickness=0,
+            bd=0,
+            height=30,
+        )
         watch_canvas = tk.Canvas(
             watch_wrap,
             background=DARK_PANEL2,
@@ -6928,10 +6829,25 @@ class PowerTraderHub(tk.Tk):
         )
         watch_scroll_y = ttk.Scrollbar(watch_wrap, orient="vertical", command=watch_canvas.yview)
         watch_scroll_x = ttk.Scrollbar(watch_wrap, orient="horizontal", command=watch_canvas.xview)
-        watch_canvas.configure(yscrollcommand=watch_scroll_y.set, xscrollcommand=watch_scroll_x.set)
-        watch_canvas.grid(row=0, column=0, sticky="nsew")
-        watch_scroll_y.grid(row=0, column=1, sticky="ns")
-        watch_scroll_x.grid(row=1, column=0, sticky="ew")
+
+        def _sync_watch_xscroll(first: str, last: str, mk: str = market_key) -> None:
+            try:
+                watch_scroll_x.set(first, last)
+            except Exception:
+                pass
+            try:
+                panel_ref = self.market_panels.get(mk, {})
+                hdr = panel_ref.get("watch_header_canvas")
+                if hdr is not None:
+                    hdr.xview_moveto(float(first))
+            except Exception:
+                pass
+
+        watch_canvas.configure(yscrollcommand=watch_scroll_y.set, xscrollcommand=_sync_watch_xscroll)
+        watch_header_canvas.grid(row=0, column=0, sticky="ew")
+        watch_canvas.grid(row=1, column=0, sticky="nsew")
+        watch_scroll_y.grid(row=1, column=1, sticky="ns")
+        watch_scroll_x.grid(row=2, column=0, sticky="ew")
         watch_canvas.bind("<Configure>", lambda _e, mk=market_key: self._draw_market_watchlist_table(mk), add="+")
         watch_canvas.bind("<Button-1>", lambda e, mk=market_key: self._on_market_watchlist_click(mk, e), add="+")
         watch_canvas.bind("<Double-Button-1>", lambda e, mk=market_key: self._activate_market_watchlist_selection(mk, event=e), add="+")
@@ -7102,7 +7018,7 @@ class PowerTraderHub(tk.Tk):
 
         current_chart_box = ttk.LabelFrame(current_body, text=f"{market_name} Current Trade Chart (Neural lines overlaid)")
         # Keep a guaranteed chart viewport so Stocks/Forex do not collapse below fold.
-        current_chart_box.configure(height=420)
+        current_chart_box.configure(height=500)
         current_chart_box.pack_propagate(False)
         current_chart_box.pack(fill="x", expand=False, padx=6, pady=(0, 6))
         current_chart_top = ttk.Frame(current_chart_box)
@@ -7144,7 +7060,7 @@ class PowerTraderHub(tk.Tk):
             textvariable=current_chart_status_var,
             foreground=DARK_MUTED,
             justify="left",
-            wraplength=920,
+            wraplength=1280,
         ).pack(side="left", fill="x", expand=True)
 
         current_chart_canvas = tk.Canvas(
@@ -7153,7 +7069,7 @@ class PowerTraderHub(tk.Tk):
             highlightthickness=1,
             highlightbackground=DARK_BORDER,
             bd=0,
-            height=300,
+            height=360,
         )
         current_chart_canvas.pack(fill="both", expand=True, padx=6, pady=(4, 6))
         current_chart_canvas.bind(
@@ -7324,9 +7240,6 @@ class PowerTraderHub(tk.Tk):
             "history_autoscroll_var": history_autoscroll_var,
             "history_lines": [],
             "recommendations_text": recommendations_text,
-            "test_btn": test_btn,
-            "trader_step_btn": trader_step_btn,
-            "trader_step_market_key": trader_step_market_key,
             "run_btn": run_btn,
             "action_status_var": action_status_var,
             "auto_scan_var": auto_scan_var,
@@ -7362,8 +7275,11 @@ class PowerTraderHub(tk.Tk):
             "chart_legend_render_sig": (),
             "watch_box": watch_box,
             "watch_tree": None,
+            "watch_header_canvas": watch_header_canvas,
             "watch_canvas": watch_canvas,
             "watch_meta_var": watch_meta_var,
+            "stock_watchlist_search_var": stock_watchlist_search_var,
+            "stock_watchlist_action_var": stock_watchlist_action_var,
             "watch_rows": [],
             "watch_columns": watch_cols,
             "watch_headings": watch_headings,
@@ -7438,6 +7354,11 @@ class PowerTraderHub(tk.Tk):
         widget = panel.get("log_text")
         if not widget:
             return
+        try:
+            if hasattr(widget, "winfo_ismapped") and (not bool(widget.winfo_ismapped())):
+                return
+        except Exception:
+            pass
         all_lines = list(panel.get("log_lines", []) or [])
         mode = str((panel.get("log_filter_var").get() if panel.get("log_filter_var") else "All") or "All").strip().lower()
 
@@ -9031,6 +8952,28 @@ class PowerTraderHub(tk.Tk):
                 out_lines.append(current)
         return "\n".join(out_lines)
 
+    def _truncate_table_text(self, text: Any, max_width_px: int, font_spec: Tuple[str, int, str]) -> str:
+        raw = " ".join(str(text or "").split())
+        if (not raw) or max_width_px <= 20:
+            return raw
+        if self._measure_table_text_px(raw, font_spec) <= max_width_px:
+            return raw
+        suffix = "..."
+        suffix_w = self._measure_table_text_px(suffix, font_spec)
+        if suffix_w >= max_width_px:
+            return suffix
+        lo, hi = 0, len(raw)
+        best = ""
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            probe = f"{raw[:mid].rstrip()}{suffix}"
+            if self._measure_table_text_px(probe, font_spec) <= max_width_px:
+                best = probe
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return best or suffix
+
     @staticmethod
     def _mousewheel_units(event: Any) -> int:
         try:
@@ -9486,8 +9429,10 @@ class PowerTraderHub(tk.Tk):
             return (42, 72)
         if key in {"coin", "symbol"}:
             return (72, 140)
-        if key in {"side", "status"}:
+        if key == "side":
             return (88, 140)
+        if key == "status":
+            return (150, 320)
         if key in {"score", "entry", "exit", "gain"}:
             return (88, 128)
         if key in {"why", "logic", "trigger"}:
@@ -9541,9 +9486,21 @@ class PowerTraderHub(tk.Tk):
             return DARK_MUTED
         if col_key == "status":
             up = txt.upper()
-            if up == "READY":
+            if "ENTRY READY" in up:
                 return DARK_ACCENT
-            if up in {"TRAINING", "TRAIN FIRST", "ENTRY WAIT", "SHORT BLOCK", "EDGE LOW", "ON DECK", "NO PRICE", "WATCH"}:
+            if (
+                ("ENTRY WAIT" in up)
+                or ("ENTRY GATED" in up)
+                or ("WATCH ONLY" in up)
+                or ("DATA CHECK" in up)
+                or ("TRAINING" in up)
+                or ("TRAIN FIRST" in up)
+                or ("SHORT BLOCK" in up)
+                or ("EDGE LOW" in up)
+                or ("ON DECK" in up)
+                or ("NO PRICE" in up)
+                or (up in {"TRAINING", "TRAIN FIRST", "SHORT BLOCK", "EDGE LOW", "ON DECK", "NO PRICE", "WATCH"})
+            ):
                 return "#FFD27A"
             return DARK_MUTED if up in {"WAIT", "--"} else DARK_FG
         if col_key in {"score", "gain"}:
@@ -9574,6 +9531,8 @@ class PowerTraderHub(tk.Tk):
         base_widths: Dict[str, int],
         kind: str,
         selected_idx: int = -1,
+        draw_header: bool = True,
+        draw_body: bool = True,
     ) -> List[Dict[str, Any]]:
         try:
             view_w = max(220, int(canvas.winfo_width() or 0))
@@ -9583,7 +9542,7 @@ class PowerTraderHub(tk.Tk):
         prev_x, prev_y = self._canvas_view_start(canvas)
         widths = self._watchlist_autofit_widths(columns, headings, rows, base_widths, view_w)
         total_w = sum(int(widths.get(col, 100) or 100) for col in columns) or view_w
-        header_h = 30
+        header_h = 30 if draw_header else 0
         pad_x = 8
         pad_y = 6
         text_cols = {"why", "logic", "trigger"}
@@ -9598,31 +9557,34 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             return []
 
-        x = 0
-        for col in columns:
-            w = int(widths.get(col, 100) or 100)
-            canvas.create_rectangle(x, 0, x + w, header_h, fill=DARK_BG2, outline=DARK_BORDER, width=1)
-            anchor = "center"
-            tx = x + (w / 2)
-            if col in {"score", "entry", "exit", "gain"}:
-                anchor = "e"
-                tx = x + w - pad_x
-            elif col in text_cols:
-                anchor = "w"
-                tx = x + pad_x
-            canvas.create_text(
-                tx,
-                header_h / 2,
-                text=str(headings.get(col, col.title()) or col.title()),
-                fill=DARK_ACCENT,
-                font=("TkDefaultFont", 10, "bold"),
-                anchor=anchor,
-            )
-            x += w
+        if draw_header:
+            x = 0
+            for col in columns:
+                w = int(widths.get(col, 100) or 100)
+                canvas.create_rectangle(x, 0, x + w, header_h, fill=DARK_BG2, outline=DARK_BORDER, width=1)
+                anchor = "center"
+                tx = x + (w / 2)
+                if col in {"score", "entry", "exit", "gain"}:
+                    anchor = "e"
+                    tx = x + w - pad_x
+                elif col in text_cols:
+                    anchor = "w"
+                    tx = x + pad_x
+                canvas.create_text(
+                    tx,
+                    header_h / 2,
+                    text=str(headings.get(col, col.title()) or col.title()),
+                    fill=DARK_ACCENT,
+                    font=("TkDefaultFont", 10, "bold"),
+                    anchor=anchor,
+                )
+                x += w
 
         y = header_h
         draw_rows = list(rows or [])
-        if not draw_rows:
+        if (not draw_body):
+            draw_rows = []
+        elif not draw_rows:
             placeholder: Dict[str, Any] = {col: "--" for col in columns}
             first_col = columns[0] if columns else "symbol"
             placeholder[first_col] = "--"
@@ -9641,8 +9603,16 @@ class PowerTraderHub(tk.Tk):
             max_lines = 1
             for col in columns:
                 raw_val = str(row.get(col, "") or "")
-                wrapped[col] = raw_val
-                max_lines = max(max_lines, max(1, len([ln for ln in raw_val.splitlines() if ln.strip()]) or 1))
+                w = int(widths.get(col, 100) or 100)
+                max_cell_w = max(24, int(w - (pad_x * 2)))
+                use_bold = col in {"coin", "symbol", "side", "status", "score", "gain"}
+                font_spec = body_bold_font if use_bold else body_font
+                if col in text_cols:
+                    cell_val = self._wrap_table_text(raw_val, max_cell_w, font_spec)
+                else:
+                    cell_val = self._truncate_table_text(raw_val, max_cell_w, font_spec)
+                wrapped[col] = cell_val
+                max_lines = max(max_lines, max(1, len([ln for ln in cell_val.splitlines() if ln.strip()]) or 1))
             row_h = max(28, (max_lines * line_h) + (pad_y * 2))
             row_bg = "#13304A" if row_idx == int(selected_idx) else (DARK_PANEL if (row_idx % 2) == 0 else "#0C1827")
             x = 0
@@ -9670,7 +9640,7 @@ class PowerTraderHub(tk.Tk):
                     tx,
                     ty,
                     text=cell_txt,
-                    fill=self._watchlist_cell_fg(kind, col, str(row.get(col, "") or "")),
+                    fill=self._watchlist_cell_fg(kind, col, str(cell_txt or "")),
                     font=(body_bold_font if col in {"coin", "symbol", "side", "status", "score", "gain"} else body_font),
                     anchor=anchor,
                     width=(0),
@@ -9960,6 +9930,151 @@ class PowerTraderHub(tk.Tk):
                 return ident
         return ""
 
+    def _projection_direction_label(self, side: Any, score: Any = None) -> str:
+        side_txt = str(side or "").strip().upper()
+        try:
+            score_f = float(score if score is not None else 0.0)
+        except Exception:
+            score_f = 0.0
+        if side_txt in {"LONG", "BUY"}:
+            return "Upward"
+        if side_txt in {"SHORT", "SELL"}:
+            return "Downward"
+        if score_f > 0.0:
+            return "Upward Bias"
+        if score_f < 0.0:
+            return "Downward Bias"
+        return "Neutral"
+
+    def _projected_sell_timing_label(
+        self,
+        *,
+        projected_move_pct: float,
+        change_6h_pct: float,
+        change_24h_pct: float,
+    ) -> str:
+        move_abs = abs(float(projected_move_pct or 0.0))
+        pace_candidates: List[float] = []
+        if math.isfinite(change_24h_pct) and abs(change_24h_pct) > 1e-6:
+            pace_candidates.append(abs(change_24h_pct))
+        if math.isfinite(change_6h_pct) and abs(change_6h_pct) > 1e-6:
+            pace_candidates.append(abs(change_6h_pct) * 4.0)
+        if move_abs <= 0.0 or (not pace_candidates):
+            return "On signal"
+        daily_pace = max(pace_candidates)
+        if daily_pace <= 1e-6:
+            return "On signal"
+        est_days = max(0.25, min(30.0, move_abs / daily_pace))
+        if est_days < 1.0:
+            return f"{int(round(est_days * 24.0))}h"
+        return f"{est_days:.1f}d"
+
+    def _stock_manual_watchlist_rows(self, limit: int = 20) -> List[Dict[str, str]]:
+        out: List[Dict[str, str]] = []
+        trader_gate_reason = ""
+        market_closed = False
+        try:
+            trader_path = str((self.market_trader_paths or {}).get("stocks", "") or "").strip()
+        except Exception:
+            trader_path = ""
+        if trader_path:
+            trader_row = _safe_read_json(trader_path) or {}
+            trader_gate_reason = str(trader_row.get("entry_eval_top_reason", "") or "").strip()
+        try:
+            thinker_path = str((self.market_thinker_paths or {}).get("stocks", "") or "").strip()
+        except Exception:
+            thinker_path = ""
+        if thinker_path:
+            thinker_row = _safe_read_json(thinker_path) or {}
+            ai_state = str(thinker_row.get("ai_state", "") or "").strip().lower()
+            msg = str(thinker_row.get("msg", "") or "").strip().lower()
+            market_closed = bool(thinker_row.get("market_open") is False) or ("market closed" in ai_state) or ("market closed" in msg)
+        try:
+            payload = _safe_read_json(self.stock_manual_watchlist_path) or {}
+            symbols_map = payload.get("symbols", {}) if isinstance(payload.get("symbols", {}), dict) else {}
+        except Exception:
+            symbols_map = {}
+        for symbol, meta in list(symbols_map.items())[: max(1, int(limit or 20))]:
+            ident = model_quality_pass._normalize_stock_ticker(symbol)
+            if not ident:
+                continue
+            preview = _safe_read_json(model_quality_pass._stock_watchlist_preview_path(self.hub_dir, ident)) or {}
+            readiness = preview.get("stock_readiness", {}) if isinstance(preview.get("stock_readiness", {}), dict) else {}
+            blockers = [str(x or "").strip() for x in list(readiness.get("trade_blockers", []) or []) if str(x or "").strip()]
+            eligible = bool(readiness.get("trade_eligible", False))
+            direction = str(preview.get("predicted_direction", "") or "").strip().lower()
+            pnl_trend = str(preview.get("predicted_pnl_trend", "") or "").strip().lower()
+            direction_label = "Neutral"
+            if direction == "up":
+                direction_label = "Upward"
+            elif direction == "down":
+                direction_label = "Downward"
+            try:
+                conf = float(preview.get("confidence", 0.0) or 0.0)
+            except Exception:
+                conf = 0.0
+            try:
+                avg_pnl = float((preview.get("common_historical_outcomes", {}) if isinstance(preview.get("common_historical_outcomes", {}), dict) else {}).get("average_pnl_pct", 0.0) or 0.0)
+            except Exception:
+                avg_pnl = 0.0
+            projected_move_pct = abs(avg_pnl)
+            if pnl_trend == "down":
+                projected_move_pct = -projected_move_pct
+            elif pnl_trend == "up":
+                projected_move_pct = projected_move_pct
+            elif direction == "down":
+                projected_move_pct = -projected_move_pct
+            runtime_gate_reason = ""
+            if eligible and market_closed:
+                runtime_gate_reason = "Market closed; new stock entries pause until the next session."
+            elif eligible and trader_gate_reason:
+                runtime_gate_reason = trader_gate_reason
+            status_txt = (
+                "MANUAL / EXECUTION GATED"
+                if (eligible and runtime_gate_reason)
+                else (
+                    "MANUAL / ENTRY READY"
+                    if eligible
+                    else (
+                        "MANUAL / PREVIEW READY"
+                        if bool(preview)
+                        else (
+                            "MANUAL / WARMING"
+                            if str((meta or {}).get("historical_warmup_status", "") or "").strip().lower() != "ready"
+                            else "MANUAL / PENDING"
+                        )
+                    )
+                )
+            )
+            why_txt = runtime_gate_reason or (", ".join(blockers[:3]) if blockers else "Manually added to watchlist.")
+            logic_txt = str(preview.get("stock_pnl_quality_reason", "") or "").strip() or str(preview.get("explanation", "") or "").strip()
+            trigger_txt = str(preview.get("predicted_exit_trigger", "Preview pending") or "Preview pending")
+            if runtime_gate_reason:
+                trigger_txt = runtime_gate_reason
+            sell_in_txt = "On signal"
+            if bool(preview):
+                sell_in_txt = self._projected_sell_timing_label(
+                    projected_move_pct=projected_move_pct,
+                    change_6h_pct=0.0,
+                    change_24h_pct=0.0,
+                )
+            out.append(
+                {
+                    "symbol": ident,
+                    "projection": direction_label,
+                    "score": f"{conf:+.4f}" if conf > 0.0 else "N/A",
+                    "entry": "Preview",
+                    "exit": "Model",
+                    "gain": f"{projected_move_pct:+.2f}%" if math.isfinite(projected_move_pct) else "N/A",
+                    "sell_in": sell_in_txt,
+                    "status": status_txt,
+                    "why": why_txt,
+                    "logic": logic_txt,
+                    "trigger": trigger_txt,
+                }
+            )
+        return out
+
     def _market_watchlist_rows(
         self,
         market_key: str,
@@ -9974,9 +10089,49 @@ class PowerTraderHub(tk.Tk):
             profit_target_pct = float(self.settings.get(profit_key, 0.0) or 0.0)
         except Exception:
             profit_target_pct = 0.0
+        trader_gate_reason = ""
+        if mk in {"stocks", "forex"}:
+            try:
+                trader_path = str((self.market_trader_paths or {}).get(mk, "") or "").strip()
+            except Exception:
+                trader_path = ""
+            if trader_path:
+                trader_row = _safe_read_json(trader_path) or {}
+                trader_gate_reason = str(trader_row.get("entry_eval_top_reason", "") or "").strip()
+        open_idents: set[str] = set()
+        try:
+            status_path = str((self.market_status_paths or {}).get(mk, "") or "").strip()
+        except Exception:
+            status_path = ""
+        if status_path:
+            status_row = _safe_read_json(status_path) or {}
+            raw_positions = (
+                list(status_row.get("raw_positions", []) or [])
+                if isinstance(status_row.get("raw_positions", []), list)
+                else []
+            )
+            for pos in raw_positions:
+                if not isinstance(pos, dict):
+                    continue
+                ident = str(
+                    pos.get("symbol", "")
+                    or pos.get("pair", "")
+                    or pos.get("instrument", "")
+                    or ""
+                ).strip().upper()
+                if ident:
+                    open_idents.add(ident)
         scan_rows: List[Dict[str, Any]] = []
         seen_idents: set[str] = set()
         take_n = max(1, int(limit or 20))
+        manual_rows: List[Dict[str, str]] = []
+        if mk == "stocks":
+            manual_rows = self._stock_manual_watchlist_rows(limit=take_n)
+            for row in manual_rows:
+                ident = str(row.get("symbol", "") or "").strip().upper()
+                if ident and ident not in open_idents:
+                    seen_idents.add(ident)
+
         for payload_key in ("leaders", "all_scores"):
             payload_rows = thinker.get(payload_key, [])
             if not isinstance(payload_rows, list):
@@ -9987,6 +10142,8 @@ class PowerTraderHub(tk.Tk):
                 ident = str(row.get("pair") or row.get("symbol") or "").strip().upper()
                 if (not ident) or (ident in seen_idents):
                     continue
+                if ident in open_idents:
+                    continue
                 seen_idents.add(ident)
                 scan_rows.append(row)
                 if len(scan_rows) >= take_n:
@@ -9996,8 +10153,10 @@ class PowerTraderHub(tk.Tk):
         if (not scan_rows) and isinstance(thinker.get("top_pick", {}), dict):
             top_row = dict(thinker.get("top_pick", {}) or {})
             ident = str(top_row.get("pair") or top_row.get("symbol") or "").strip().upper()
-            if ident:
+            if ident and (ident not in open_idents):
                 scan_rows.append(top_row)
+        if manual_rows:
+            rows.extend(list(manual_rows)[:take_n])
         for idx, row in enumerate(scan_rows[:take_n], start=1):
             if not isinstance(row, dict):
                 continue
@@ -10034,10 +10193,26 @@ class PowerTraderHub(tk.Tk):
             status_txt = "READY" if eligible else ("ENTRY WAIT" if side in {"LONG", "SHORT"} else side)
             if score_outlier:
                 status_txt = "DATA CHECK"
+            if score_outlier:
+                status_txt = "SCAN READY / DATA CHECK"
+            elif eligible:
+                status_txt = "SCAN READY / EXECUTION GATED" if (mk in {"stocks", "forex"} and trader_gate_reason) else "SCAN READY / ENTRY READY"
+            elif side in {"LONG", "SHORT"}:
+                status_txt = "SCAN READY / ENTRY GATED"
+            else:
+                status_txt = "SCAN READY / WATCH ONLY"
             try:
                 last_price = float(row.get("last", 0.0) or 0.0)
             except Exception:
                 last_price = 0.0
+            try:
+                change_6h_pct = float(row.get("change_6h_pct", 0.0) or 0.0)
+            except Exception:
+                change_6h_pct = 0.0
+            try:
+                change_24h_pct = float(row.get("change_24h_pct", 0.0) or 0.0)
+            except Exception:
+                change_24h_pct = 0.0
             try:
                 calib_prob = float(row.get("calibration_effective_prob", row.get("calib_prob", 0.0)) or 0.0)
             except Exception:
@@ -10049,7 +10224,9 @@ class PowerTraderHub(tk.Tk):
                 trigger_bits.append(f"last {_fmt_price(last_price)}")
             trigger_suffix = f" ({' | '.join(trigger_bits)})" if trigger_bits else ""
             if eligible:
-                if mk == "stocks":
+                if mk in {"stocks", "forex"} and trader_gate_reason:
+                    trigger_txt = f"Model entry is ready for {ident}, but execution is currently gated: {trader_gate_reason}{trigger_suffix}"
+                elif mk == "stocks":
                     trigger_txt = f"Trader step can open {side} on the next cycle if {ident} keeps this setup and capacity is available{trigger_suffix}."
                 else:
                     trigger_txt = f"Trader step can open {side} on the next cycle if {ident} keeps this setup and risk size still fits{trigger_suffix}."
@@ -10076,20 +10253,28 @@ class PowerTraderHub(tk.Tk):
             gain_txt = "N/A"
             if entry_val > 0.0 and exit_val > 0.0 and math.isfinite(gain_pct) and abs(float(gain_pct)) <= 250.0:
                 gain_txt = f"{gain_pct:+.2f}%"
+            proj_dir_txt = self._projection_direction_label(side, raw_score)
+            sell_in_txt = self._projected_sell_timing_label(
+                projected_move_pct=gain_pct,
+                change_6h_pct=change_6h_pct,
+                change_24h_pct=change_24h_pct,
+            )
             rows.append(
                 {
                     "symbol": ident,
+                    "projection": proj_dir_txt,
                     "score": score_txt,
                     "entry": _fmt_price(entry_val) if entry_val > 0.0 else "N/A",
                     "exit": _fmt_price(exit_val) if exit_val > 0.0 else "N/A",
                     "gain": gain_txt,
+                    "sell_in": sell_in_txt,
                     "status": status_txt,
                     "why": why_txt,
                     "logic": logic_txt,
                     "trigger": trigger_txt,
                 }
             )
-        return rows
+        return rows[:take_n]
 
     def _market_account_value_from_snapshot(
         self,
@@ -12004,9 +12189,17 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             updated_txt = ""
         try:
+            manual_count = 0
+            if mk == "stocks":
+                manual_count = sum(
+                    1
+                    for row in list(rows or [])
+                    if isinstance(row, dict) and str(row.get("status", "") or "").strip().upper().startswith("MANUAL /")
+                )
             meta_var.set(
                 (
                     f"Leaders {len(rows)}"
+                    + (f" | manual {manual_count}" if manual_count > 0 else "")
                     + (f" | updated {updated_txt}" if updated_txt else "")
                     + (" | holding previous watchlist while scanner refreshes" if using_cached_rows else "")
                     + (" | double-click a row to focus the chart" if rows else "")
@@ -12021,11 +12214,29 @@ class PowerTraderHub(tk.Tk):
     def _draw_market_watchlist_table(self, market_key: str) -> None:
         panel = self.market_panels.get(market_key, {})
         canvas = panel.get("watch_canvas")
+        header_canvas = panel.get("watch_header_canvas")
         cols = tuple(panel.get("watch_columns", ()) or ())
         headings = dict(panel.get("watch_headings", {}) or {})
         base_widths = dict(panel.get("watch_widths", {}) or {})
         if canvas is None or not cols:
             return
+        if header_canvas is not None:
+            try:
+                header_canvas.configure(width=max(220, int(canvas.winfo_width() or 0)))
+                self._draw_watchlist_canvas_table(
+                    header_canvas,
+                    columns=cols,
+                    headings=headings,
+                    rows=[],
+                    base_widths=base_widths,
+                    kind=str(market_key or "").strip().lower(),
+                    selected_idx=-1,
+                    draw_header=True,
+                    draw_body=False,
+                )
+                header_canvas.xview_moveto(canvas.xview()[0] if hasattr(canvas, "xview") else 0.0)
+            except Exception:
+                pass
         regions = self._draw_watchlist_canvas_table(
             canvas,
             columns=cols,
@@ -12034,6 +12245,7 @@ class PowerTraderHub(tk.Tk):
             base_widths=base_widths,
             kind=str(market_key or "").strip().lower(),
             selected_idx=int(panel.get("watch_selected_idx", -1) or -1),
+            draw_header=False,
         )
         panel["watch_row_regions"] = list(regions or [])
 
@@ -12799,11 +13011,16 @@ class PowerTraderHub(tk.Tk):
                     realized_val = self._coerce_float_value(raw)
                     if realized_val is not None:
                         break
-            parts = [when, f"{action}/{phase:5s}", f"{ident:7s}"]
+            action_tag = f"{action}/{phase}"
+            parts = [when, f"{action_tag:10s} {ident:7s}"]
             if qty_txt:
                 parts.append(f"qty={qty_txt}")
             if px_txt != "N/A":
                 parts.append(f"px={px_txt}")
+            if phase == "CLOSE":
+                pnl_pct_val = self._coerce_float_value(row.get("pnl_pct", None))
+                if pnl_pct_val is not None:
+                    parts.append(f"pnl@trade={_fmt_pct(float(pnl_pct_val))}")
             if bool(row.get("_synthetic")):
                 parts.append("source=broker snapshot")
             if (realized_val is not None) and phase == "CLOSE":
@@ -12872,6 +13089,18 @@ class PowerTraderHub(tk.Tk):
             if ident:
                 open_state[ident] = (event == "entry")
 
+        # Keep a bounded history view for UI responsiveness.
+        window_rows: List[Dict[str, Any]] = list(completed[-250:])
+        visible_entry_markers: set[str] = set()
+        for row in window_rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("event", "") or "").strip().lower() != "entry":
+                continue
+            ident = str(row.get("symbol", "") or row.get("instrument", "") or row.get("pair", "") or "").strip().upper()
+            if ident:
+                visible_entry_markers.add(ident)
+
         raw_positions = list(status.get("raw_positions", []) or []) if isinstance(status.get("raw_positions", []), list) else []
         synthetic_rows: List[Dict[str, Any]] = []
         for raw_row in raw_positions:
@@ -12879,7 +13108,11 @@ class PowerTraderHub(tk.Tk):
                 continue
             if mk == "stocks":
                 ident = str(raw_row.get("symbol", "") or "").strip().upper()
-                if (not ident) or bool(open_state.get(ident, False)):
+                if not ident:
+                    continue
+                # Ensure active positions always show an OPEN/BUY marker in the visible window,
+                # even when the original entry is older than the retained history range.
+                if ident in visible_entry_markers:
                     continue
                 side_raw = str(raw_row.get("side", "long") or "long").strip().lower()
                 try:
@@ -12901,10 +13134,15 @@ class PowerTraderHub(tk.Tk):
                     }
                 )
                 open_state[ident] = True
+                visible_entry_markers.add(ident)
                 continue
 
             ident = str(raw_row.get("instrument", "") or raw_row.get("pair", "") or "").strip().upper()
-            if (not ident) or bool(open_state.get(ident, False)):
+            if not ident:
+                continue
+            # Ensure active positions always show an OPEN/BUY marker in the visible window,
+            # even when the original entry is older than the retained history range.
+            if ident in visible_entry_markers:
                 continue
             side_txt, units_f, leg = self._market_position_leg(raw_row)
             try:
@@ -12922,8 +13160,9 @@ class PowerTraderHub(tk.Tk):
                 }
             )
             open_state[ident] = True
+            visible_entry_markers.add(ident)
 
-        return list((completed + synthetic_rows)[-250:])
+        return list((window_rows + synthetic_rows)[-250:])
 
     def _set_market_history(self, market_key: str, lines: List[Any]) -> None:
         panel = self.market_panels.get(market_key, {})
@@ -12986,6 +13225,11 @@ class PowerTraderHub(tk.Tk):
         widget = panel.get("runner_text")
         if not widget:
             return
+        try:
+            if hasattr(widget, "winfo_ismapped") and (not bool(widget.winfo_ismapped())):
+                return
+        except Exception:
+            pass
         payload = list(lines or [])
         if not payload:
             payload = ["Waiting for market runner output."]
@@ -13009,6 +13253,11 @@ class PowerTraderHub(tk.Tk):
         widget = panel.get("training_text")
         if not widget:
             return
+        try:
+            if hasattr(widget, "winfo_ismapped") and (not bool(widget.winfo_ismapped())):
+                return
+        except Exception:
+            pass
         payload = list(lines or [])
         if not payload:
             payload = ["Waiting for training/readiness output."]
@@ -13244,6 +13493,175 @@ class PowerTraderHub(tk.Tk):
             base_url=str(self.settings.get("alpaca_base_url", DEFAULT_SETTINGS.get("alpaca_base_url", "")) or ""),
             data_url=str(self.settings.get("alpaca_data_url", DEFAULT_SETTINGS.get("alpaca_data_url", "")) or ""),
         )
+
+    def _set_stock_watchlist_action_status(self, message: str) -> None:
+        panel = self.market_panels.get("stocks", {})
+        status_var = panel.get("stock_watchlist_action_var")
+        try:
+            if status_var is not None:
+                status_var.set(str(message or "").strip())
+        except Exception:
+            pass
+
+    def _start_stock_watchlist_add_flow(self, market_key: str = "stocks") -> None:
+        panel = self.market_panels.get(str(market_key or "").strip().lower(), {})
+        search_var = panel.get("stock_watchlist_search_var")
+        symbol_in = str((search_var.get() if search_var is not None else "") or "").strip()
+        normalized = model_quality_pass._normalize_stock_ticker(symbol_in)
+        if not normalized:
+            self._set_stock_watchlist_action_status("Enter a valid ticker to warm and preview.")
+            return
+        self._set_stock_watchlist_action_status(f"Checking {normalized} with the configured stock data provider...")
+
+        def _worker() -> None:
+            try:
+                validation = model_quality_pass.validate_stock_watchlist_symbol(
+                    symbol=normalized,
+                    settings=self.settings,
+                    base_dir=self.project_dir,
+                    hub_dir=self.hub_dir,
+                )
+                if not bool(validation.get("valid", False)):
+                    validation_status = str(validation.get("status", "") or "").strip().lower()
+                    msg = (
+                        f"{normalized} could not be validated."
+                        if validation_status == "invalid_symbol"
+                        else f"{normalized} validation unavailable: {str(validation.get('error', '') or validation.get('status', 'provider_unavailable')).strip()}"
+                    )
+                    self.after(0, lambda m=msg: self._set_stock_watchlist_action_status(m))
+                    return
+                already_in_watchlist = bool(validation.get("already_in_watchlist", False))
+                added = model_quality_pass.add_stock_to_manual_watchlist(
+                    hub_dir=self.hub_dir,
+                    settings=self.settings,
+                    symbol=normalized,
+                    validation_provider=str(validation.get("provider", "") or "unknown"),
+                )
+                self._save_settings()
+                warm = model_quality_pass.warm_stock_historical_cache(
+                    hub_dir=self.hub_dir,
+                    base_dir=self.project_dir,
+                    settings=self.settings,
+                    symbol=normalized,
+                    lookback_days=365,
+                    timeframe="1Hour",
+                )
+                preview = model_quality_pass.build_stock_watchlist_prediction_preview(
+                    hub_dir=self.hub_dir,
+                    base_dir=self.project_dir,
+                    settings=self.settings,
+                    symbol=normalized,
+                    timeframe="1Hour",
+                    lookback_days=365,
+                )
+                try:
+                    payload = _safe_read_json(self.stock_manual_watchlist_path) or {}
+                    rows = payload.get("symbols", {}) if isinstance(payload.get("symbols", {}), dict) else {}
+                    row = rows.get(normalized, {}) if isinstance(rows.get(normalized, {}), dict) else {}
+                    row["historical_warmup_status"] = str(warm.get("warmup_status", "") or "")
+                    row["prediction_preview_status"] = "ready" if bool(preview.get("rows_available", 0)) else "pending"
+                    row["validation_provider"] = str(validation.get("provider", "") or row.get("validation_provider", ""))
+                    rows[normalized] = row
+                    payload["symbols"] = rows
+                    payload["ts"] = int(time.time())
+                    _safe_write_json(self.stock_manual_watchlist_path, payload)
+                except Exception:
+                    pass
+                def _finish() -> None:
+                    if search_var is not None:
+                        try:
+                            search_var.set("")
+                        except Exception:
+                            pass
+                    rows_available = int(preview.get("rows_available", 0) or 0)
+                    replay_rows = int(preview.get("replay_rows_generated", 0) or 0)
+                    eligible = bool((preview.get("stock_readiness", {}) if isinstance(preview.get("stock_readiness", {}), dict) else {}).get("trade_eligible", False))
+                    blockers = list((preview.get("stock_readiness", {}) if isinstance(preview.get("stock_readiness", {}), dict) else {}).get("trade_blockers", []) or [])
+                    msg = (
+                        f"{normalized} {'already on watchlist; refreshed' if already_in_watchlist else 'added to watchlist'} | provider {validation.get('provider', 'unknown')} | "
+                        f"rows {rows_available} | replay {replay_rows} | "
+                        f"trade eligibility: {'ready' if eligible else 'blocked'}"
+                    )
+                    if blockers:
+                        msg += f" | blockers: {', '.join(str(b) for b in blockers[:4])}"
+                    self._set_stock_watchlist_action_status(msg)
+                    self._refresh_parallel_market_panels()
+                    self._open_stock_watchlist_preview("stocks", symbol=normalized, autofocus=False)
+                self.after(0, _finish)
+            except Exception as exc:
+                self.after(0, lambda: self._set_stock_watchlist_action_status(f"Stock watchlist add failed: {type(exc).__name__}: {exc}"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _open_stock_watchlist_preview(self, market_key: str = "stocks", symbol: str = "", autofocus: bool = True) -> None:
+        panel = self.market_panels.get(str(market_key or "").strip().lower(), {})
+        search_var = panel.get("stock_watchlist_search_var")
+        requested = model_quality_pass._normalize_stock_ticker(symbol or (search_var.get() if search_var is not None else ""))
+        if not requested:
+            try:
+                payload = _safe_read_json(self.stock_manual_watchlist_path) or {}
+                symbols = list((payload.get("symbols", {}) if isinstance(payload.get("symbols", {}), dict) else {}).keys())
+                requested = model_quality_pass._normalize_stock_ticker(symbols[-1] if symbols else "")
+            except Exception:
+                requested = ""
+        if not requested:
+            self._set_stock_watchlist_action_status("No manual stock preview is available yet.")
+            return
+        preview_path = model_quality_pass._stock_watchlist_preview_path(self.hub_dir, requested)
+        preview = _safe_read_json(preview_path) if preview_path else {}
+        if not preview:
+            self._set_stock_watchlist_action_status(f"No saved preview found for {requested} yet.")
+            return
+        win = tk.Toplevel(self)
+        win.title(f"{requested} Historical Replay Preview")
+        win.geometry("760x520")
+        body = tk.Text(
+            win,
+            wrap="word",
+            font=self._live_log_font,
+            bg=DARK_PANEL,
+            fg=DARK_FG,
+            padx=10,
+            pady=8,
+            insertbackground=DARK_FG,
+        )
+        body.pack(fill="both", expand=True)
+        body.insert(
+            "1.0",
+            "\n".join(
+                [
+                    f"Symbol: {requested}",
+                    f"Provider: {preview.get('provider', 'unknown')}",
+                    f"Rows available: {preview.get('rows_available', 0)}",
+                    f"Replay rows generated: {preview.get('replay_rows_generated', 0)}",
+                    f"Predicted direction: {preview.get('predicted_direction', 'unknown')}",
+                    f"Likely exit trigger: {preview.get('predicted_exit_trigger', 'Unknown')}",
+                    f"PnL trend estimate: {preview.get('predicted_pnl_trend', 'unknown')}",
+                    f"Confidence: {preview.get('confidence', 0.0)}",
+                    f"PnL quality score: {preview.get('stock_pnl_quality_score', 0.0)}",
+                    f"PnL quality reason: {preview.get('stock_pnl_quality_reason', '')}",
+                    f"Trade quality score: {preview.get('stock_trade_quality_score', 0.0)}",
+                    f"Trade quality gate applied: {preview.get('trade_quality_gate_applied', False)}",
+                    f"Trade eligibility: {((preview.get('stock_readiness', {}) if isinstance(preview.get('stock_readiness', {}), dict) else {}).get('trade_eligible', False))}",
+                    f"Blockers: {', '.join((preview.get('stock_readiness', {}) if isinstance(preview.get('stock_readiness', {}), dict) else {}).get('trade_blockers', []) or ['none'])}",
+                    "",
+                    f"Explanation: {preview.get('explanation', '')}",
+                    "",
+                    json.dumps(preview.get("common_historical_outcomes", {}), indent=2),
+                    "",
+                    json.dumps(preview.get("direction_scores", {}), indent=2),
+                    "",
+                    json.dumps(preview.get("trigger_scores", {}), indent=2),
+                ]
+            ),
+        )
+        body.configure(state="disabled")
+        if autofocus:
+            try:
+                win.lift()
+                win.focus_force()
+            except Exception:
+                pass
 
     def _make_oanda_client(self) -> OandaBrokerClient:
         account_id, token = get_oanda_creds(self.settings, base_dir=self.project_dir)
@@ -14301,7 +14719,7 @@ class PowerTraderHub(tk.Tk):
 
                 plot_left = (18 if compact_overview else min(width - 190, text_right + 12))
                 plot_right = width - 18
-                plot_top = (74 if compact_overview else 36)
+                plot_top = (106 if compact_overview else 52)
                 plot_bot = max(plot_top + 100, height - 28)
                 if plot_right > plot_left + 140 and plot_bot > plot_top + 90:
                     vmin = min(lows)
@@ -15204,7 +15622,7 @@ class PowerTraderHub(tk.Tk):
                 pass
             action_hint = ""
             if not configured:
-                action_hint = f"Next: add {broker} credentials in Settings, then click Test {broker} Connection."
+                action_hint = f"Next: add {broker} credentials in API Settings and run the broker test there."
             elif bool(self._market_test_busy.get(market_key, False)):
                 action_hint = f"Next: waiting for {broker} connection test to finish."
             elif health and (not bool(health.get("data_ok", True)) or not bool(health.get("broker_ok", True))):
@@ -15696,31 +16114,11 @@ class PowerTraderHub(tk.Tk):
                 )
 
             try:
-                busy = bool(self._market_test_busy.get(market_key, False))
-                panel["test_btn"].configure(
-                    state=("disabled" if busy else "normal"),
-                    text=("Testing..." if busy else f"Test {panel.get('broker_name', broker)} Connection"),
-                )
-            except Exception:
-                pass
-            try:
                 scan_busy = bool(self._market_thinker_busy.get(market_key, False))
                 panel["run_btn"].configure(
                     state=("disabled" if (scan_busy or (not configured)) else "normal"),
                     text=("Scanning..." if scan_busy else "Run Scan"),
                 )
-            except Exception:
-                pass
-            try:
-                step_btn = panel.get("trader_step_btn")
-                if step_btn is not None:
-                    step_market = str(panel.get("trader_step_market_key", "") or "")
-                    busy_step = bool(self._market_trader_busy.get(step_market, False))
-                    step_name = "Stocks" if step_market == "stocks" else "Forex"
-                    step_btn.configure(
-                        state=("disabled" if (busy_step or (not configured)) else "normal"),
-                        text=(f"Running {step_name} Step..." if busy_step else f"Run {step_name} Step"),
-                    )
             except Exception:
                 pass
         try:
@@ -15786,7 +16184,18 @@ class PowerTraderHub(tk.Tk):
                 msg = str(trader_data.get("msg", "") or thinker_data.get("msg", "") or status_data.get("msg", "") or "").strip()
                 panel["ai_var"].set(f"{panel['market_name']} AI: {ai_state}")
                 panel["trader_var"].set(f"{panel['market_name']} Trader: {trader_state}")
-                state_line = f"Trade State: {str(thinker_data.get('state', status_data.get('state', 'UNKNOWN')) or 'UNKNOWN')}"
+                scan_state_txt = str(thinker_data.get("state", status_data.get("state", "UNKNOWN")) or "UNKNOWN").strip().upper()
+                top_pick_row = thinker_data.get("top_pick", {}) if isinstance(thinker_data.get("top_pick", {}), dict) else {}
+                top_side = str(top_pick_row.get("side", "watch") or "watch").strip().upper()
+                top_eligible = bool(top_pick_row.get("eligible_for_entry", False))
+                top_gate = str(top_pick_row.get("entry_gate_reason", "") or "").strip()
+                if top_side in {"LONG", "SHORT"} and top_eligible and (not top_gate):
+                    entry_state_txt = "ENTRY READY"
+                elif top_side in {"LONG", "SHORT"}:
+                    entry_state_txt = "ENTRY GATED"
+                else:
+                    entry_state_txt = "WATCH ONLY"
+                state_line = f"Scan State: {scan_state_txt} | Entry State: {entry_state_txt}"
                 if msg:
                     state_line += f" | {msg}"
                 panel["state_var"].set(self._format_market_state_line(state_line))
@@ -17462,6 +17871,8 @@ class PowerTraderHub(tk.Tk):
             ui_refresh_s = 1.0
         panel_refresh_s = max(1.5, float(ui_refresh_s) * 2.0)
         log_refresh_s = max(1.5, float(ui_refresh_s) * 2.5)
+        if (getattr(self, "supervisor_text", None) is None) and (getattr(self, "trader_text", None) is None):
+            log_refresh_s = max(log_refresh_s, 3.0)
         self._parallel_market_panels_refresh_interval_s = float(panel_refresh_s)
         self._log_panel_refresh_interval_s = float(log_refresh_s)
         self._maybe_apply_profile_autotune()
@@ -17810,7 +18221,8 @@ class PowerTraderHub(tk.Tk):
             can_toggle_all = False
 
         try:
-            self.btn_toggle_all.configure(state=("normal" if can_toggle_all else "disabled"))
+            if hasattr(self, "btn_toggle_all") and self.btn_toggle_all:
+                self.btn_toggle_all.configure(state=("normal" if can_toggle_all else "disabled"))
         except Exception:
             pass
         try:
@@ -17826,12 +18238,13 @@ class PowerTraderHub(tk.Tk):
 
         # Make the Start/Stop button intent explicit when gated by training.
         try:
-            if not can_toggle_all:
-                self.btn_toggle_all.configure(text="Start Trades (Train All First)")
-            elif neural_running or trader_running or bool(getattr(self, "_auto_start_trader_pending", False)):
-                self.btn_toggle_all.configure(text="Stop Trades")
-            else:
-                self.btn_toggle_all.configure(text="Start Trades")
+            if hasattr(self, "btn_toggle_all") and self.btn_toggle_all:
+                if not can_toggle_all:
+                    self.btn_toggle_all.configure(text="Start Trades (Train All First)")
+                elif neural_running or trader_running or bool(getattr(self, "_auto_start_trader_pending", False)):
+                    self.btn_toggle_all.configure(text="Stop Trades")
+                else:
+                    self.btn_toggle_all.configure(text="Start Trades")
         except Exception:
             pass
 
@@ -18086,27 +18499,42 @@ class PowerTraderHub(tk.Tk):
         log_refresh_due = log_elapsed_s >= float(log_refresh_s) and (log_dirty_hint or log_force_due)
         if log_refresh_due:
             self._last_log_panel_refresh_ts = now
-            self._drain_queue_to_text(self.runner_log_q, self.supervisor_text)
-            self._drain_queue_to_text(self.trader_log_q, self.trader_text)
-            self._refresh_log_file_to_text(
-                self.runner_log_path,
-                self.runner_text,
-                "_last_runner_log_sig",
-                max_lines=300,
-            )
-            self._refresh_log_file_to_text(
-                self.supervisor_log_path,
-                self.supervisor_text,
-                "_last_supervisor_log_sig",
-                max_lines=300,
-                prefix_path=self.runner_launch_log_path,
-            )
-            self._refresh_log_file_to_text(
-                self.trader_log_path,
-                self.trader_text,
-                "_last_trader_log_sig",
-                max_lines=300,
-            )
+            if getattr(self, "supervisor_text", None) is not None:
+                self._drain_queue_to_text(self.runner_log_q, self.supervisor_text)
+                self._refresh_log_file_to_text(
+                    self.supervisor_log_path,
+                    self.supervisor_text,
+                    "_last_supervisor_log_sig",
+                    max_lines=300,
+                    prefix_path=self.runner_launch_log_path,
+                )
+            else:
+                try:
+                    while True:
+                        self.runner_log_q.get_nowait()
+                except queue.Empty:
+                    pass
+            if getattr(self, "trader_text", None) is not None:
+                self._drain_queue_to_text(self.trader_log_q, self.trader_text)
+                self._refresh_log_file_to_text(
+                    self.trader_log_path,
+                    self.trader_text,
+                    "_last_trader_log_sig",
+                    max_lines=300,
+                )
+            else:
+                try:
+                    while True:
+                        self.trader_log_q.get_nowait()
+                except queue.Empty:
+                    pass
+            if getattr(self, "runner_text", None) is not None:
+                self._refresh_log_file_to_text(
+                    self.runner_log_path,
+                    self.runner_text,
+                    "_last_runner_log_sig",
+                    max_lines=300,
+                )
 
         # trainer logs: show selected trainer output
         try:
@@ -19737,25 +20165,26 @@ class PowerTraderHub(tk.Tk):
                 blocker = "Eligible now; waiting for next trader cycle."
 
             if training_active:
-                status = "TRAINING"
+                status = "SCAN READY / TRAINING"
             elif not trained:
-                status = "TRAIN FIRST"
+                status = "SCAN READY / TRAIN FIRST"
             elif score < min_edge:
-                status = "EDGE LOW"
+                status = "SCAN READY / ENTRY GATED (EDGE LOW)"
             elif not in_active:
-                status = "ON DECK"
+                status = "SCAN READY / ON DECK"
             elif short_sig > 0:
-                status = "SHORT BLOCK"
+                status = "SCAN READY / ENTRY GATED (SHORT BLOCK)"
             elif long_sig < start_level:
-                status = "ENTRY WAIT"
+                status = "SCAN READY / ENTRY WAIT"
             elif projected_entry <= 0.0:
-                status = "NO PRICE"
+                status = "SCAN READY / NO PRICE"
             else:
-                status = "READY"
+                status = "SCAN READY / ENTRY READY"
 
             rows.append(
                 {
                     "coin": coin,
+                    "side": str(row.get("side", "") or "").strip().upper(),
                     "score": score,
                     "logic": logic,
                     "blocker": blocker,
@@ -19819,13 +20248,21 @@ class PowerTraderHub(tk.Tk):
             gain_txt = "N/A"
             if entry_val > 0.0 and exit_val > 0.0 and math.isfinite(gain_pct) and abs(float(gain_pct)) <= 250.0:
                 gain_txt = f"{gain_pct:+.2f}%"
+            proj_dir_txt = self._projection_direction_label(row.get("side", ""), score)
+            sell_in_txt = self._projected_sell_timing_label(
+                projected_move_pct=gain_pct,
+                change_6h_pct=max(0.0, score),
+                change_24h_pct=max(0.0, score),
+            )
             display_rows.append(
                 {
                     "coin": str(row.get("coin", "") or "").strip().upper(),
+                    "projection": proj_dir_txt,
                     "score": score_txt,
                     "entry": _fmt_price(entry_val) if entry_val > 0.0 else "N/A",
                     "exit": _fmt_price(exit_val) if exit_val > 0.0 else "N/A",
                     "gain": gain_txt,
+                    "sell_in": sell_in_txt,
                     "status": str(row.get("status", "WAIT") or "WAIT").strip().upper(),
                     "why": str(row.get("blocker", "") or "").strip(),
                     "logic": str(row.get("logic", "") or "").strip(),
@@ -22162,7 +22599,7 @@ class PowerTraderHub(tk.Tk):
                 "pm_start_pct_no_dca": 6.0,
                 "pm_start_pct_with_dca": 3.5,
                 "trailing_gap_pct": 0.35,
-                "max_total_exposure_pct": 20.0,
+                "max_total_exposure_pct": 60.0,
                 "kucoin_unsupported_cooldown_s": 43200.0,
                 "crypto_price_error_log_cooldown_s": 240.0,
                 "key_rotation_warn_days": 0,
@@ -22195,7 +22632,7 @@ class PowerTraderHub(tk.Tk):
                 "stock_profit_target_pct": 0.40,
                 "stock_trailing_gap_pct": 0.15,
                 "stock_max_day_trades": 1,
-                "stock_max_total_exposure_pct": 20.0,
+                "stock_max_total_exposure_pct": 60.0,
                 "stock_live_guarded_score_mult": 1.35,
                 "stock_min_calib_prob_live_guarded": 0.70,
                 "stock_max_slippage_bps": 20.0,
@@ -22231,7 +22668,7 @@ class PowerTraderHub(tk.Tk):
                 "forex_replay_adaptive_step_cap_pct": 25.0,
                 "forex_profit_target_pct": 0.30,
                 "forex_trailing_gap_pct": 0.12,
-                "forex_max_total_exposure_pct": 20.0,
+                "forex_max_total_exposure_pct": 60.0,
                 "forex_session_mode": "london_ny",
                 "forex_live_guarded_score_mult": 1.25,
                 "forex_min_calib_prob_live_guarded": 0.68,
@@ -22262,7 +22699,7 @@ class PowerTraderHub(tk.Tk):
                 "pm_start_pct_no_dca": 4.0,
                 "pm_start_pct_with_dca": 1.8,
                 "trailing_gap_pct": 0.75,
-                "max_total_exposure_pct": 65.0,
+                "max_total_exposure_pct": 60.0,
                 "kucoin_unsupported_cooldown_s": 14400.0,
                 "crypto_price_error_log_cooldown_s": 60.0,
                 "key_rotation_warn_days": 0,
@@ -22302,7 +22739,7 @@ class PowerTraderHub(tk.Tk):
                 "stock_profit_target_pct": 1.80,
                 "stock_trailing_gap_pct": 0.70,
                 "stock_max_day_trades": 1,
-                "stock_max_total_exposure_pct": 55.0,
+                "stock_max_total_exposure_pct": 60.0,
                 "stock_live_guarded_score_mult": 1.15,
                 "stock_min_calib_prob_live_guarded": 0.56,
                 "stock_max_slippage_bps": 30.0,
@@ -22339,7 +22776,7 @@ class PowerTraderHub(tk.Tk):
                 "forex_replay_adaptive_step_cap_pct": 60.0,
                 "forex_profit_target_pct": 0.18,
                 "forex_trailing_gap_pct": 0.14,
-                "forex_max_total_exposure_pct": 55.0,
+                "forex_max_total_exposure_pct": 60.0,
                 "forex_session_mode": "all",
                 "forex_live_guarded_score_mult": 1.02,
                 "forex_min_calib_prob_live_guarded": 0.48,

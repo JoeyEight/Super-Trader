@@ -5077,6 +5077,10 @@ def validate_stock_watchlist_symbol(
     settings_watch = {_normalize_stock_ticker(tok) for tok in _s(settings.get("stock_universe_symbols", "")).replace("\n", ",").split(",")}
     if normalized and (normalized in existing_watch or normalized in settings_watch):
         result["already_in_watchlist"] = True
+        result["valid"] = True
+        result["status"] = "already_in_watchlist"
+        result["stock_watchlist_search_valid"] = True
+        return result
     if not normalized:
         result["stock_watchlist_search_error"] = "empty_symbol"
         return result
@@ -5087,8 +5091,14 @@ def validate_stock_watchlist_symbol(
         return result
     try:
         valid = False
+        now_ts = int(time.time())
+        start_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts - (120 * 86400)))
+        end_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts))
         if provider == "alpaca":
-            assets = client.list_tradable_assets()
+            try:
+                assets = client.list_tradable_assets()
+            except Exception:
+                assets = []
             if assets:
                 valid = any(
                     _normalize_stock_ticker((row or {}).get("symbol", "")) == normalized
@@ -5097,7 +5107,14 @@ def validate_stock_watchlist_symbol(
                     if isinstance(row, dict)
                 )
             if not valid:
-                valid = len(client.get_stock_bars(normalized, timeframe="1Day", limit=5, feed="iex")) > 0
+                valid = len(client.get_stock_bars(
+                    normalized,
+                    timeframe="1Day",
+                    limit=30,
+                    feed="iex",
+                    start_iso=start_iso,
+                    end_iso=end_iso,
+                )) > 0
         else:
             valid = len((client.get_time_series_batch([normalized], interval="1day", outputsize=5) or {}).get(normalized, [])) > 0
         result["valid"] = bool(valid)

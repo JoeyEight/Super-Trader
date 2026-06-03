@@ -3504,6 +3504,32 @@ class TestModelQualityPass(unittest.TestCase):
         self.assertEqual(out.get("symbol"), "BAD")
         self.assertFalse(bool(out.get("valid", False)))
 
+    def test_validate_stock_symbol_uses_dated_bar_fallback_for_after_hours_validity(self) -> None:
+        fake_client = mock.Mock()
+        fake_client.list_tradable_assets.return_value = []
+
+        def _bars(symbol, timeframe="1Day", limit=5, feed="iex", start_iso="", end_iso=""):
+            if symbol == "INTC" and start_iso and end_iso:
+                return [{"t": "2026-06-01T13:00:00Z", "c": 20.0}]
+            return []
+
+        fake_client.get_stock_bars.side_effect = _bars
+        with mock.patch.object(model_quality_pass, "_stock_provider_client", return_value=("alpaca", fake_client, {})):
+            out = validate_stock_watchlist_symbol(symbol="INTC", settings={}, base_dir="/tmp")
+        self.assertEqual(out.get("symbol"), "INTC")
+        self.assertTrue(bool(out.get("valid", False)))
+        self.assertEqual(out.get("status"), "valid_symbol")
+
+    def test_validate_stock_symbol_allows_already_added_watchlist_symbol(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            settings = {"stock_universe_symbols": "AAPL"}
+            add_stock_to_manual_watchlist(hub_dir=td, settings=settings, symbol="NVDA", validation_provider="alpaca")
+            out = validate_stock_watchlist_symbol(symbol="NVDA", settings=settings, base_dir=td, hub_dir=td)
+        self.assertEqual(out.get("symbol"), "NVDA")
+        self.assertTrue(bool(out.get("valid", False)))
+        self.assertTrue(bool(out.get("already_in_watchlist", False)))
+        self.assertEqual(out.get("status"), "already_in_watchlist")
+
     def test_targeted_stock_warmup_and_preview_use_existing_cache_path(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             settings = {"stock_data_provider": "alpaca"}
