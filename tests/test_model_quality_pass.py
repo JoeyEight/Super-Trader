@@ -1560,6 +1560,57 @@ class TestModelQualityPass(unittest.TestCase):
             self.assertIn("stock_trade_quality_score", preview)
             self.assertIn("trade_quality_gate_applied", preview)
 
+    def test_stock_watchlist_preview_accepts_controlled_rollout_eligible_field(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            settings = {"stock_data_provider": "alpaca"}
+            bars = []
+            base_ts = 1_700_000_000
+            price = 100.0
+            for i in range(72):
+                price *= 1.004 if i < 36 else 1.001
+                bars.append(
+                    {
+                        "t": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(base_ts + (i * 3600))),
+                        "o": price,
+                        "h": price * 1.01,
+                        "l": price * 0.995,
+                        "c": price,
+                        "v": 1000,
+                    }
+                )
+            self._write_json(
+                os.path.join(td, "model_quality_full_pass.json"),
+                {
+                    "controlled_rollout_readiness": {
+                        "stocks": {
+                            "eligible": True,
+                            "reason": "",
+                            "blockers": [],
+                        }
+                    }
+                },
+            )
+            fake_client = mock.Mock()
+            fake_client.get_stock_bars.return_value = list(bars)
+            fake_pred = {
+                "predicted_direction": "up",
+                "predicted_exit_trigger": "Trailing",
+                "predicted_pnl_trend": "up",
+                "predicted_confidence": 0.85,
+                "stock_pnl_quality_score": 0.7,
+                "stock_pnl_quality_reason": "clean_trend_followthrough",
+                "stock_trade_quality_score": 0.65,
+                "stock_trade_quality_gate_applied": False,
+                "direction_scores": {"up": 1.0, "down": 0.2},
+                "trigger_scores": {"Trailing": 1.0, "Stale Alignment": 0.1},
+            }
+            with mock.patch.object(model_quality_pass, "_stock_provider_client", return_value=("alpaca", fake_client, {})):
+                with mock.patch.object(model_quality_pass, "_stock_predict_one", return_value=fake_pred):
+                    warm_stock_historical_cache(hub_dir=td, base_dir=td, settings=settings, symbol="NVDA")
+                    preview = build_stock_watchlist_prediction_preview(hub_dir=td, base_dir=td, settings=settings, symbol="NVDA")
+            blockers = list(preview.get("manual_watchlist_trade_blockers", []) or [])
+            self.assertNotIn("market_rollout_not_ready", blockers)
+
     def test_safe_selection_falls_back_to_baseline_when_crypto_candidate_regresses(self) -> None:
         closed_rows = []
         ts = 1_700_000_000

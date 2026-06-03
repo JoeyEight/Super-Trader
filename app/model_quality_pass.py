@@ -5437,7 +5437,12 @@ def build_stock_watchlist_prediction_preview(
             blockers.append("trade_quality_gate_applied")
     rollout = _safe_read_json(os.path.join(hub_dir, "model_quality_full_pass.json"))
     stocks_rollout = rollout.get("controlled_rollout_readiness", {}).get("stocks", {}) if isinstance(rollout.get("controlled_rollout_readiness", {}), dict) else {}
-    if stocks_rollout and not bool(stocks_rollout.get("controlled_rollout_eligible", False)):
+    rollout_eligible = False
+    if stocks_rollout:
+        rollout_eligible = bool(
+            stocks_rollout.get("controlled_rollout_eligible", stocks_rollout.get("eligible", False))
+        )
+    if stocks_rollout and not rollout_eligible:
         blockers.append("market_rollout_not_ready")
     preview["stock_readiness"]["trade_blockers"] = blockers
     preview["stock_readiness"]["trade_eligible"] = not blockers

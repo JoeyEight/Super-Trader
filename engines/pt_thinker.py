@@ -41,11 +41,13 @@ _KUCOIN_CACHE_TTL_SEC = float(os.environ.get("PT_KUCOIN_CACHE_TTL_SEC", "2.5"))
 _KUCOIN_STALE_MAX_SEC = float(os.environ.get("PT_KUCOIN_STALE_MAX_SEC", "120.0"))
 _KUCOIN_UNSUPPORTED_COOLDOWN_S = float(os.environ.get("PT_KUCOIN_UNSUPPORTED_COOLDOWN_S", "21600.0"))
 _CRYPTO_PRICE_ERR_LOG_COOLDOWN_S = float(os.environ.get("PT_CRYPTO_PRICE_ERR_LOG_COOLDOWN_S", "120.0"))
+_RH_UNSUPPORTED_SYMBOL_COOLDOWN_S = float(os.environ.get("PT_RH_UNSUPPORTED_SYMBOL_COOLDOWN_S", "21600.0"))
 _kucoin_last_call_mono = 0.0
 _kucoin_error_streak = 0
 _kucoin_cooldown_until_mono = 0.0
 _kucoin_cache = {}
 _kucoin_unsupported_until_mono = {}
+_rh_unsupported_until_mono = {}
 _kucoin_tune_cache = {
 	"mtime": None,
 	"vals": (
@@ -103,6 +105,8 @@ def _is_retryable_price_exception(exc: Exception) -> bool:
 		"missing robinhood credentials",
 		"api key is empty",
 		"failed to decode robinhood private key",
+		"invalid symbol",
+		"validation_error",
 		"unsupported trading pair",
 		"400100",
 		"best_bid_ask returned no results",
@@ -125,6 +129,26 @@ def _is_retryable_price_exception(exc: Exception) -> bool:
 		"connection reset",
 	)
 	return any(tok in msg for tok in retry_tokens)
+
+
+def _is_robinhood_invalid_symbol_exception(exc: Exception) -> bool:
+	msg = str(exc or "").strip().lower()
+	if not msg:
+		return False
+	return ("invalid symbol" in msg) or ("validation_error" in msg)
+
+
+def _robinhood_symbol_is_temporarily_unsupported(symbol: str) -> bool:
+	now = time.monotonic()
+	until = float(_rh_unsupported_until_mono.get(str(symbol or "").strip().upper(), 0.0) or 0.0)
+	return now < until
+
+
+def _mark_robinhood_symbol_unsupported(symbol: str) -> None:
+	sym = str(symbol or "").strip().upper()
+	if not sym:
+		return
+	_rh_unsupported_until_mono[sym] = time.monotonic() + float(max(300.0, _RH_UNSUPPORTED_SYMBOL_COOLDOWN_S))
 
 
 def _get_kline_shaped(symbol: str, kline_type: str, retry_forever: bool = True, max_attempts: int = 4):
@@ -1503,24 +1527,34 @@ def step_coin(sym: str):
 		# reset tf_update for this coin (but DO NOT block-wait; just detect updates and return)
 		tf_update = ['no'] * len(tf_choices)
 
-		# get current price ONCE per coin — use Robinhood's current ASK (same as rhcb trader buy price)
+		# get current price ONCE per coin — prefer Robinhood for supported symbols,
+		# but fall back directly to KuCoin after a confirmed invalid-symbol rejection.
 		rh_symbol = f"{sym}-USD"
 		current = None
 		max_price_attempts = 25
 		_, _, _, _, price_log_cd_s = _kucoin_tune_values()
-		for _attempt in range(1, max_price_attempts + 1):
-			try:
-				current = robinhood_current_ask(rh_symbol)
-				break
-			except Exception as e:
-				log_throttled(
-					f"pt_thinker:price_feed:{sym}:{type(e).__name__}",
-					f"[pt_thinker] {sym} price feed error: {e}",
-					cooldown_s=float(price_log_cd_s),
-				)
-				if not _is_retryable_price_exception(e):
+		if not _robinhood_symbol_is_temporarily_unsupported(rh_symbol):
+			for _attempt in range(1, max_price_attempts + 1):
+				try:
+					current = robinhood_current_ask(rh_symbol)
 					break
-				time.sleep(min(5.0, 0.2 * _attempt))
+				except Exception as e:
+					if _is_robinhood_invalid_symbol_exception(e):
+						_mark_robinhood_symbol_unsupported(rh_symbol)
+						log_throttled(
+							f"pt_thinker:price_feed_unsupported:{sym}",
+							f"[pt_thinker] {sym} is not supported by Robinhood market-data; using KuCoin fallback",
+							cooldown_s=float(max(60.0, min(_RH_UNSUPPORTED_SYMBOL_COOLDOWN_S, 7200.0))),
+						)
+						break
+					log_throttled(
+						f"pt_thinker:price_feed:{sym}:{type(e).__name__}",
+						f"[pt_thinker] {sym} price feed error: {e}",
+						cooldown_s=float(price_log_cd_s),
+					)
+					if not _is_retryable_price_exception(e):
+						break
+					time.sleep(min(5.0, 0.2 * _attempt))
 		if current is None:
 			try:
 				kucoin_live = _kucoin_live_current_price(sym)
