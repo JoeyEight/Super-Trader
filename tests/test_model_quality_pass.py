@@ -9,14 +9,18 @@ from unittest import mock
 
 import app.model_quality_pass as model_quality_pass
 import app.crypto_historical_replay as crypto_historical_replay
+from app.crypto_original_predictor import derive_crypto_original_signal_dry_run, predict_crypto_original_dry_run
 from app.crypto_artifacts import discover_crypto_trained_artifacts, load_crypto_artifact_features
 from app.crypto_historical_replay import build_crypto_historical_strategy_replay
 from app.model_quality_pass import (
     _augment_historical_blind_rows,
     _build_historical_blind_simulation,
+    _build_crypto_trigger_classifier_candidate,
     _crypto_apply_second_stage_discriminator,
     _crypto_blind_trigger_predict,
+    _crypto_trigger_classifier_dataset_rows,
     _historical_blind_diagnostics,
+    _split_walkforward_rows,
     _completed_live_decision_rows,
     _verify_completed_live_synthetic_paths,
     _generate_stock_historical_replay_closed_trades,
@@ -2856,6 +2860,145 @@ class TestModelQualityPass(unittest.TestCase):
             self.assertIn(out.get("state"), {"NO_DATA", "READY"})
             self.assertIn("replay_cache_path", out.get("diagnostics", {}))
 
+    def test_crypto_original_predictor_is_replay_safe_and_parses_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            coin_dir = os.path.join(td, "BTC")
+            os.makedirs(coin_dir, exist_ok=True)
+            with open(os.path.join(coin_dir, "neural_perfect_threshold_1hour.txt"), "w", encoding="utf-8") as f:
+                f.write("20.0")
+            with open(os.path.join(coin_dir, "memories_1hour.txt"), "w", encoding="utf-8") as f:
+                f.write("1.0 2.0{}4.0{}-1.0~0.5 -1.5{}1.0{}-2.0")
+            for name in ("memory_weights_1hour.txt", "memory_weights_high_1hour.txt", "memory_weights_low_1hour.txt"):
+                with open(os.path.join(coin_dir, name), "w", encoding="utf-8") as f:
+                    f.write("1 1")
+            snapshot = [
+                [1_700_000_000_000, 100.0, 101.0, 101.5, 99.8, 1000.0],
+                [1_700_000_360_000, 101.0, 102.0, 102.6, 100.7, 1100.0],
+            ]
+            cwd_before = os.getcwd()
+            out = predict_crypto_original_dry_run(
+                symbol="BTC-USD",
+                timeframe="1hour",
+                candle_snapshot=snapshot,
+                artifact_dir=coin_dir,
+                as_of_ts=1_700_000_360,
+            )
+            self.assertEqual(os.getcwd(), cwd_before)
+            self.assertTrue(bool(out.get("original_predictor_dry_run_used", False)))
+            self.assertFalse(bool(out.get("original_predictor_called_step_coin", True)))
+            self.assertFalse(bool(out.get("original_predictor_called_robinhood", True)))
+            self.assertFalse(bool(out.get("original_predictor_called_kucoin_live", True)))
+            self.assertFalse(bool(out.get("original_predictor_wrote_live_signal_files", True)))
+            self.assertFalse(bool(out.get("original_predictor_changed_cwd", True)))
+            self.assertFalse(bool(out.get("original_predictor_mutated_live_artifacts", True)))
+            self.assertIn(out.get("predicted_direction"), {"up", "down", "flat"})
+            self.assertIn("direction_scores", out)
+            self.assertEqual(str(out.get("original_trigger_semantics_status", "")), "unavailable")
+            self.assertEqual(str(out.get("trigger_semantics_blocker", "")), "original_artifacts_do_not_encode_exit_trigger_class")
+
+    def test_crypto_original_bound_signal_adapter_emits_messages_without_side_effects(self) -> None:
+        cwd_before = os.getcwd()
+        out = derive_crypto_original_signal_dry_run(
+            symbol="BTC-USD",
+            current_price=105.0,
+            timeframe_predictions=[
+                {
+                    "timeframe": "1hour",
+                    "active_model_state": "active",
+                    "predicted_low_boundary": 98.0,
+                    "predicted_high_boundary": 101.0,
+                    "low_new_price": 99.0,
+                    "high_new_price": 100.5,
+                }
+            ],
+        )
+        self.assertEqual(os.getcwd(), cwd_before)
+        self.assertEqual(str(out.get("original_message_type", "")), "SHORT")
+        self.assertEqual(str(out.get("original_signal_side", "")), "short")
+        self.assertEqual(int(out.get("original_short_signal_count", 0) or 0), 1)
+        self.assertFalse(bool(out.get("bound_signal_called_robinhood", True)))
+        self.assertFalse(bool(out.get("bound_signal_called_kucoin_live", True)))
+        self.assertFalse(bool(out.get("bound_signal_wrote_live_signal_files", True)))
+        self.assertFalse(bool(out.get("bound_signal_wrote_bound_files", True)))
+        self.assertFalse(bool(out.get("bound_signal_changed_cwd", True)))
+
+    def test_crypto_original_bound_signal_adapter_can_emit_within_and_inactive(self) -> None:
+        within = derive_crypto_original_signal_dry_run(
+            symbol="BTC-USD",
+            current_price=100.0,
+            timeframe_predictions=[
+                {
+                    "timeframe": "1hour",
+                    "active_model_state": "active",
+                    "predicted_low_boundary": 99.0,
+                    "predicted_high_boundary": 101.0,
+                    "low_new_price": 99.2,
+                    "high_new_price": 100.8,
+                }
+            ],
+        )
+        inactive = derive_crypto_original_signal_dry_run(
+            symbol="BTC-USD",
+            current_price=100.0,
+            timeframe_predictions=[
+                {
+                    "timeframe": "1hour",
+                    "active_model_state": "inactive",
+                    "predicted_low_boundary": 99.0,
+                    "predicted_high_boundary": 101.0,
+                    "low_new_price": 99.2,
+                    "high_new_price": 100.8,
+                }
+            ],
+        )
+        self.assertEqual(str(within.get("original_message_type", "")), "WITHIN")
+        self.assertEqual(str(inactive.get("original_message_type", "")), "INACTIVE")
+        self.assertEqual(str(within.get("original_trigger_semantics_status", "")), "unavailable")
+        self.assertEqual(str(inactive.get("original_trigger_semantics_status", "")), "unavailable")
+
+    def test_crypto_historical_replay_rows_include_original_dry_run_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            coin_dir = os.path.join(td, "market_data", "coins", "BTC")
+            os.makedirs(coin_dir, exist_ok=True)
+            for name, content in (
+                ("trainer_last_training_time.txt", str(time.time())),
+                ("neural_perfect_threshold_1hour.txt", "20.0"),
+                ("memories_1hour.txt", "1.0 2.0{}4.0{}-1.0~0.5 -1.5{}1.0{}-2.0"),
+                ("memory_weights_1hour.txt", "1 1"),
+                ("memory_weights_high_1hour.txt", "1 1"),
+                ("memory_weights_low_1hour.txt", "1 1"),
+                ("long_dca_signal.txt", "1"),
+                ("short_dca_signal.txt", "0"),
+                ("futures_long_profit_margin.txt", "0.8"),
+                ("futures_short_profit_margin.txt", "0.1"),
+            ):
+                with open(os.path.join(coin_dir, name), "w", encoding="utf-8") as f:
+                    f.write(content)
+            base_ts = 1_700_000_000_000
+            cache_rows = []
+            price = 100.0
+            for i in range(96):
+                price += 0.4 if i < 48 else (0.5 if i < 72 else -0.6)
+                cache_rows.append([base_ts + (i * 3600 * 1000), price - 0.2, price, price + 0.4, price - 0.4, 1000.0])
+            cache_path = os.path.join(td, "crypto", "historical_replay_cache", "candles", "BTC", "1hour.json")
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(cache_rows, f)
+            out = build_crypto_historical_strategy_replay(
+                hub_dir=td,
+                settings={"main_neural_dir": os.path.join(td, "market_data", "coins")},
+                symbols=["BTC-USD"],
+                timeframe="1hour",
+                lookback_days=30,
+                max_symbols=1,
+            )
+            self.assertTrue(out.get("rows"))
+            row = out.get("rows", [])[0]
+            self.assertIn("original_predicted_direction", row)
+            self.assertIn("original_predictor_dry_run_used", row)
+            self.assertFalse(bool(row.get("original_predictor_called_robinhood", True)))
+            self.assertFalse(bool(row.get("original_predictor_called_kucoin_live", True)))
+
     def test_model_quality_prefers_historical_strategy_replay_when_sufficient(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             self._write_jsonl(
@@ -4141,6 +4284,106 @@ class TestModelQualityPass(unittest.TestCase):
         self.assertEqual(int(diag.get("diagnostic_only_rows", 0) or 0), 1)
         self.assertEqual(int(diag.get("eligible_for_training_rows", 0) or 0), 1)
 
+    def test_crypto_blind_rows_can_use_original_dry_run_with_heuristic_trigger_semantics(self) -> None:
+        raw_rows = [
+            {
+                "symbol": "BTC-USD",
+                "entry_ts": 100,
+                "exit_ts": 200,
+                "entry_price": 100.0,
+                "exit_price": 104.0,
+                "pnl_pct": 4.0,
+                "actual_direction": "up",
+                "actual_exit_trigger": "Take Profit",
+                "hold_hours": 8.0,
+                "strategy_adapter_used": "minimal_artifact_replay_v1",
+                "current_candle_pct_move": 0.4,
+                "recent_return_3": 1.0,
+                "recent_return_6": 1.2,
+                "recent_return_12": 1.4,
+                "recent_return_24": 1.6,
+                "recent_volatility": 0.4,
+                "trend_momentum_score": 1.0,
+                "signal_margin": 0.3,
+                "active_timeframe_count": 3,
+                "original_predicted_direction": "up",
+                "original_predicted_exit_trigger": "Unknown",
+                "original_predicted_pnl_trend": "up",
+                "original_confidence": 0.71,
+                "original_direction_scores": {"up": 0.9, "down": 0.1},
+                "original_trigger_scores": {},
+                "original_trade_quality_score": 0.62,
+                "original_pnl_quality_score": 0.58,
+                "original_selected_predictor": "original_crypto_artifact_model",
+                "original_predictor_variant": "original_strategy_dry_run_v1",
+                "original_source_used": "trained_artifact_original_memory_files",
+                "original_prediction_semantics": "original_strategy_dry_run_with_heuristic_trigger",
+                "original_prediction_semantics_warning": "original_direction_and_bounds_from_artifacts_but_trigger_semantics_require_replay_heuristic",
+                "original_predictor_dry_run_used": True,
+                "original_predictor_replay_safe": True,
+            }
+        ]
+        with mock.patch("app.model_quality_pass._safe_predict_blind_row", return_value={"predicted_direction": "down", "predicted_exit_trigger": "Trailing", "predicted_pnl_trend": "down", "predicted_confidence": 0.33, "direction_scores": {"up": 0.2, "down": 0.8}, "trigger_scores": {"Trailing": 0.7}, "trigger_margin": 0.5, "predictor_variant": "blind_sequence_trigger_scorer_v1"}):
+            out = _augment_historical_blind_rows(raw_rows, market="crypto", symbol_sources={"BTC-USD": "configured_universe"})
+        self.assertEqual(str(out[0].get("predicted_direction", "")), "up")
+        self.assertEqual(str(out[0].get("predicted_exit_trigger", "")), "Trailing")
+        self.assertEqual(str(out[0].get("prediction_semantics", "")), "original_strategy_dry_run_with_heuristic_trigger")
+        self.assertTrue(bool(out[0].get("original_predictor_trigger_from_heuristic", False)))
+
+    def test_crypto_original_dry_run_eval_artifact_is_written(self) -> None:
+        fake_crypto = {
+            "rows": [
+                {
+                    "symbol": "BTC-USD",
+                    "entry_ts": 100,
+                    "exit_ts": 200,
+                    "entry_price": 100.0,
+                    "exit_price": 104.0,
+                    "pnl_pct": 4.0,
+                    "actual_direction": "up",
+                    "actual_exit_trigger": "Take Profit",
+                    "current_candle_pct_move": 0.4,
+                    "recent_return_3": 1.0,
+                    "recent_return_6": 1.2,
+                    "recent_return_12": 1.4,
+                    "recent_return_24": 1.6,
+                    "recent_volatility": 0.4,
+                    "trend_momentum_score": 1.0,
+                    "signal_margin": 0.3,
+                    "active_timeframe_count": 3,
+                    "strategy_adapter_used": "minimal_artifact_replay_v1",
+                    "original_predicted_direction": "up",
+                    "original_predicted_exit_trigger": "Unknown",
+                    "original_predicted_pnl_trend": "up",
+                    "original_confidence": 0.71,
+                    "original_direction_scores": {"up": 0.9, "down": 0.1},
+                    "original_trigger_scores": {},
+                    "original_trade_quality_score": 0.62,
+                    "original_pnl_quality_score": 0.58,
+                    "original_selected_predictor": "original_crypto_artifact_model",
+                    "original_predictor_variant": "original_strategy_dry_run_v1",
+                    "original_source_used": "trained_artifact_original_memory_files",
+                    "original_prediction_semantics": "original_strategy_dry_run_with_heuristic_trigger",
+                    "original_prediction_semantics_warning": "original_direction_and_bounds_from_artifacts_but_trigger_semantics_require_replay_heuristic",
+                    "original_predictor_dry_run_used": True,
+                    "original_predictor_replay_safe": True,
+                }
+            ],
+            "diagnostics": {"historical_strategy_replay_provider": "kucoin", "historical_strategy_replay_skipped_reasons": [], "strategy_adapter_used": "minimal_artifact_replay_v1"},
+        }
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"HISTORICAL_BLIND_SIM_ENABLED": "1", "HISTORICAL_BLIND_SIM_MARKETS": "crypto"}, clear=False):
+                with mock.patch("app.model_quality_pass.build_crypto_historical_strategy_replay", return_value=fake_crypto):
+                    with mock.patch("app.model_quality_pass._crypto_blind_trigger_predict", return_value={"predicted_direction": "down", "predicted_exit_trigger": "Trailing", "predicted_pnl_trend": "down", "predicted_confidence": 0.33, "direction_scores": {"up": 0.2, "down": 0.8}, "trigger_scores": {"Trailing": 0.7}, "trigger_margin": 0.5, "predictor_variant": "blind_sequence_trigger_scorer_v1"}):
+                        _build_historical_blind_simulation(hub_dir=td, base_dir=td, settings={})
+            eval_path = os.path.join(td, "crypto", "original_strategy_dry_run_eval.json")
+            self.assertTrue(os.path.exists(eval_path))
+            payload = json.load(open(eval_path, "r", encoding="utf-8"))
+            self.assertIn("heuristic_vs_original_dry_run_comparison", payload)
+            self.assertIn("safety_audit", payload)
+            self.assertEqual(str(payload.get("original_trigger_semantics_status", "")), "unavailable")
+            self.assertEqual(str(payload.get("recommendation", "")), "proceed_to_separate_trigger_classifier")
+
     def test_crypto_blind_trigger_scorer_can_choose_non_trailing_classes(self) -> None:
         train_rows = self._crypto_trigger_train_rows()
         risk_candidate = {
@@ -4461,6 +4704,92 @@ class TestModelQualityPass(unittest.TestCase):
         self.assertGreaterEqual(float(scored.get("trigger_score_selected_margin", 0.0) or 0.0), 0.0)
         self.assertTrue(bool(str(scored.get("trigger_score_reason", ""))))
         self.assertEqual(str(scored.get("source_feature_availability", "")), "entry_features_only")
+
+    def test_crypto_trigger_classifier_dataset_excludes_leakage_fields(self) -> None:
+        rows = [
+            {
+                "symbol": "BTC-USD",
+                "entry_ts": 100,
+                "exit_ts": 200,
+                "replay_row_id": "btc-1",
+                "actual_exit_trigger": "Risk Cut",
+                "predicted_exit_trigger": "Trailing",
+                "future_leakage_detected": False,
+                "prediction_semantics_placeholder_only": False,
+                "original_confidence": 0.66,
+                "bars_since_entry": 4,
+                "bars_in_trade": 4,
+                "current_unrealized_pnl_pct": -1.2,
+                "recent_return_3": 0.4,
+                "recent_return_6": 0.5,
+                "recent_return_12": 0.6,
+                "recent_return_24": 0.7,
+                "recent_volatility": 0.8,
+                "trend_momentum_score": 0.9,
+                "signal_margin": 0.1,
+                "hold_hours": 6.0,
+                "original_predicted_direction": "down",
+                "original_signal_side": "short",
+                "pnl_pct": -3.0,
+            }
+        ]
+        dataset = _crypto_trigger_classifier_dataset_rows(rows)
+        self.assertGreater(int(len(dataset.get("rows", []) or [])), 0)
+        self.assertIn("actual_exit_trigger", dataset.get("excluded_leakage_fields", []))
+        self.assertIn("pnl_pct", dataset.get("excluded_leakage_fields", []))
+        self.assertNotIn("actual_exit_trigger", dataset.get("feature_names", []))
+        self.assertIn("original_confidence", dataset.get("feature_names", []))
+        self.assertIn("bars_since_entry", dataset.get("feature_names", []))
+
+    def test_crypto_trigger_classifier_split_is_deterministic_and_chronological(self) -> None:
+        rows = [
+            {"replay_row_id": f"row-{idx}", "entry_ts": idx, "exit_ts": idx + 10, "label": "Trailing", "heuristic_prediction": "Trailing", "features": [float(idx)]}
+            for idx in range(20)
+        ]
+        first = _split_walkforward_rows(rows)
+        second = _split_walkforward_rows(list(reversed(rows)))
+        self.assertEqual([r["replay_row_id"] for r in first["train"]], [r["replay_row_id"] for r in second["train"]])
+        self.assertEqual(first["train"][0]["entry_ts"], 0)
+        self.assertEqual(first["test"][-1]["entry_ts"], 19)
+
+    def test_crypto_trigger_classifier_candidate_is_candidate_only_and_emits_artifacts(self) -> None:
+        rows = _augment_historical_blind_rows(
+            self._crypto_trigger_train_rows(),
+            market="crypto",
+            symbol_sources={"BTC-USD": "configured_universe", "ETH-USD": "configured_universe", "SOL-USD": "configured_universe", "DOGE-USD": "configured_universe"},
+            crypto_trigger_mode="improved",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch("brokers.broker_alpaca.AlpacaBrokerClient", side_effect=AssertionError("alpaca should not be called")):
+                with mock.patch("brokers.broker_twelvedata.TwelveDataClient", side_effect=AssertionError("twelvedata should not be called")):
+                    result = _build_crypto_trigger_classifier_candidate(td, rows)
+            self.assertTrue(os.path.exists(result["dataset_path"]))
+            self.assertTrue(os.path.exists(result["eval_path"]))
+            payload = json.load(open(result["eval_path"], "r", encoding="utf-8"))
+            self.assertTrue(bool(payload.get("candidate_only", False)))
+            self.assertTrue(bool(payload.get("heuristic_fallback_preserved", False)))
+            self.assertEqual(str(payload.get("env_flag", "")), "MODEL_QUALITY_USE_CRYPTO_TRIGGER_CLASSIFIER")
+            self.assertEqual(list(payload.get("original_model_responsibility", [])), ["direction", "bounds", "confidence"])
+
+    def test_historical_blind_simulation_crypto_summary_keeps_classifier_candidate_only(self) -> None:
+        fake_crypto = {
+            "rows": _augment_historical_blind_rows(
+                self._crypto_trigger_train_rows(),
+                market="crypto",
+                symbol_sources={"BTC-USD": "configured_universe", "ETH-USD": "configured_universe", "SOL-USD": "configured_universe", "DOGE-USD": "configured_universe"},
+                crypto_trigger_mode="improved",
+            ),
+            "diagnostics": {"historical_strategy_replay_provider": "kucoin", "historical_strategy_replay_skipped_reasons": [], "strategy_adapter_used": "minimal_artifact_replay_v1"},
+        }
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"HISTORICAL_BLIND_SIM_ENABLED": "1", "HISTORICAL_BLIND_SIM_MARKETS": "crypto,stocks,forex", "MODEL_QUALITY_USE_CRYPTO_TRIGGER_CLASSIFIER": "1"}, clear=False):
+                with mock.patch("app.model_quality_pass.build_crypto_historical_strategy_replay", return_value=fake_crypto):
+                    report = _build_historical_blind_simulation(hub_dir=td, base_dir=td, settings={})
+        crypto_summary = (((report.get("markets", {}) or {}).get("crypto", {}) or {}).get("summary", {}) or {})
+        self.assertTrue(bool(crypto_summary.get("crypto_trigger_classifier_candidate_only", False)))
+        self.assertFalse(bool(crypto_summary.get("crypto_trigger_classifier_live_enabled", True)))
+        self.assertEqual(str(crypto_summary.get("crypto_trigger_classifier_effect_on_primary_source", "")), "none_candidate_only")
+        self.assertFalse(bool(report.get("historical_blind_simulation_used_as_primary", True)))
 
     def test_stock_blind_sim_summary_reports_nonzero_pnl_trend_metrics_after_label_fix(self) -> None:
         with tempfile.TemporaryDirectory() as td:

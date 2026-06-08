@@ -5345,6 +5345,9 @@ def _historical_blind_prediction_semantics(row: Dict[str, Any], market: str) -> 
     trigger_scores = row.get("trigger_scores", {}) if isinstance(row.get("trigger_scores", {}), dict) else {}
     trigger_margin = _f(row.get("trigger_score_selected_margin", row.get("trigger_margin", 0.0)), 0.0)
     source_feature_availability = _s(row.get("source_feature_availability", ""))
+    original_used = bool(row.get("original_predictor_dry_run_used", False))
+    original_trigger_from_heuristic = bool(row.get("original_predictor_trigger_from_heuristic", False))
+    original_replay_safe = bool(row.get("original_predictor_replay_safe", True))
     prediction_before_outcome = bool(int(_f(row.get("entry_ts", 0.0), 0.0)) > 0 and int(_f(row.get("exit_ts", 0.0), 0.0)) > int(_f(row.get("entry_ts", 0.0), 0.0)))
     placeholder_only = bool(
         ("fallback" in predictor_variant)
@@ -5362,6 +5365,8 @@ def _historical_blind_prediction_semantics(row: Dict[str, Any], market: str) -> 
     leakage_detected = not prediction_before_outcome
     if leakage_detected:
         label_alignment_blockers.append("entry_exit_sequence_invalid")
+    if original_used and not original_replay_safe:
+        label_alignment_blockers.append("original_dry_run_not_replay_safe")
     eligible_for_training = bool(
         prediction_before_outcome
         and (not placeholder_only)
@@ -5372,6 +5377,7 @@ def _historical_blind_prediction_semantics(row: Dict[str, Any], market: str) -> 
         and not leakage_detected
         and not low_margin
         and source_feature_availability != "fallback_only"
+        and (not original_used or original_replay_safe)
     )
     reason = "eligible"
     if not prediction_before_outcome:
@@ -5384,9 +5390,14 @@ def _historical_blind_prediction_semantics(row: Dict[str, Any], market: str) -> 
         reason = "predicted_trigger_unknown"
     elif not predicted_pnl_trend or not actual_pnl_trend:
         reason = "pnl_trend_label_unaligned"
+    semantics = "heuristic"
+    warning = f"{_s(market).lower()}_blind_sim_predictions_are_history-derived_heuristics_not_live_strategy_orders"
+    if original_used:
+        semantics = "original_strategy_dry_run_with_heuristic_trigger" if original_trigger_from_heuristic else (_s(row.get("original_prediction_semantics", "")) or "original_strategy_dry_run")
+        warning = _s(row.get("original_prediction_semantics_warning", "")) or ("original_crypto_artifact_math_replayed_read_only" if not original_trigger_from_heuristic else "original_direction_and_bounds_from_artifacts_but_trigger_semantics_require_replay_heuristic")
     return {
-        "prediction_semantics": "heuristic",
-        "prediction_semantics_warning": f"{_s(market).lower()}_blind_sim_predictions_are_history-derived_heuristics_not_live_strategy_orders",
+        "prediction_semantics": semantics,
+        "prediction_semantics_warning": warning,
         "prediction_before_outcome": prediction_before_outcome,
         "placeholder_only": placeholder_only,
         "label_alignment_blockers": label_alignment_blockers,
@@ -5760,6 +5771,74 @@ def _export_crypto_blind_residual_mismatches(hub_dir: str, rows: List[Dict[str, 
     }
     _write_json_atomic(paths["summary"], summary)
     return {"paths": paths, "summary": summary}
+
+
+def _crypto_original_dry_run_eval_path(hub_dir: str) -> str:
+    return os.path.join(hub_dir, "crypto", "original_strategy_dry_run_eval.json")
+
+
+def _export_crypto_original_dry_run_eval(hub_dir: str, rows: List[Dict[str, Any]], replay_diagnostics: Dict[str, Any]) -> Dict[str, Any]:
+    heuristic = _prediction_comparison_summary(rows, view="heuristic")
+    original = _prediction_comparison_summary(rows, view="original")
+    bound_signal = _prediction_comparison_summary(rows, view="bound_signal")
+    safety = _crypto_original_dry_run_safety_audit(rows)
+    bound_safety = _crypto_bound_signal_safety_audit(rows)
+    trigger_status = "unavailable"
+    statuses = list(bound_safety.get("original_trigger_semantics_statuses", []) or [])
+    if any(s == "available" for s in statuses):
+        trigger_status = "available"
+    elif any(s == "partial" for s in statuses):
+        trigger_status = "partial"
+    payload = {
+        "feature_source_summary": {
+            "rows_evaluated": int(len(rows)),
+            "replay_source": "historical_strategy_replay",
+            "strategy_adapter_used": _s(replay_diagnostics.get("strategy_adapter_used", "")) or "minimal_artifact_replay_v1",
+            "original_predictor_file": "app/crypto_original_predictor.py",
+            "original_predictor_function": "predict_crypto_original_dry_run",
+        },
+        "rows_evaluated": int(len(rows)),
+        "missing_artifact_reasons": dict(replay_diagnostics.get("artifact_missing_reasons", {}) if isinstance(replay_diagnostics.get("artifact_missing_reasons", {}), dict) else {}),
+        "heuristic_vs_original_dry_run_comparison": {
+            "heuristic": heuristic,
+            "original_dry_run": original,
+            "bound_signal_dry_run": bound_signal,
+        },
+        "safety_audit": safety,
+        "bound_to_signal_safety_audit": bound_safety,
+        "original_trigger_semantics_status": trigger_status,
+        "trigger_semantics_blocker": "original_artifacts_do_not_encode_exit_trigger_class" if trigger_status == "unavailable" else "",
+        "prediction_semantics_summary": _count_by(rows, lambda r: _s(r.get("prediction_semantics", "")) or "unknown"),
+        "eligible_rows": int(sum(1 for r in rows if bool(r.get("eligible_for_training", False)) and bool(r.get("original_predictor_dry_run_used", False)))),
+        "diagnostic_only_rows": int(sum(1 for r in rows if bool(r.get("diagnostic_only", False)))),
+        "training_readiness_decision": (
+            "original_trigger_ready"
+            if trigger_status == "available"
+            else "original_trigger_partial"
+            if trigger_status == "partial"
+            else "original_trigger_unavailable"
+        ),
+        "recommendation": (
+            "use_original_trigger_semantics"
+            if trigger_status == "available"
+            else "keep_heuristic_trigger_fallback"
+            if trigger_status == "partial"
+            else "proceed_to_separate_trigger_classifier"
+        ),
+        "direction_only_recommendation": (
+            "original_model_should_be_used_for_direction_bounds_confidence_trigger_must_remain_heuristic_or_separate_classifier"
+            if trigger_status == "unavailable"
+            else ""
+        ),
+        "legacy_readiness_decision": (
+            "original_dry_run_partial"
+            if bool(safety.get("original_predictor_dry_run_used", False))
+            else "original_dry_run_not_ready"
+        ),
+    }
+    path = _crypto_original_dry_run_eval_path(hub_dir)
+    _write_json_atomic(path, payload)
+    return {"path": path, "payload": payload}
 
 
 def _safe_predict_blind_row(
@@ -6357,16 +6436,30 @@ def _augment_historical_blind_rows(
         enriched["side"] = _s(raw.get("side", "long")) or "long"
         enriched["qty"] = _f(raw.get("qty", 1.0), 1.0)
         enriched["predictor_variant"] = predictor_variant
-        enriched["predicted_direction"] = _s(pred.get("predicted_direction", "")) or "up"
-        enriched["predicted_exit_trigger"] = _s(pred.get("predicted_exit_trigger", "")) or "Unknown"
-        normalized_predicted_pnl = _normalize_pnl_trend_label(pred.get("predicted_pnl_trend", ""))
-        enriched["predicted_pnl_trend"] = normalized_predicted_pnl or _normalize_pnl_trend_label(enriched["predicted_direction"]) or "flat"
-        enriched["confidence"] = round(
+        heuristic_predicted_direction = _s(pred.get("predicted_direction", "")) or "up"
+        heuristic_predicted_exit_trigger = _s(pred.get("predicted_exit_trigger", "")) or "Unknown"
+        heuristic_predicted_pnl = _normalize_pnl_trend_label(pred.get("predicted_pnl_trend", "")) or _normalize_pnl_trend_label(heuristic_predicted_direction) or "flat"
+        heuristic_confidence = round(
             _f(pred.get("predicted_confidence", pred.get("confidence", 0.0)), 0.0),
             6,
         )
-        enriched["direction_scores"] = dict(pred.get("direction_scores", {}) if isinstance(pred.get("direction_scores", {}), dict) else {})
-        enriched["trigger_scores"] = dict(pred.get("trigger_scores", {}) if isinstance(pred.get("trigger_scores", {}), dict) else {})
+        heuristic_direction_scores = dict(pred.get("direction_scores", {}) if isinstance(pred.get("direction_scores", {}), dict) else {})
+        heuristic_trigger_scores = dict(pred.get("trigger_scores", {}) if isinstance(pred.get("trigger_scores", {}), dict) else {})
+        enriched["heuristic_predicted_direction"] = heuristic_predicted_direction
+        enriched["heuristic_predicted_exit_trigger"] = heuristic_predicted_exit_trigger
+        enriched["heuristic_predicted_pnl_trend"] = heuristic_predicted_pnl
+        enriched["heuristic_confidence"] = heuristic_confidence
+        enriched["heuristic_direction_scores"] = heuristic_direction_scores
+        enriched["heuristic_trigger_scores"] = heuristic_trigger_scores
+        enriched["heuristic_predictor_variant"] = predictor_variant
+        enriched["heuristic_prediction_semantics"] = "heuristic"
+        enriched["heuristic_prediction_semantics_warning"] = f"{_s(market).lower()}_blind_sim_predictions_are_history-derived_heuristics_not_live_strategy_orders"
+        enriched["predicted_direction"] = heuristic_predicted_direction
+        enriched["predicted_exit_trigger"] = heuristic_predicted_exit_trigger
+        enriched["predicted_pnl_trend"] = heuristic_predicted_pnl
+        enriched["confidence"] = heuristic_confidence
+        enriched["direction_scores"] = heuristic_direction_scores
+        enriched["trigger_scores"] = heuristic_trigger_scores
         enriched["trigger_margin"] = round(_f(pred.get("trigger_margin", 0.0), 0.0), 6)
         enriched["trigger_score_risk_cut"] = round(_f(pred.get("trigger_score_risk_cut", 0.0), 0.0), 6)
         enriched["trigger_score_take_profit"] = round(_f(pred.get("trigger_score_take_profit", 0.0), 0.0), 6)
@@ -6414,6 +6507,61 @@ def _augment_historical_blind_rows(
             "drawdown_after_favorable_move_pct",
             "favorable_move_quality_score",
             "late_risk_after_favorable_move",
+            "original_predicted_direction",
+            "original_predicted_exit_trigger",
+            "original_predicted_pnl_trend",
+            "original_confidence",
+            "original_direction_scores",
+            "original_trigger_scores",
+            "original_trade_quality_score",
+            "original_pnl_quality_score",
+            "original_selected_predictor",
+            "original_predictor_variant",
+            "original_source_used",
+            "original_prediction_semantics",
+            "original_prediction_semantics_warning",
+            "original_current_candle_pct_move",
+            "original_final_moves",
+            "original_high_final_moves",
+            "original_low_final_moves",
+            "original_high_new_price",
+            "original_low_new_price",
+            "original_active_model_state",
+            "original_signal_side",
+            "original_signal_margin",
+            "original_long_signal_count",
+            "original_short_signal_count",
+            "original_long_profit_margin",
+            "original_short_profit_margin",
+            "original_message_type",
+            "original_bound_position",
+            "original_signal_active",
+            "original_bounds_active",
+            "original_trigger_semantics_status",
+            "trigger_semantics_blocker",
+            "original_memory_rows_selected",
+            "original_memory_rows_perfect_matches",
+            "original_predictor_dry_run_available",
+            "original_predictor_dry_run_used",
+            "original_predictor_replay_safe",
+            "original_predictor_imported_pt_thinker",
+            "original_predictor_called_step_coin",
+            "original_predictor_called_robinhood",
+            "original_predictor_called_kucoin_live",
+            "original_predictor_wrote_live_signal_files",
+            "original_predictor_changed_cwd",
+            "original_predictor_mutated_live_artifacts",
+            "bound_signal_dry_run_available",
+            "bound_signal_dry_run_used",
+            "bound_signal_replay_safe",
+            "bound_signal_called_robinhood",
+            "bound_signal_called_kucoin_live",
+            "bound_signal_wrote_live_signal_files",
+            "bound_signal_wrote_bound_files",
+            "bound_signal_changed_cwd",
+            "bound_signal_imported_pt_thinker",
+            "bound_signal_blockers",
+            "original_predictor_blockers",
         ):
             if key in pred:
                 enriched[key] = pred.get(key)
@@ -6425,6 +6573,33 @@ def _augment_historical_blind_rows(
             _f(pred.get("stock_pnl_quality_score", pred.get("pnl_quality_score", 0.0)), 0.0),
             6,
         )
+        if _s(market).lower() == "crypto" and bool(raw.get("original_predictor_dry_run_used", False)):
+            original_direction = _s(raw.get("original_predicted_direction", "")) or heuristic_predicted_direction
+            original_pnl = _normalize_pnl_trend_label(raw.get("original_predicted_pnl_trend", "")) or _normalize_pnl_trend_label(original_direction) or heuristic_predicted_pnl
+            original_confidence = round(_f(raw.get("original_confidence", heuristic_confidence), heuristic_confidence), 6)
+            original_direction_scores = dict(raw.get("original_direction_scores", {}) if isinstance(raw.get("original_direction_scores", {}), dict) else {})
+            original_trigger_scores = dict(raw.get("original_trigger_scores", {}) if isinstance(raw.get("original_trigger_scores", {}), dict) else {})
+            original_trigger = _s(raw.get("original_predicted_exit_trigger", ""))
+            original_trigger_from_heuristic = original_trigger in {"", "Unknown"} or not original_trigger_scores
+            if original_trigger_from_heuristic:
+                original_trigger = heuristic_predicted_exit_trigger
+                original_trigger_scores = heuristic_trigger_scores
+            enriched["predicted_direction"] = original_direction
+            enriched["predicted_exit_trigger"] = original_trigger
+            enriched["predicted_pnl_trend"] = original_pnl
+            enriched["confidence"] = original_confidence
+            enriched["direction_scores"] = original_direction_scores
+            enriched["trigger_scores"] = original_trigger_scores
+            enriched["trade_quality_score"] = round(_f(raw.get("original_trade_quality_score", enriched.get("trade_quality_score", 0.0)), 0.0), 6)
+            enriched["pnl_quality_score"] = round(_f(raw.get("original_pnl_quality_score", enriched.get("pnl_quality_score", 0.0)), 0.0), 6)
+            enriched["selected_predictor"] = _s(raw.get("original_selected_predictor", "")) or "original_crypto_artifact_model"
+            enriched["selected_predictor_name"] = enriched["selected_predictor"]
+            enriched["predictor_variant"] = _s(raw.get("original_predictor_variant", "")) or "original_strategy_dry_run_v1"
+            enriched["source_used"] = _s(raw.get("original_source_used", "")) or "trained_artifact_original_memory_files"
+            enriched["original_predictor_trigger_from_heuristic"] = bool(original_trigger_from_heuristic)
+            enriched["source_feature_availability"] = "original_artifact_dry_run_with_heuristic_trigger" if original_trigger_from_heuristic else "original_artifact_dry_run"
+        else:
+            enriched["original_predictor_trigger_from_heuristic"] = False
         enriched["actual_direction"] = actual_direction
         enriched["actual_exit_trigger"] = actual_exit_trigger
         enriched["actual_pnl_trend"] = actual_pnl_trend
@@ -6507,6 +6682,583 @@ def _historical_blind_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "win_rate_pct": round(100.0 * sum(1 for v in pnl_vals if v > 0.0) / max(1, n), 4),
         "average_pnl_pct": round(sum(pnl_vals) / max(1, n), 6),
         "max_drawdown_pct": round(min(pnl_vals), 6),
+    }
+
+
+def _prediction_view_rows(rows: List[Dict[str, Any]], *, view: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for row in list(rows or []):
+        if not isinstance(row, dict):
+            continue
+        item = dict(row)
+        if view == "heuristic":
+            item["predicted_direction"] = _s(row.get("heuristic_predicted_direction", "")) or _s(row.get("predicted_direction", ""))
+            item["predicted_exit_trigger"] = _s(row.get("heuristic_predicted_exit_trigger", "")) or _s(row.get("predicted_exit_trigger", ""))
+            item["predicted_pnl_trend"] = _s(row.get("heuristic_predicted_pnl_trend", "")) or _s(row.get("predicted_pnl_trend", ""))
+            item["confidence"] = _f(row.get("heuristic_confidence", row.get("confidence", 0.0)), 0.0)
+            item["direction_scores"] = dict(row.get("heuristic_direction_scores", {}) if isinstance(row.get("heuristic_direction_scores", {}), dict) else (row.get("direction_scores", {}) if isinstance(row.get("direction_scores", {}), dict) else {}))
+            item["trigger_scores"] = dict(row.get("heuristic_trigger_scores", {}) if isinstance(row.get("heuristic_trigger_scores", {}), dict) else (row.get("trigger_scores", {}) if isinstance(row.get("trigger_scores", {}), dict) else {}))
+            item["predictor_variant"] = _s(row.get("heuristic_predictor_variant", "")) or _s(row.get("predictor_variant", ""))
+            item["prediction_semantics"] = "heuristic"
+            item["prediction_semantics_warning"] = _s(row.get("heuristic_prediction_semantics_warning", "")) or f"{_s(row.get('market', '')).lower()}_blind_sim_predictions_are_history-derived_heuristics_not_live_strategy_orders"
+        elif view == "original":
+            if _s(row.get("original_predicted_direction", "")):
+                item["predicted_direction"] = _s(row.get("original_predicted_direction", ""))
+            if _s(row.get("original_predicted_exit_trigger", "")):
+                item["predicted_exit_trigger"] = _s(row.get("original_predicted_exit_trigger", ""))
+            if _s(row.get("original_predicted_pnl_trend", "")):
+                item["predicted_pnl_trend"] = _s(row.get("original_predicted_pnl_trend", ""))
+            item["confidence"] = _f(row.get("original_confidence", row.get("confidence", 0.0)), 0.0)
+            item["direction_scores"] = dict(row.get("original_direction_scores", {}) if isinstance(row.get("original_direction_scores", {}), dict) else {})
+            item["trigger_scores"] = dict(row.get("original_trigger_scores", {}) if isinstance(row.get("original_trigger_scores", {}), dict) else {})
+            item["predictor_variant"] = _s(row.get("original_predictor_variant", "")) or _s(row.get("predictor_variant", ""))
+            item["prediction_semantics"] = _s(row.get("original_prediction_semantics", "")) or _s(row.get("prediction_semantics", ""))
+            item["prediction_semantics_warning"] = _s(row.get("original_prediction_semantics_warning", ""))
+        elif view == "bound_signal":
+            side = _s(row.get("original_signal_side", "")).lower()
+            item["predicted_direction"] = "up" if side == "long" else "down" if side == "short" else "flat"
+            item["predicted_exit_trigger"] = "Unknown"
+            item["predicted_pnl_trend"] = "up" if side == "long" else "down" if side == "short" else "flat"
+            conf = _f(row.get("original_confidence", row.get("confidence", 0.0)), 0.0)
+            if side in {"within", "inactive"}:
+                conf = min(conf, 0.35)
+            item["confidence"] = conf
+            item["direction_scores"] = {"up": max(0.0, _f(row.get("original_long_signal_count", 0), 0.0)), "down": max(0.0, _f(row.get("original_short_signal_count", 0), 0.0))}
+            item["trigger_scores"] = {}
+            item["predictor_variant"] = "original_bound_signal_dry_run_v1"
+            item["prediction_semantics"] = "original_strategy_dry_run_direction_only"
+            item["prediction_semantics_warning"] = "original_direction_and_bounds_from_artifacts_only_exit_trigger_class_not_encoded"
+        item["direction_correct"] = bool(_s(item.get("predicted_direction", "")).lower() == _s(item.get("actual_direction", "")).lower())
+        item["trigger_correct"] = bool(_s(item.get("predicted_exit_trigger", "")) == _s(item.get("actual_exit_trigger", "")))
+        item["pnl_trend_correct"] = bool(_normalize_pnl_trend_label(item.get("predicted_pnl_trend", "")) == _s(item.get("actual_pnl_trend", "")).lower())
+        out.append(item)
+    return out
+
+
+def _prediction_comparison_summary(rows: List[Dict[str, Any]], *, view: str) -> Dict[str, Any]:
+    working = _prediction_view_rows(rows, view=view)
+    return {
+        "metrics": _historical_blind_metrics(working),
+        "predicted_direction_counts": _count_by(working, lambda r: _s(r.get("predicted_direction", "")) or "Unknown"),
+        "predicted_trigger_counts": _count_by(working, lambda r: _s(r.get("predicted_exit_trigger", "")) or "Unknown"),
+        "predicted_pnl_trend_counts": _count_by(working, lambda r: _normalize_pnl_trend_label(r.get("predicted_pnl_trend", "")) or "unknown"),
+            "direction_confusion_matrix": _confusion_matrix(working, actual_key="actual_direction", pred_key="predicted_direction"),
+            "trigger_confusion_matrix": _confusion_matrix(working, actual_key="actual_exit_trigger", pred_key="predicted_exit_trigger"),
+            "pnl_trend_confusion_matrix": _confusion_matrix(
+                [{**r, "predicted_pnl_trend": _normalize_pnl_trend_label(r.get("predicted_pnl_trend", "")), "actual_pnl_trend": _normalize_pnl_trend_label(r.get("actual_pnl_trend", ""))} for r in working],
+                actual_key="actual_pnl_trend",
+                pred_key="predicted_pnl_trend",
+            ),
+        "residual_pairs": {
+            "Trailing->Take Profit": int(sum(1 for r in working if _s(r.get("actual_exit_trigger", "")) == "Trailing" and _s(r.get("predicted_exit_trigger", "")) == "Take Profit")),
+            "Trailing->Risk Cut": int(sum(1 for r in working if _s(r.get("actual_exit_trigger", "")) == "Trailing" and _s(r.get("predicted_exit_trigger", "")) == "Risk Cut")),
+            "Stale Alignment->Risk Cut": int(sum(1 for r in working if _s(r.get("actual_exit_trigger", "")) == "Stale Alignment" and _s(r.get("predicted_exit_trigger", "")) == "Risk Cut")),
+            "Risk Cut->Take Profit": int(sum(1 for r in working if _s(r.get("actual_exit_trigger", "")) == "Risk Cut" and _s(r.get("predicted_exit_trigger", "")) == "Take Profit")),
+            "Take Profit->Risk Cut": int(sum(1 for r in working if _s(r.get("actual_exit_trigger", "")) == "Take Profit" and _s(r.get("predicted_exit_trigger", "")) == "Risk Cut")),
+        },
+        "prediction_semantics": sorted({_s(r.get("prediction_semantics", "")) for r in working if _s(r.get("prediction_semantics", ""))}),
+    }
+
+
+CRYPTO_TRIGGER_CLASSIFIER_CLASSES = (
+    "Risk Cut",
+    "Take Profit",
+    "Trailing",
+    "Stale Alignment",
+)
+CRYPTO_TRIGGER_CLASSIFIER_FEATURES = (
+    "original_confidence",
+    "original_signal_margin",
+    "original_long_signal_count",
+    "original_short_signal_count",
+    "original_long_profit_margin",
+    "original_short_profit_margin",
+    "bars_since_entry",
+    "bars_in_trade",
+    "current_unrealized_pnl_pct",
+    "max_favorable_excursion_pct_so_far",
+    "max_adverse_excursion_pct_so_far",
+    "drawdown_from_peak_pct_so_far",
+    "trailing_armed_so_far",
+    "bars_since_trailing_armed",
+    "risk_cut_distance_pct",
+    "take_profit_distance_pct",
+    "risk_cut_touched_so_far",
+    "take_profit_touched_so_far",
+    "peak_to_current_reversal_pct",
+    "favorable_then_softened_flag_so_far",
+    "late_favorable_reversal_score",
+    "favorable_then_reversed",
+    "max_favorable_before_exit_pct",
+    "reversal_from_peak_before_exit_pct",
+    "bars_from_peak_to_exit_preview",
+    "trailing_arm_to_exit_bars_preview",
+    "risk_pressure_after_peak",
+    "take_profit_pressure_before_reversal",
+    "target_near_before_reversal",
+    "reversal_velocity_pct_per_bar",
+    "post_peak_momentum_decay",
+    "drawdown_after_favorable_move_pct",
+    "favorable_move_quality_score",
+    "late_risk_after_favorable_move",
+    "recent_return_3",
+    "recent_return_6",
+    "recent_return_12",
+    "recent_return_24",
+    "recent_volatility",
+    "trend_momentum_score",
+    "signal_margin",
+    "hold_hours",
+    "current_candle_pct_move",
+    "active_timeframe_count",
+)
+CRYPTO_TRIGGER_CLASSIFIER_CATEGORICAL_FEATURES = (
+    "original_predicted_direction",
+    "original_signal_side",
+)
+CRYPTO_TRIGGER_CLASSIFIER_EXCLUDED_LEAKAGE_FIELDS = (
+    "actual_exit_trigger",
+    "actual_direction",
+    "actual_pnl_trend",
+    "pnl",
+    "pnl_usd",
+    "pnl_pct",
+    "exit_price",
+    "predicted_exit_trigger",
+    "predicted_direction",
+    "predicted_pnl_trend",
+    "trigger_correct",
+    "direction_correct",
+    "pnl_trend_correct",
+)
+
+
+def _crypto_trigger_classifier_dataset_path(hub_dir: str) -> str:
+    return os.path.join(hub_dir, "crypto", "crypto_trigger_classifier_dataset_summary.json")
+
+
+def _crypto_trigger_classifier_eval_path(hub_dir: str) -> str:
+    return os.path.join(hub_dir, "crypto", "crypto_trigger_classifier_eval.json")
+
+
+def _crypto_trigger_classifier_model_path(hub_dir: str) -> str:
+    return os.path.join(hub_dir, "crypto", "crypto_trigger_classifier_v1.json")
+
+
+def _crypto_trigger_classifier_feature_groups() -> Dict[str, List[str]]:
+    return {
+        "prediction_time_features": [
+            "original_confidence",
+            "original_signal_margin",
+            "original_long_signal_count",
+            "original_short_signal_count",
+            "original_long_profit_margin",
+            "original_short_profit_margin",
+            "recent_return_3",
+            "recent_return_6",
+            "recent_return_12",
+            "recent_return_24",
+            "recent_volatility",
+            "trend_momentum_score",
+            "signal_margin",
+            "current_candle_pct_move",
+            "active_timeframe_count",
+            "original_predicted_direction",
+            "original_signal_side",
+        ],
+        "position_management_features": [
+            "bars_since_entry",
+            "bars_in_trade",
+            "current_unrealized_pnl_pct",
+            "max_favorable_excursion_pct_so_far",
+            "max_adverse_excursion_pct_so_far",
+            "drawdown_from_peak_pct_so_far",
+            "trailing_armed_so_far",
+            "bars_since_trailing_armed",
+            "risk_cut_distance_pct",
+            "take_profit_distance_pct",
+            "risk_cut_touched_so_far",
+            "take_profit_touched_so_far",
+            "peak_to_current_reversal_pct",
+            "favorable_then_softened_flag_so_far",
+            "late_favorable_reversal_score",
+            "favorable_then_reversed",
+            "max_favorable_before_exit_pct",
+            "reversal_from_peak_before_exit_pct",
+            "bars_from_peak_to_exit_preview",
+            "trailing_arm_to_exit_bars_preview",
+            "risk_pressure_after_peak",
+            "take_profit_pressure_before_reversal",
+            "target_near_before_reversal",
+            "reversal_velocity_pct_per_bar",
+            "post_peak_momentum_decay",
+            "drawdown_after_favorable_move_pct",
+            "favorable_move_quality_score",
+            "late_risk_after_favorable_move",
+            "hold_hours",
+        ],
+        "leakage_excluded_features": list(CRYPTO_TRIGGER_CLASSIFIER_EXCLUDED_LEAKAGE_FIELDS),
+    }
+
+
+def _crypto_trigger_classifier_encode_value(feature: str, value: Any) -> float:
+    if feature in {"trailing_armed_so_far", "risk_cut_touched_so_far", "take_profit_touched_so_far", "favorable_then_softened_flag_so_far", "favorable_then_reversed", "target_near_before_reversal", "late_risk_after_favorable_move"}:
+        return 1.0 if bool(value) else 0.0
+    if feature == "original_predicted_direction":
+        txt = _s(value).lower()
+        if txt == "up":
+            return 1.0
+        if txt == "down":
+            return -1.0
+        return 0.0
+    if feature == "original_signal_side":
+        txt = _s(value).lower()
+        if txt == "long":
+            return 1.0
+        if txt == "short":
+            return -1.0
+        if txt == "within":
+            return 0.25
+        return 0.0
+    return _f(value, 0.0)
+
+
+def _crypto_trigger_classifier_dataset_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    ordered = sorted([dict(r) for r in list(rows or []) if isinstance(r, dict)], key=_stable_row_sort_key)
+    feature_groups = _crypto_trigger_classifier_feature_groups()
+    dataset: List[Dict[str, Any]] = []
+    rejected_reasons: Dict[str, int] = {}
+    feature_names = list(CRYPTO_TRIGGER_CLASSIFIER_FEATURES) + list(CRYPTO_TRIGGER_CLASSIFIER_CATEGORICAL_FEATURES)
+    for row in ordered:
+        actual_trigger = _s(row.get("actual_exit_trigger", ""))
+        if actual_trigger not in CRYPTO_TRIGGER_CLASSIFIER_CLASSES:
+            rejected_reasons["unsupported_actual_exit_trigger"] = int(rejected_reasons.get("unsupported_actual_exit_trigger", 0) + 1)
+            continue
+        if bool(row.get("prediction_semantics_placeholder_only", False)):
+            rejected_reasons["placeholder_only"] = int(rejected_reasons.get("placeholder_only", 0) + 1)
+            continue
+        if bool(row.get("future_leakage_detected", False)):
+            rejected_reasons["future_leakage_detected"] = int(rejected_reasons.get("future_leakage_detected", 0) + 1)
+            continue
+        vector: List[float] = []
+        present_count = 0
+        for feature in feature_names:
+            if feature in row and row.get(feature) is not None and _s(row.get(feature, "")) != "":
+                present_count += 1
+            vector.append(_crypto_trigger_classifier_encode_value(feature, row.get(feature)))
+        if present_count < 8:
+            rejected_reasons["insufficient_replay_safe_features"] = int(rejected_reasons.get("insufficient_replay_safe_features", 0) + 1)
+            continue
+        dataset.append(
+            {
+                "replay_row_id": _s(row.get("replay_row_id", "")) or _replay_row_id(row),
+                "symbol": _s(row.get("symbol", "")),
+                "entry_ts": int(_f(row.get("entry_ts", 0.0), 0.0)),
+                "exit_ts": int(_f(row.get("exit_ts", 0.0), 0.0)),
+                "label": actual_trigger,
+                "heuristic_prediction": _s(row.get("predicted_exit_trigger", "")) or "Unknown",
+                "features": vector,
+            }
+        )
+    class_distribution = _count_by(dataset, lambda r: _s(r.get("label", "")) or "Unknown")
+    return {
+        "rows": dataset,
+        "feature_names": feature_names,
+        "feature_groups": feature_groups,
+        "excluded_leakage_fields": list(CRYPTO_TRIGGER_CLASSIFIER_EXCLUDED_LEAKAGE_FIELDS),
+        "class_distribution": class_distribution,
+        "rejected_reasons": rejected_reasons,
+        "leakage_detected": False,
+    }
+
+
+def _macro_f1_from_confusion(confusion: Dict[str, Dict[str, int]], labels: List[str]) -> float:
+    scores: List[float] = []
+    for label in labels:
+        tp = int(((confusion.get(label, {}) if isinstance(confusion.get(label, {}), dict) else {}).get(label, 0)))
+        fp = sum(int((confusion.get(other, {}) if isinstance(confusion.get(other, {}), dict) else {}).get(label, 0)) for other in labels if other != label)
+        fn = sum(int(v) for k, v in (confusion.get(label, {}) if isinstance(confusion.get(label, {}), dict) else {}).items() if _s(k) != label)
+        precision = tp / max(1, tp + fp)
+        recall = tp / max(1, tp + fn)
+        if precision + recall <= 0.0:
+            scores.append(0.0)
+        else:
+            scores.append((2.0 * precision * recall) / (precision + recall))
+    return round(sum(scores) / max(1, len(scores)), 6)
+
+
+def _per_class_precision_recall(confusion: Dict[str, Dict[str, int]], labels: List[str]) -> Dict[str, Dict[str, float]]:
+    out: Dict[str, Dict[str, float]] = {}
+    for label in labels:
+        tp = int(((confusion.get(label, {}) if isinstance(confusion.get(label, {}), dict) else {}).get(label, 0)))
+        fp = sum(int((confusion.get(other, {}) if isinstance(confusion.get(other, {}), dict) else {}).get(label, 0)) for other in labels if other != label)
+        fn = sum(int(v) for k, v in (confusion.get(label, {}) if isinstance(confusion.get(label, {}), dict) else {}).items() if _s(k) != label)
+        out[label] = {
+            "precision": round(tp / max(1, tp + fp), 6),
+            "recall": round(tp / max(1, tp + fn), 6),
+        }
+    return out
+
+
+def _crypto_trigger_classifier_model_fit(train_rows: List[Dict[str, Any]], feature_names: List[str]) -> Dict[str, Any]:
+    feature_count = len(feature_names)
+    means = [0.0] * feature_count
+    stds = [1.0] * feature_count
+    if train_rows:
+        for idx in range(feature_count):
+            vals = [_f(row.get("features", [0.0] * feature_count)[idx], 0.0) for row in train_rows]
+            mean = sum(vals) / max(1, len(vals))
+            variance = sum((v - mean) ** 2 for v in vals) / max(1, len(vals))
+            means[idx] = mean
+            stds[idx] = math.sqrt(variance) if variance > 1e-12 else 1.0
+    class_prototypes: Dict[str, List[float]] = {}
+    class_counts: Dict[str, int] = {}
+    grouped: Dict[str, List[List[float]]] = {}
+    for row in train_rows:
+        label = _s(row.get("label", ""))
+        grouped.setdefault(label, []).append(list(row.get("features", []) or []))
+    for label, vectors in grouped.items():
+        class_counts[label] = int(len(vectors))
+        proto: List[float] = []
+        for idx in range(feature_count):
+            proto.append(sum(_f(v[idx], 0.0) for v in vectors) / max(1, len(vectors)))
+        class_prototypes[label] = proto
+    return {
+        "model_type": "pure_python_centroid_classifier_v1",
+        "feature_names": list(feature_names),
+        "means": means,
+        "stds": stds,
+        "class_prototypes": class_prototypes,
+        "class_counts": class_counts,
+    }
+
+
+def _crypto_trigger_classifier_predict_one(model: Dict[str, Any], row: Dict[str, Any]) -> Dict[str, Any]:
+    features = list(row.get("features", []) or [])
+    stds = list(model.get("stds", []) or [])
+    class_prototypes = dict(model.get("class_prototypes", {}) if isinstance(model.get("class_prototypes", {}), dict) else {})
+    if not class_prototypes:
+        return {"predicted_exit_trigger": "Unknown", "trigger_scores": {}}
+    scores: Dict[str, float] = {}
+    best_label = "Unknown"
+    best_score = -1e18
+    for label, proto in class_prototypes.items():
+        distance = 0.0
+        for idx, value in enumerate(features):
+            denom = max(1e-6, abs(_f(stds[idx], 1.0))) if idx < len(stds) else 1.0
+            base = _f(proto[idx], 0.0) if idx < len(proto) else 0.0
+            diff = (_f(value, 0.0) - base) / denom
+            distance += diff * diff
+        score = 1.0 / (1.0 + math.sqrt(distance))
+        scores[label] = round(score, 6)
+        if score > best_score:
+            best_score = score
+            best_label = label
+    return {
+        "predicted_exit_trigger": best_label,
+        "trigger_scores": scores,
+    }
+
+
+def _crypto_trigger_classifier_attach_predictions(rows: List[Dict[str, Any]], model: Dict[str, Any]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for row in list(rows or []):
+        if not isinstance(row, dict):
+            continue
+        item = dict(row)
+        item["actual_exit_trigger"] = _s(item.get("actual_exit_trigger", "")) or _s(item.get("label", "")) or "Unknown"
+        pred = _crypto_trigger_classifier_predict_one(model, item)
+        item["classifier_predicted_exit_trigger"] = _s(pred.get("predicted_exit_trigger", "")) or "Unknown"
+        item["classifier_trigger_scores"] = dict(pred.get("trigger_scores", {}) if isinstance(pred.get("trigger_scores", {}), dict) else {})
+        item["predicted_exit_trigger"] = item["classifier_predicted_exit_trigger"]
+        item["trigger_correct"] = bool(_s(item.get("predicted_exit_trigger", "")) == _s(item.get("actual_exit_trigger", "")))
+        out.append(item)
+    return out
+
+
+def _crypto_trigger_classifier_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    confusion = _confusion_matrix(rows, "actual_exit_trigger", "predicted_exit_trigger")
+    labels = list(CRYPTO_TRIGGER_CLASSIFIER_CLASSES)
+    metrics = _historical_blind_metrics(rows)
+    metrics["macro_f1"] = _macro_f1_from_confusion(confusion, labels)
+    metrics["per_class_precision_recall"] = _per_class_precision_recall(confusion, labels)
+    metrics["confusion_matrix"] = confusion
+    metrics["residual_pair_counts"] = {
+        f"{actual}->{predicted}": int(sum(1 for r in rows if _s(r.get("actual_exit_trigger", "")) == actual and _s(r.get("predicted_exit_trigger", "")) == predicted))
+        for actual, predicted in _crypto_residual_mismatch_pairs()
+    }
+    return metrics
+
+
+def _crypto_trigger_classifier_ready_decision(
+    *,
+    dataset_rows: List[Dict[str, Any]],
+    test_metrics: Dict[str, Any],
+    heuristic_test_metrics: Dict[str, Any],
+    validation_metrics: Dict[str, Any],
+    class_distribution: Dict[str, int],
+) -> Tuple[str, List[str], bool]:
+    blockers: List[str] = []
+    severe_class_collapse = len([k for k, v in (test_metrics.get("confusion_matrix", {}) if isinstance(test_metrics.get("confusion_matrix", {}), dict) else {}).items() if isinstance(v, dict) and sum(int(x) for x in v.values()) > 0]) <= 1
+    if len(dataset_rows) < 24:
+        blockers.append("eligible_rows_too_small")
+    for label in CRYPTO_TRIGGER_CLASSIFIER_CLASSES:
+        if int(class_distribution.get(label, 0)) < 2:
+            blockers.append(f"class_too_small:{label}")
+    if severe_class_collapse:
+        blockers.append("severe_class_collapse")
+    if _f(test_metrics.get("trigger_match_pct", 0.0), 0.0) <= _f(heuristic_test_metrics.get("trigger_match_pct", 0.0), 0.0):
+        blockers.append("test_trigger_accuracy_not_above_heuristic")
+    if abs(_f(validation_metrics.get("trigger_match_pct", 0.0), 0.0) - _f(test_metrics.get("trigger_match_pct", 0.0), 0.0)) > 25.0:
+        blockers.append("validation_test_gap_extreme")
+    if blockers:
+        decision = "classifier_candidate_partial" if len(dataset_rows) > 0 else "classifier_candidate_not_ready"
+    else:
+        decision = "classifier_candidate_ready"
+    return decision, blockers, severe_class_collapse
+
+
+def _build_crypto_trigger_classifier_candidate(hub_dir: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    dataset = _crypto_trigger_classifier_dataset_rows(rows)
+    split_rows = _split_walkforward_rows(dataset.get("rows", []))
+    train_rows = list(split_rows.get("train", []) or [])
+    validation_rows = list(split_rows.get("validation", []) or [])
+    test_rows = list(split_rows.get("test", []) or [])
+    model = _crypto_trigger_classifier_model_fit(train_rows, list(dataset.get("feature_names", []) or []))
+    validation_scored = _crypto_trigger_classifier_attach_predictions(validation_rows, model)
+    test_scored = _crypto_trigger_classifier_attach_predictions(test_rows, model)
+    heuristic_validation = [{"actual_exit_trigger": _s(r.get("label", "")), "predicted_exit_trigger": _s(r.get("heuristic_prediction", "")), "trigger_correct": bool(_s(r.get("label", "")) == _s(r.get("heuristic_prediction", "")))} for r in validation_rows]
+    heuristic_test = [{"actual_exit_trigger": _s(r.get("label", "")), "predicted_exit_trigger": _s(r.get("heuristic_prediction", "")), "trigger_correct": bool(_s(r.get("label", "")) == _s(r.get("heuristic_prediction", "")))} for r in test_rows]
+    validation_metrics = _crypto_trigger_classifier_metrics(validation_scored)
+    test_metrics = _crypto_trigger_classifier_metrics(test_scored)
+    heuristic_validation_metrics = _crypto_trigger_classifier_metrics(heuristic_validation)
+    heuristic_test_metrics = _crypto_trigger_classifier_metrics(heuristic_test)
+    readiness_decision, blockers, class_collapse = _crypto_trigger_classifier_ready_decision(
+        dataset_rows=list(dataset.get("rows", []) or []),
+        test_metrics=test_metrics,
+        heuristic_test_metrics=heuristic_test_metrics,
+        validation_metrics=validation_metrics,
+        class_distribution=dict(dataset.get("class_distribution", {}) if isinstance(dataset.get("class_distribution", {}), dict) else {}),
+    )
+    dataset_payload = {
+        "schema_version": HISTORICAL_BLIND_SIM_SCHEMA_VERSION,
+        "candidate_name": "crypto_trigger_classifier_v1",
+        "target": "actual_exit_trigger",
+        "rows": int(len(dataset.get("rows", []) or [])),
+        "train_rows": int(len(train_rows)),
+        "validation_rows": int(len(validation_rows)),
+        "test_rows": int(len(test_rows)),
+        "split_method": "chronological_70_15_15",
+        "class_names": list(CRYPTO_TRIGGER_CLASSIFIER_CLASSES),
+        "class_distribution": dict(dataset.get("class_distribution", {}) if isinstance(dataset.get("class_distribution", {}), dict) else {}),
+        "class_distribution_by_split": {
+            "train": _count_by(train_rows, lambda r: _s(r.get("label", "")) or "Unknown"),
+            "validation": _count_by(validation_rows, lambda r: _s(r.get("label", "")) or "Unknown"),
+            "test": _count_by(test_rows, lambda r: _s(r.get("label", "")) or "Unknown"),
+        },
+        "feature_names": list(dataset.get("feature_names", []) or []),
+        "feature_groups": dict(dataset.get("feature_groups", {}) if isinstance(dataset.get("feature_groups", {}), dict) else {}),
+        "excluded_leakage_fields": list(dataset.get("excluded_leakage_fields", []) or []),
+        "rejected_reasons": dict(dataset.get("rejected_reasons", {}) if isinstance(dataset.get("rejected_reasons", {}), dict) else {}),
+        "leakage_check_status": "pass" if not bool(dataset.get("leakage_detected", False)) else "blocked",
+    }
+    eval_payload = {
+        "schema_version": HISTORICAL_BLIND_SIM_SCHEMA_VERSION,
+        "candidate_name": "crypto_trigger_classifier_v1",
+        "model_type": _s(model.get("model_type", "")) or "pure_python_centroid_classifier_v1",
+        "class_names": list(CRYPTO_TRIGGER_CLASSIFIER_CLASSES),
+        "feature_names": list(dataset.get("feature_names", []) or []),
+        "excluded_leakage_fields": list(dataset.get("excluded_leakage_fields", []) or []),
+        "validation_metrics": validation_metrics,
+        "test_metrics": test_metrics,
+        "heuristic_validation_metrics": heuristic_validation_metrics,
+        "heuristic_test_metrics": heuristic_test_metrics,
+        "heuristic_vs_classifier_residual_comparison": {
+            "validation": {
+                "heuristic": heuristic_validation_metrics.get("residual_pair_counts", {}),
+                "classifier": validation_metrics.get("residual_pair_counts", {}),
+            },
+            "test": {
+                "heuristic": heuristic_test_metrics.get("residual_pair_counts", {}),
+                "classifier": test_metrics.get("residual_pair_counts", {}),
+            },
+        },
+        "classifier_collapsed_to_one_class": bool(class_collapse),
+        "readiness_decision": readiness_decision,
+        "remaining_blockers": blockers,
+        "candidate_only": True,
+        "default_enabled": False,
+        "env_flag": "MODEL_QUALITY_USE_CRYPTO_TRIGGER_CLASSIFIER",
+        "original_model_responsibility": ["direction", "bounds", "confidence"],
+        "classifier_responsibility": ["exit_trigger_class_only"],
+        "heuristic_fallback_preserved": True,
+    }
+    dataset_path = _crypto_trigger_classifier_dataset_path(hub_dir)
+    eval_path = _crypto_trigger_classifier_eval_path(hub_dir)
+    model_path = _crypto_trigger_classifier_model_path(hub_dir)
+    _write_json_atomic(dataset_path, dataset_payload)
+    _write_json_atomic(eval_path, eval_payload)
+    _write_json_atomic(
+        model_path,
+        {
+            "schema_version": HISTORICAL_BLIND_SIM_SCHEMA_VERSION,
+            "candidate_name": "crypto_trigger_classifier_v1",
+            "model_type": _s(model.get("model_type", "")) or "pure_python_centroid_classifier_v1",
+            "feature_names": list(model.get("feature_names", []) or []),
+            "class_counts": dict(model.get("class_counts", {}) if isinstance(model.get("class_counts", {}), dict) else {}),
+            "class_names": sorted(list((model.get("class_prototypes", {}) if isinstance(model.get("class_prototypes", {}), dict) else {}).keys())),
+        },
+    )
+    return {
+        "dataset_path": dataset_path,
+        "eval_path": eval_path,
+        "model_path": model_path,
+        "dataset_summary": dataset_payload,
+        "eval_summary": eval_payload,
+    }
+
+
+def _crypto_original_dry_run_safety_audit(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    working = [r for r in list(rows or []) if isinstance(r, dict)]
+    blockers: Dict[str, int] = {}
+    for row in working:
+        for blocker in list(row.get("original_predictor_blockers", []) or []):
+            blockers[_s(blocker) or "unknown"] = int(blockers.get(_s(blocker) or "unknown", 0) + 1)
+    return {
+        "original_predictor_dry_run_available": bool(any(bool(r.get("original_predictor_dry_run_available", False)) for r in working)),
+        "original_predictor_dry_run_used": bool(any(bool(r.get("original_predictor_dry_run_used", False)) for r in working)),
+        "original_predictor_replay_safe": bool(all(bool(r.get("original_predictor_replay_safe", True)) for r in working)),
+        "original_predictor_imported_pt_thinker": bool(any(bool(r.get("original_predictor_imported_pt_thinker", False)) for r in working)),
+        "original_predictor_called_step_coin": bool(any(bool(r.get("original_predictor_called_step_coin", False)) for r in working)),
+        "original_predictor_called_robinhood": bool(any(bool(r.get("original_predictor_called_robinhood", False)) for r in working)),
+        "original_predictor_called_kucoin_live": bool(any(bool(r.get("original_predictor_called_kucoin_live", False)) for r in working)),
+        "original_predictor_wrote_live_signal_files": bool(any(bool(r.get("original_predictor_wrote_live_signal_files", False)) for r in working)),
+        "original_predictor_changed_cwd": bool(any(bool(r.get("original_predictor_changed_cwd", False)) for r in working)),
+        "original_predictor_mutated_live_artifacts": bool(any(bool(r.get("original_predictor_mutated_live_artifacts", False)) for r in working)),
+        "original_predictor_blockers": blockers,
+    }
+
+
+def _crypto_bound_signal_safety_audit(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    working = [r for r in list(rows or []) if isinstance(r, dict)]
+    blockers: Dict[str, int] = {}
+    for row in working:
+        for blocker in list(row.get("bound_signal_blockers", []) or []):
+            blockers[_s(blocker) or "unknown"] = int(blockers.get(_s(blocker) or "unknown", 0) + 1)
+    trigger_statuses = sorted({_s(r.get("original_trigger_semantics_status", "")) for r in working if _s(r.get("original_trigger_semantics_status", ""))})
+    return {
+        "bound_signal_dry_run_available": bool(any(bool(r.get("bound_signal_dry_run_available", False)) for r in working)),
+        "bound_signal_dry_run_used": bool(any(bool(r.get("bound_signal_dry_run_used", False)) for r in working)),
+        "bound_signal_replay_safe": bool(all(bool(r.get("bound_signal_replay_safe", True)) for r in working)),
+        "bound_signal_called_robinhood": bool(any(bool(r.get("bound_signal_called_robinhood", False)) for r in working)),
+        "bound_signal_called_kucoin_live": bool(any(bool(r.get("bound_signal_called_kucoin_live", False)) for r in working)),
+        "bound_signal_wrote_live_signal_files": bool(any(bool(r.get("bound_signal_wrote_live_signal_files", False)) for r in working)),
+        "bound_signal_wrote_bound_files": bool(any(bool(r.get("bound_signal_wrote_bound_files", False)) for r in working)),
+        "bound_signal_changed_cwd": bool(any(bool(r.get("bound_signal_changed_cwd", False)) for r in working)),
+        "bound_signal_imported_pt_thinker": bool(any(bool(r.get("bound_signal_imported_pt_thinker", False)) for r in working)),
+        "bound_signal_blockers": blockers,
+        "original_trigger_semantics_statuses": trigger_statuses,
+        "trigger_semantics_blocker_counts": _count_by(working, lambda r: _s(r.get("trigger_semantics_blocker", "")) or "none"),
     }
 
 
@@ -6756,6 +7508,7 @@ def _build_historical_blind_simulation(
         rejected_rows: List[Dict[str, Any]] = []
         status_by_symbol: Dict[str, Dict[str, Any]] = {}
         crypto_baseline_rows: List[Dict[str, Any]] = []
+        replay_diag: Dict[str, Any] = {}
         if market == "crypto":
             built = _build_crypto_blind_simulation(
                 hub_dir=hub_dir,
@@ -6771,6 +7524,7 @@ def _build_historical_blind_simulation(
             decisions = list(built.get("decisions", []) or [])
             skips = list(built.get("skips", []) or [])
             candidate_symbols = list(built.get("symbols", []) or [])
+            replay_diag = built.get("diagnostics", {}) if isinstance(built.get("diagnostics", {}), dict) else {}
             for sym in candidate_symbols:
                 sym_rows = [dict(r) for r in trades if _s(r.get("symbol", "")).upper() == sym]
                 sym_decisions = [dict(r) for r in decisions if _s(r.get("symbol", "")).upper() == sym]
@@ -6807,7 +7561,7 @@ def _build_historical_blind_simulation(
                     "simulation_directional_accuracy": metrics.get("directional_accuracy_pct", 0.0),
                     "simulation_trigger_accuracy": metrics.get("trigger_match_pct", 0.0),
                     "simulation_pnl_trend_accuracy": metrics.get("pnl_trend_match_pct", 0.0),
-                    "prediction_semantics": "heuristic",
+                    "prediction_semantics": _s(next((r.get("prediction_semantics", "") for r in sym_rows if _s(r.get("prediction_semantics", ""))), "heuristic")) or "heuristic",
                     "diagnostic_only_rows": int(sum(1 for r in sym_rows if bool(r.get("diagnostic_only", False)))),
                     "simulation_trade_count": int(len(sym_rows)),
                     "simulation_skip_count": int(len(sym_skips)),
@@ -6872,6 +7626,8 @@ def _build_historical_blind_simulation(
         )
         crypto_before_after = _crypto_blind_before_after_summary(crypto_baseline_rows, trades) if market == "crypto" else {}
         crypto_residual_artifacts = _export_crypto_blind_residual_mismatches(hub_dir, trades) if market == "crypto" else {}
+        crypto_original_dry_run_eval = _export_crypto_original_dry_run_eval(hub_dir, trades, replay_diag) if market == "crypto" else {}
+        crypto_trigger_classifier_eval = _build_crypto_trigger_classifier_candidate(hub_dir, trades) if market == "crypto" else {}
         split_rows = _split_walkforward_rows(trades)
         crypto_training_readiness = {}
         if market == "crypto":
@@ -6986,6 +7742,23 @@ def _build_historical_blind_simulation(
             summary["residual_mismatch_summary_path"] = _s((crypto_residual_artifacts.get("paths", {}) if isinstance(crypto_residual_artifacts.get("paths", {}), dict) else {}).get("summary", ""))
             summary["residual_mismatch_artifact_counts"] = (crypto_residual_artifacts.get("summary", {}) if isinstance(crypto_residual_artifacts.get("summary", {}), dict) else {})
             summary["crypto_training_readiness_decision"] = crypto_training_readiness
+            summary["original_strategy_dry_run_eval_path"] = _s(crypto_original_dry_run_eval.get("path", ""))
+            summary["heuristic_vs_original_dry_run_comparison"] = (crypto_original_dry_run_eval.get("payload", {}) if isinstance(crypto_original_dry_run_eval.get("payload", {}), dict) else {}).get("heuristic_vs_original_dry_run_comparison", {})
+            summary["original_strategy_dry_run_safety_audit"] = (crypto_original_dry_run_eval.get("payload", {}) if isinstance(crypto_original_dry_run_eval.get("payload", {}), dict) else {}).get("safety_audit", {})
+            summary["bound_to_signal_safety_audit"] = (crypto_original_dry_run_eval.get("payload", {}) if isinstance(crypto_original_dry_run_eval.get("payload", {}), dict) else {}).get("bound_to_signal_safety_audit", {})
+            summary["original_trigger_semantics_status"] = (crypto_original_dry_run_eval.get("payload", {}) if isinstance(crypto_original_dry_run_eval.get("payload", {}), dict) else {}).get("original_trigger_semantics_status", "unavailable")
+            summary["trigger_semantics_blocker"] = (crypto_original_dry_run_eval.get("payload", {}) if isinstance(crypto_original_dry_run_eval.get("payload", {}), dict) else {}).get("trigger_semantics_blocker", "")
+            summary["original_trigger_training_readiness"] = (crypto_original_dry_run_eval.get("payload", {}) if isinstance(crypto_original_dry_run_eval.get("payload", {}), dict) else {}).get("training_readiness_decision", "original_trigger_unavailable")
+            summary["original_trigger_recommendation"] = (crypto_original_dry_run_eval.get("payload", {}) if isinstance(crypto_original_dry_run_eval.get("payload", {}), dict) else {}).get("recommendation", "")
+            summary["crypto_trigger_classifier_dataset_summary_path"] = _s(crypto_trigger_classifier_eval.get("dataset_path", ""))
+            summary["crypto_trigger_classifier_eval_path"] = _s(crypto_trigger_classifier_eval.get("eval_path", ""))
+            summary["crypto_trigger_classifier_model_path"] = _s(crypto_trigger_classifier_eval.get("model_path", ""))
+            summary["crypto_trigger_classifier_dataset_summary"] = dict(crypto_trigger_classifier_eval.get("dataset_summary", {}) if isinstance(crypto_trigger_classifier_eval.get("dataset_summary", {}), dict) else {})
+            summary["crypto_trigger_classifier_eval"] = dict(crypto_trigger_classifier_eval.get("eval_summary", {}) if isinstance(crypto_trigger_classifier_eval.get("eval_summary", {}), dict) else {})
+            summary["model_quality_use_crypto_trigger_classifier"] = bool(_env_flag("MODEL_QUALITY_USE_CRYPTO_TRIGGER_CLASSIFIER"))
+            summary["crypto_trigger_classifier_candidate_only"] = True
+            summary["crypto_trigger_classifier_live_enabled"] = False
+            summary["crypto_trigger_classifier_effect_on_primary_source"] = "none_candidate_only"
             if int(crypto_before_after.get("training_eligible_rows_after", 0) or 0) < int(crypto_before_after.get("training_eligible_rows_before", 0) or 0) - 20:
                 summary["blocker"] = (_s(summary.get("blocker", "")) + (" | " if _s(summary.get("blocker", "")) else "") + "training_eligible_rows_dropped_materially_after_trigger_semantics_pass").strip()
         _write_json_atomic(paths["summary"], summary)

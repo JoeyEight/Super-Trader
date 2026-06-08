@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, List, Tuple
 import requests
 
 from app.crypto_artifacts import TRAINING_STALE_SECONDS, discover_crypto_trained_artifacts, load_crypto_artifact_features
+from app.crypto_original_predictor import predict_crypto_original_dry_run
 from app.trigger_normalization import normalize_exit_trigger
 
 
@@ -230,6 +231,7 @@ def _simulate_strategy_rows(
     artifact_ctx: Dict[str, Any],
     timeframe: str,
     thresholds: Dict[str, float],
+    artifact_dir: str = "",
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     if len(candles) < 48:
@@ -460,6 +462,87 @@ def _simulate_strategy_rows(
                 peak_bar = 0
                 trough_bar = 0
                 entry_features = dict(feature_payload)
+                try:
+                    original_pred = predict_crypto_original_dry_run(
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        candle_snapshot=candles[: idx + 1],
+                        artifact_dir=artifact_dir,
+                        as_of_ts=int(ts_ms / 1000),
+                    )
+                except Exception as exc:
+                    original_pred = {
+                        "original_predictor_dry_run_available": False,
+                        "original_predictor_dry_run_used": False,
+                        "original_predictor_replay_safe": True,
+                        "original_predictor_imported_pt_thinker": False,
+                        "original_predictor_called_step_coin": False,
+                        "original_predictor_called_robinhood": False,
+                        "original_predictor_called_kucoin_live": False,
+                        "original_predictor_wrote_live_signal_files": False,
+                        "original_predictor_changed_cwd": False,
+                        "original_predictor_mutated_live_artifacts": False,
+                        "original_predictor_blockers": [f"predictor_exception:{type(exc).__name__}"],
+                    }
+                entry_features.update(
+                    {
+                        "original_predicted_direction": _s(original_pred.get("predicted_direction", "")),
+                        "original_predicted_exit_trigger": _s(original_pred.get("predicted_exit_trigger", "")),
+                        "original_predicted_pnl_trend": _s(original_pred.get("predicted_pnl_trend", "")),
+                        "original_confidence": round(_f(original_pred.get("confidence", original_pred.get("predicted_confidence", 0.0)), 0.0), 6),
+                        "original_direction_scores": dict(original_pred.get("direction_scores", {}) if isinstance(original_pred.get("direction_scores", {}), dict) else {}),
+                        "original_trigger_scores": dict(original_pred.get("trigger_scores", {}) if isinstance(original_pred.get("trigger_scores", {}), dict) else {}),
+                        "original_trade_quality_score": round(_f(original_pred.get("trade_quality_score", 0.0), 0.0), 6),
+                        "original_pnl_quality_score": round(_f(original_pred.get("pnl_quality_score", 0.0), 0.0), 6),
+                        "original_selected_predictor": _s(original_pred.get("selected_predictor", "")),
+                        "original_predictor_variant": _s(original_pred.get("predictor_variant", "")),
+                        "original_source_used": _s(original_pred.get("source_used", "")),
+                        "original_prediction_semantics": _s(original_pred.get("prediction_semantics", "")),
+                        "original_prediction_semantics_warning": _s(original_pred.get("prediction_semantics_warning", "")),
+                        "original_current_candle_pct_move": round(_f(original_pred.get("current_candle_pct_move", 0.0), 0.0), 6),
+                        "original_final_moves": round(_f(original_pred.get("final_moves", 0.0), 0.0), 6),
+                        "original_high_final_moves": round(_f(original_pred.get("high_final_moves", 0.0), 0.0), 6),
+                        "original_low_final_moves": round(_f(original_pred.get("low_final_moves", 0.0), 0.0), 6),
+                        "original_high_new_price": round(_f(original_pred.get("high_new_price", 0.0), 0.0), 10),
+                        "original_low_new_price": round(_f(original_pred.get("low_new_price", 0.0), 0.0), 10),
+                        "original_active_model_state": _s(original_pred.get("active_model_state", "")),
+                        "original_signal_side": _s(original_pred.get("original_signal_side", "")),
+                        "original_signal_margin": round(_f(original_pred.get("original_signal_margin", 0.0), 0.0), 6),
+                        "original_long_signal_count": int(_f(original_pred.get("original_long_signal_count", 0), 0.0)),
+                        "original_short_signal_count": int(_f(original_pred.get("original_short_signal_count", 0), 0.0)),
+                        "original_long_profit_margin": round(_f(original_pred.get("original_long_profit_margin", 0.0), 0.0), 6),
+                        "original_short_profit_margin": round(_f(original_pred.get("original_short_profit_margin", 0.0), 0.0), 6),
+                        "original_message_type": _s(original_pred.get("original_message_type", "")),
+                        "original_bound_position": _s(original_pred.get("original_bound_position", "")),
+                        "original_signal_active": bool(original_pred.get("original_signal_active", False)),
+                        "original_bounds_active": bool(original_pred.get("original_bounds_active", False)),
+                        "original_trigger_semantics_status": _s(original_pred.get("original_trigger_semantics_status", "")),
+                        "trigger_semantics_blocker": _s(original_pred.get("trigger_semantics_blocker", "")),
+                        "original_memory_rows_selected": int(_f(original_pred.get("memory_rows_selected", 0), 0.0)),
+                        "original_memory_rows_perfect_matches": int(_f(original_pred.get("memory_rows_perfect_matches", 0), 0.0)),
+                        "original_predictor_dry_run_available": bool(original_pred.get("original_predictor_dry_run_available", False)),
+                        "original_predictor_dry_run_used": bool(original_pred.get("original_predictor_dry_run_used", False)),
+                        "original_predictor_replay_safe": bool(original_pred.get("original_predictor_replay_safe", True)),
+                        "original_predictor_imported_pt_thinker": bool(original_pred.get("original_predictor_imported_pt_thinker", False)),
+                        "original_predictor_called_step_coin": bool(original_pred.get("original_predictor_called_step_coin", False)),
+                        "original_predictor_called_robinhood": bool(original_pred.get("original_predictor_called_robinhood", False)),
+                        "original_predictor_called_kucoin_live": bool(original_pred.get("original_predictor_called_kucoin_live", False)),
+                        "original_predictor_wrote_live_signal_files": bool(original_pred.get("original_predictor_wrote_live_signal_files", False)),
+                        "original_predictor_changed_cwd": bool(original_pred.get("original_predictor_changed_cwd", False)),
+                        "original_predictor_mutated_live_artifacts": bool(original_pred.get("original_predictor_mutated_live_artifacts", False)),
+                        "bound_signal_dry_run_available": bool(original_pred.get("bound_signal_dry_run_available", False)),
+                        "bound_signal_dry_run_used": bool(original_pred.get("bound_signal_dry_run_used", False)),
+                        "bound_signal_replay_safe": bool(original_pred.get("bound_signal_replay_safe", True)),
+                        "bound_signal_called_robinhood": bool(original_pred.get("bound_signal_called_robinhood", False)),
+                        "bound_signal_called_kucoin_live": bool(original_pred.get("bound_signal_called_kucoin_live", False)),
+                        "bound_signal_wrote_live_signal_files": bool(original_pred.get("bound_signal_wrote_live_signal_files", False)),
+                        "bound_signal_wrote_bound_files": bool(original_pred.get("bound_signal_wrote_bound_files", False)),
+                        "bound_signal_changed_cwd": bool(original_pred.get("bound_signal_changed_cwd", False)),
+                        "bound_signal_imported_pt_thinker": bool(original_pred.get("bound_signal_imported_pt_thinker", False)),
+                        "bound_signal_blockers": list(original_pred.get("bound_signal_blockers", []) or []),
+                        "original_predictor_blockers": list(original_pred.get("original_predictor_blockers", []) or []),
+                    }
+                )
             continue
         prior_peak = peak_px
         peak_px = max(peak_px, high_px, close_px)
@@ -738,7 +821,7 @@ def build_crypto_historical_strategy_replay(
         if not bool(artifact_ctx.get("usable", False)):
             skipped.append({"symbol": symbol, "reason": _s((artifact_ctx.get("artifact_missing_reasons", []) or ["artifact_unusable"])[0]) or "artifact_unusable"})
             continue
-        trade_rows = _simulate_strategy_rows(symbol, final_candles, artifact_ctx, timeframe, thresholds)
+        trade_rows = _simulate_strategy_rows(symbol, final_candles, artifact_ctx, timeframe, thresholds, artifact_dir=_symbol_dir(main_neural_dir, symbol))
         if not trade_rows:
             skipped.append({"symbol": symbol, "reason": "no_strategy_trades"})
             continue
