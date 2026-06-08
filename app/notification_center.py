@@ -36,6 +36,10 @@ _STARTUP_CHECK_INFO_WARNINGS = {
     "stale_pid_file_removed",
 }
 
+_STARTUP_CHECK_INFO_WARNING_PREFIXES = (
+    "key_rotation_due:",
+)
+
 _OPENAI_ERROR_STATUSES = {
     "timeout",
     "request_error",
@@ -176,6 +180,13 @@ def _row_is_actionable_or_issue(row: Dict[str, Any]) -> bool:
     return bool(row.get("change_applied", False))
 
 
+def _runtime_reason_severity(reason: str, default_severity: str) -> str:
+    key = str(reason or "").strip().lower()
+    if key == "key_rotation_due":
+        return "info"
+    return _sev(default_severity)
+
+
 def _market_from_incident(row: Dict[str, Any]) -> str:
     details = row.get("details", {}) if isinstance(row.get("details", {}), dict) else {}
     market = str(details.get("market", "") or "").strip().lower()
@@ -255,7 +266,12 @@ def _startup_checks_active(runtime_state: Dict[str, Any]) -> bool:
     warnings = list(checks.get("warnings", []) or []) if isinstance(checks.get("warnings", []), list) else []
     errors = list(checks.get("errors", []) or []) if isinstance(checks.get("errors", []), list) else []
     warnings = [str(row or "").strip().lower() for row in warnings if str(row or "").strip()]
-    warnings = [row for row in warnings if row not in _STARTUP_CHECK_INFO_WARNINGS]
+    warnings = [
+        row
+        for row in warnings
+        if (row not in _STARTUP_CHECK_INFO_WARNINGS)
+        and (not any(row.startswith(prefix) for prefix in _STARTUP_CHECK_INFO_WARNING_PREFIXES))
+    ]
     return bool(warnings or errors)
 
 
@@ -1282,10 +1298,11 @@ def build_notification_center_payload(
     for i, reason in enumerate(reasons[:8]):
         hint = hints[i] if i < len(hints) else ""
         action = _action_for_runtime_reason(reason, rs, hint=hint)
+        reason_sev = _runtime_reason_severity(reason, sev)
         row: Dict[str, Any] = {
             "id": f"alert_{i}_{ts_now}",
             "ts": int(ts_now),
-            "severity": sev,
+            "severity": reason_sev,
             "market": "global",
             "source": "runtime_alerts",
             "title": reason,

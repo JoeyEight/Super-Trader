@@ -7,6 +7,7 @@ import math
 import os
 import random
 import re
+import tempfile
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -14,6 +15,7 @@ from app.confidence_calibration import build_confidence_calibration_payload
 from app.crypto_artifacts import discover_crypto_trained_artifacts, load_crypto_artifact_features
 import app.crypto_historical_replay as crypto_historical_replay
 from app.crypto_historical_replay import build_crypto_historical_strategy_replay
+from app.decision_snapshot import attach_crypto_decision_snapshot, attach_market_decision_snapshot
 from app.credential_utils import (
     get_alpaca_creds,
     get_oanda_creds,
@@ -60,6 +62,30 @@ CRYPTO_SNAPSHOT_FEATURE_FIELDS = (
 )
 CRYPTO_SNAPSHOT_JOIN_PREFIX = "snapshot_"
 CRYPTO_ARTIFACT_FEATURE_PREFIX = "artifact_"
+COMPLETED_LIVE_REQUIRED_FIELDS = (
+    "decision_snapshot_id",
+    "market",
+    "symbol_or_instrument",
+    "entry_ts",
+    "exit_ts",
+    "entry_price",
+    "exit_price",
+    "side",
+    "qty",
+    "predicted_direction",
+    "predicted_exit_trigger",
+    "predicted_pnl_trend",
+    "confidence",
+    "actual_direction",
+    "actual_exit_trigger",
+    "actual_pnl_trend",
+    "pnl",
+    "pnl_usd",
+    "pnl_pct",
+    "direction_correct",
+    "trigger_correct",
+    "pnl_trend_correct",
+)
 
 
 def _s(value: Any) -> str:
@@ -596,6 +622,52 @@ def _extract_live_prediction_field(row: Dict[str, Any], keys: Iterable[str]) -> 
     return None
 
 
+def _completed_live_identity(row: Dict[str, Any], market: str) -> Tuple[str, str]:
+    mk = _s(market).lower()
+    ident = _s(row.get("symbol", row.get("instrument", row.get("pair", "")))).upper()
+    if not ident:
+        ident = _s(row.get("asset_code", "")).upper()
+    field_name = "instrument" if mk == "forex" else "symbol"
+    return ident, field_name
+
+
+def _completed_live_required_field_values(row: Dict[str, Any], market: str) -> Dict[str, Any]:
+    ident, _ = _completed_live_identity(row, market)
+    return {
+        "decision_snapshot_id": row.get("decision_snapshot_id"),
+        "market": _s(row.get("market", market)).lower() or _s(market).lower(),
+        "symbol_or_instrument": ident or None,
+        "entry_ts": row.get("entry_ts"),
+        "exit_ts": row.get("exit_ts"),
+        "entry_price": row.get("entry_price"),
+        "exit_price": row.get("exit_price"),
+        "side": row.get("side"),
+        "qty": row.get("qty"),
+        "predicted_direction": row.get("predicted_direction"),
+        "predicted_exit_trigger": row.get("predicted_exit_trigger"),
+        "predicted_pnl_trend": row.get("predicted_pnl_trend"),
+        "confidence": row.get("confidence", row.get("predicted_confidence")),
+        "actual_direction": row.get("actual_direction"),
+        "actual_exit_trigger": row.get("actual_exit_trigger"),
+        "actual_pnl_trend": row.get("actual_pnl_trend"),
+        "pnl": row.get("pnl"),
+        "pnl_usd": row.get("pnl_usd"),
+        "pnl_pct": row.get("pnl_pct"),
+        "direction_correct": row.get("direction_correct"),
+        "trigger_correct": row.get("trigger_correct"),
+        "pnl_trend_correct": row.get("pnl_trend_correct"),
+    }
+
+
+def _missing_completed_live_fields(row: Dict[str, Any], market: str) -> List[str]:
+    values = _completed_live_required_field_values(row, market)
+    missing: List[str] = []
+    for key, value in values.items():
+        if value in (None, ""):
+            missing.append(key)
+    return missing
+
+
 def _completed_live_decision_rows(
     *,
     market: str,
@@ -606,8 +678,10 @@ def _completed_live_decision_rows(
     rows_out: List[Dict[str, Any]] = []
     by_market: Dict[str, int] = {mk: 0}
     by_predictor: Dict[str, int] = {}
+    missing_fields_by_market: Dict[str, Dict[str, int]] = {mk: {}}
     found = 0
     completed = 0
+    post_model_completed = 0
     for row in list(closed_rows or []):
         if not isinstance(row, dict):
             continue
@@ -662,13 +736,19 @@ def _completed_live_decision_rows(
         direction_scores = _extract_live_prediction_field(row, ("direction_scores", "entry_snapshot_direction_scores"))
         decision_snapshot_id = _s(row.get("decision_snapshot_id", "")) or _s(row.get("entry_decision_snapshot_id", ""))
         item = dict(row)
+        ident, ident_field = _completed_live_identity(item, mk)
         item["decision_snapshot_id"] = decision_snapshot_id or None
         item["trade_id"] = _s(row.get("trade_id", row.get("position_id", row.get("order_id", "")))) or None
         item["market"] = mk
+        item[ident_field] = ident or None
+        item["symbol"] = ident or None
+        if mk == "forex":
+            item["instrument"] = ident or None
         item["predicted_direction"] = pred_dir or None
         item["predicted_exit_trigger"] = pred_trigger or None
         item["predicted_pnl_trend"] = pred_pnl or None
         item["predicted_confidence"] = round(_f(pred_conf, 0.0), 6) if pred_conf is not None else None
+        item["confidence"] = item.get("predicted_confidence")
         if isinstance(trigger_scores, dict):
             item["trigger_scores"] = dict(trigger_scores)
         if isinstance(direction_scores, dict):
@@ -676,8 +756,12 @@ def _completed_live_decision_rows(
         item["selected_predictor_name"] = predictor_name
         item["predictor_mode"] = predictor_name
         item["predictor_variant"] = predictor_variant
+        item["selected_predictor"] = predictor_name
         item["source_type"] = "completed_live_decision_snapshot"
         item["source"] = "live_execution"
+        item["source_used"] = _s(row.get("entry_snapshot_source_used", row.get("source_used", ""))) or None
+        item["trade_quality_score"] = _extract_live_prediction_field(row, ("trade_quality_score", "entry_snapshot_trade_quality_score"))
+        item["pnl_quality_score"] = _extract_live_prediction_field(row, ("pnl_quality_score", "entry_snapshot_pnl_quality_score"))
         item["raw_rule_reason"] = _s(row.get("entry_snapshot_raw_rule_reason", "")) or _s(row.get("raw_rule_reason", ""))
         item["event_exit_tag"] = _s(row.get("event_exit_tag", ""))
         item["actual_direction"] = _trade_direction(item)
@@ -705,17 +789,21 @@ def _completed_live_decision_rows(
         item["pnl_trend_correct"] = bool(
             _s(item.get("predicted_pnl_trend", "")).lower() == _s(item.get("actual_pnl_trend", "")).lower()
         )
-        missing_fields: List[str] = []
-        for key in ("decision_snapshot_id", "predicted_direction", "predicted_pnl_trend", "predicted_confidence"):
-            if item.get(key) in (None, ""):
-                missing_fields.append(key)
-        item["missing_prediction_fields"] = missing_fields
+        missing_fields = _missing_completed_live_fields(item, mk)
+        item["missing_prediction_fields"] = list(missing_fields)
+        item["missing_fields"] = list(missing_fields)
         eligible = len(missing_fields) == 0
         item["eligible_for_future_learning"] = bool(eligible)
-        item["ineligible_reason"] = "" if eligible else "missing_prediction_fields"
+        item["ineligible_reason"] = "" if eligible else ("missing_fields:" + ",".join(missing_fields))
         found += 1
+        by_market[mk] = int(by_market.get(mk, 0) + 1)
         if eligible:
             completed += 1
+        if decision_snapshot_id or pred_dir or pred_trigger or pred_pnl or (pred_conf is not None):
+            post_model_completed += 1
+        for field in missing_fields:
+            bucket = missing_fields_by_market.setdefault(mk, {})
+            bucket[field] = int(bucket.get(field, 0) + 1)
         by_predictor[predictor_name] = int(by_predictor.get(predictor_name, 0) + 1)
         rows_out.append(item)
     rows_out.sort(key=_stable_row_sort_key)
@@ -732,6 +820,11 @@ def _completed_live_decision_rows(
         "live_decision_join_rate_pct": round(100.0 * float(completed) / float(max(1, found)), 4) if found else 0.0,
         "live_decision_rows_by_market": by_market,
         "live_decision_rows_by_predictor": by_predictor,
+        "completed_live_missing_fields_by_market": missing_fields_by_market,
+        "completed_live_eligible_rows_by_market": {mk: int(completed)},
+        "completed_live_ineligible_rows_by_market": {mk: int(max(0, found - completed))},
+        "completed_live_waiting_for_real_trade_completion": bool(post_model_completed <= 0),
+        "completed_live_no_post_model_completed_trades_yet": bool(post_model_completed <= 0),
         "live_decision_missing_reason": missing_reason,
         "model_quality_source_priority_used": "completed_live_decision_snapshot" if rows_out else "",
     }
@@ -739,13 +832,15 @@ def _completed_live_decision_rows(
 
 def _closed_trades_from_exits(events: Iterable[Dict[str, Any]], market: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
+    mk = _s(market).lower()
     for row in list(events or []):
         if not isinstance(row, dict) or _s(row.get("event", "")).lower() != "exit":
             continue
         ts = int(_f(row.get("ts", 0.0), 0.0))
         hold_s = int(max(0.0, _f(row.get("hold_s", 0.0), 0.0)))
-        sym = _s(row.get("symbol", "")).upper()
-        qty = max(0.0, _f(row.get("qty", 0.0), 0.0))
+        sym = _s(row.get("symbol", row.get("instrument", row.get("pair", "")))).upper()
+        qty_field = "units" if mk == "forex" else "qty"
+        qty = abs(_f(row.get(qty_field, row.get("qty", 0.0)), 0.0))
         exit_px = _f(row.get("price", 0.0), 0.0)
         if ts <= 0 or (not sym) or qty <= 0.0 or exit_px <= 0.0:
             continue
@@ -754,12 +849,13 @@ def _closed_trades_from_exits(events: Iterable[Dict[str, Any]], market: str) -> 
             continue
         entry_ts = int(ts - hold_s) if hold_s > 0 else int(max(0, ts - 3600))
         pnl_usd = (exit_px - entry_px) * qty
-        if _s(market).lower() == "forex" and _s(row.get("side", "")).lower() != "long":
+        if mk == "forex" and _s(row.get("side", "")).lower() != "long":
             pnl_usd = (entry_px - exit_px) * qty
         out.append(
             {
                 "symbol": sym,
-                "market": _s(market).lower(),
+                "instrument": sym if mk == "forex" else None,
+                "market": mk,
                 "entry_ts": int(entry_ts),
                 "exit_ts": int(ts),
                 "qty": float(qty),
@@ -1003,6 +1099,173 @@ def _write_completed_live_decision_artifacts(
             "rows": int(len(unified)),
             "sha256": _sha256_file(unified_path),
         },
+    }
+
+
+def _synthetic_completed_live_closed_row(market: str, snapshot_payload: Dict[str, Any]) -> Dict[str, Any]:
+    mk = _s(market).lower()
+    snapshot_id = _s(snapshot_payload.get("decision_snapshot_id", ""))
+    pred_conf = snapshot_payload.get("confidence", snapshot_payload.get("predicted_confidence", snapshot_payload.get("calib_prob")))
+    if mk == "crypto":
+        return {
+            "market": mk,
+            "symbol": "BTC-USD",
+            "entry_ts": 1_700_000_000,
+            "exit_ts": 1_700_000_000 + 7200,
+            "entry_price": 100.0,
+            "exit_price": 103.0,
+            "side": "buy",
+            "qty": 0.25,
+            "hold_hours": 2.0,
+            "pnl_usd": 0.75,
+            "pnl_pct": 3.0,
+            "actual_exit_trigger": "Trailing",
+            "decision_snapshot_id": snapshot_id,
+            "entry_decision_snapshot_id": snapshot_id,
+            "entry_snapshot_selected_action": snapshot_payload.get("selected_action"),
+            "entry_snapshot_predicted_direction": snapshot_payload.get("predicted_direction"),
+            "entry_snapshot_predicted_exit_trigger": snapshot_payload.get("predicted_exit_trigger"),
+            "entry_snapshot_predicted_pnl_trend": snapshot_payload.get("predicted_pnl_trend"),
+            "entry_snapshot_predicted_confidence": pred_conf,
+            "entry_snapshot_selected_predictor": snapshot_payload.get("selected_predictor"),
+            "entry_snapshot_predictor_variant": snapshot_payload.get("predictor_variant"),
+            "entry_snapshot_source_used": snapshot_payload.get("source_used"),
+            "entry_snapshot_trade_quality_score": snapshot_payload.get("trade_quality_score"),
+            "entry_snapshot_pnl_quality_score": snapshot_payload.get("pnl_quality_score"),
+            "entry_snapshot_raw_rule_reason": snapshot_payload.get("raw_rule_reason"),
+            "entry_snapshot_normalized_trigger": snapshot_payload.get("normalized_trigger"),
+        }
+    if mk == "stocks":
+        return {
+            "market": mk,
+            "symbol": "NVDA",
+            "entry_ts": 1_700_000_000,
+            "exit_ts": 1_700_000_000 + 7200,
+            "entry_price": 100.0,
+            "exit_price": 104.0,
+            "side": "buy",
+            "qty": 1.0,
+            "hold_hours": 2.0,
+            "pnl_usd": 4.0,
+            "pnl_pct": 4.0,
+            "actual_exit_trigger": "Trailing",
+            "decision_snapshot_id": snapshot_id,
+            "entry_decision_snapshot_id": snapshot_id,
+            "entry_snapshot_selected_action": snapshot_payload.get("selected_action"),
+            "entry_snapshot_predicted_direction": snapshot_payload.get("predicted_direction"),
+            "entry_snapshot_predicted_exit_trigger": snapshot_payload.get("predicted_exit_trigger"),
+            "entry_snapshot_predicted_pnl_trend": snapshot_payload.get("predicted_pnl_trend"),
+            "entry_snapshot_predicted_confidence": pred_conf,
+            "entry_snapshot_selected_predictor": snapshot_payload.get("selected_predictor"),
+            "entry_snapshot_predictor_variant": snapshot_payload.get("predictor_variant"),
+            "entry_snapshot_source_used": snapshot_payload.get("source_used"),
+            "entry_snapshot_trade_quality_score": snapshot_payload.get("trade_quality_score"),
+            "entry_snapshot_pnl_quality_score": snapshot_payload.get("pnl_quality_score"),
+            "entry_snapshot_raw_rule_reason": snapshot_payload.get("raw_rule_reason"),
+            "entry_snapshot_normalized_trigger": snapshot_payload.get("normalized_trigger"),
+        }
+    return {
+        "market": mk,
+        "symbol": "EUR_USD",
+        "instrument": "EUR_USD",
+        "entry_ts": 1_700_000_000,
+        "exit_ts": 1_700_000_000 + 7200,
+        "entry_price": 1.1000,
+        "exit_price": 1.1030,
+        "side": "long",
+        "qty": 1000.0,
+        "hold_hours": 2.0,
+        "pnl_usd": 3.0,
+        "pnl_pct": 0.2727,
+        "actual_exit_trigger": "Trailing",
+        "decision_snapshot_id": snapshot_id,
+        "entry_decision_snapshot_id": snapshot_id,
+        "entry_snapshot_selected_action": snapshot_payload.get("selected_action"),
+        "entry_snapshot_predicted_direction": snapshot_payload.get("predicted_direction"),
+        "entry_snapshot_predicted_exit_trigger": snapshot_payload.get("predicted_exit_trigger"),
+        "entry_snapshot_predicted_pnl_trend": snapshot_payload.get("predicted_pnl_trend"),
+        "entry_snapshot_predicted_confidence": pred_conf,
+        "entry_snapshot_selected_predictor": snapshot_payload.get("selected_predictor"),
+        "entry_snapshot_predictor_variant": snapshot_payload.get("predictor_variant"),
+        "entry_snapshot_source_used": snapshot_payload.get("source_used"),
+        "entry_snapshot_trade_quality_score": snapshot_payload.get("trade_quality_score"),
+        "entry_snapshot_pnl_quality_score": snapshot_payload.get("pnl_quality_score"),
+        "entry_snapshot_raw_rule_reason": snapshot_payload.get("raw_rule_reason"),
+        "entry_snapshot_normalized_trigger": snapshot_payload.get("normalized_trigger"),
+    }
+
+
+def _verify_completed_live_synthetic_paths() -> Dict[str, Any]:
+    per_market: Dict[str, Dict[str, Any]] = {}
+    for market in ("crypto", "stocks", "forex"):
+        td = tempfile.mkdtemp(prefix="completed_live_verify_")
+        if market == "crypto":
+            entry_payload = attach_crypto_decision_snapshot(
+                {
+                    "ts": 1_700_000_000,
+                    "event": "entry",
+                    "symbol": "BTC-USD",
+                    "side": "buy",
+                    "price": 100.0,
+                    "predicted_direction": "up",
+                    "predicted_exit_trigger": "Trailing",
+                    "predicted_pnl_trend": "up",
+                    "predicted_confidence": 0.84,
+                    "selected_predictor_name": "crypto_live_model",
+                    "predictor_variant": "live",
+                    "source_used": "execution_log",
+                    "trade_quality_score": 0.73,
+                    "pnl_quality_score": 0.71,
+                    "direction_scores": {"up": 0.84, "down": 0.16},
+                    "trigger_scores": {"Trailing": 0.67, "Stale Alignment": 0.23},
+                },
+                hub_dir=td,
+                source_module="synthetic",
+                source_function="verify_completed_live_synthetic_paths",
+            )
+        else:
+            entry_payload = attach_market_decision_snapshot(
+                {
+                    "ts": 1_700_000_000,
+                    "event": "entry",
+                    "symbol": "NVDA" if market == "stocks" else "EUR_USD",
+                    "instrument": "EUR_USD" if market == "forex" else None,
+                    "side": "buy" if market == "stocks" else "long",
+                    "price": 100.0 if market == "stocks" else 1.1000,
+                    "predicted_direction": "up",
+                    "predicted_exit_trigger": "Trailing",
+                    "predicted_pnl_trend": "up",
+                    "predicted_confidence": 0.82,
+                    "selected_predictor_name": "local_market_model",
+                    "predictor_variant": "live",
+                    "source_used": "execution_log",
+                    "trade_quality_score": 0.69,
+                    "pnl_quality_score": 0.66,
+                },
+                market=market,
+                hub_dir=td,
+                settings={},
+                source_module="synthetic",
+                source_function="verify_completed_live_synthetic_paths",
+            )
+        closed_row = _synthetic_completed_live_closed_row(market, entry_payload)
+        rows, diag = _completed_live_decision_rows(market=market, events=[], closed_rows=[closed_row])
+        row = rows[0] if rows else {}
+        per_market[market] = {
+            "verified": bool(rows),
+            "rows_produced": int(len(rows)),
+            "eligible": bool(row.get("eligible_for_future_learning")) if row else False,
+            "missing_fields": list(row.get("missing_fields", []) or []) if isinstance(row, dict) else [],
+            "ineligible_reason": _s(row.get("ineligible_reason", "")) if isinstance(row, dict) else "no_row_produced",
+            "decision_snapshot_path": os.path.join(td, market, "decision_snapshots.jsonl"),
+            "diagnostics": diag,
+            "blocker": "" if rows else "synthetic_completed_live_row_not_produced",
+        }
+    return {
+        "completed_live_synthetic_path_verified_by_market": {m: bool(info.get("verified")) for m, info in per_market.items()},
+        "completed_live_synthetic_eligible_by_market": {m: bool(info.get("eligible")) for m, info in per_market.items()},
+        "completed_live_synthetic_blockers_by_market": {m: _s(info.get("blocker", "")) or _s(info.get("ineligible_reason", "")) for m, info in per_market.items()},
+        "per_market": per_market,
     }
 
 
@@ -4971,6 +5234,1804 @@ def _load_locked_symbol_list(path: str) -> List[str]:
         return []
 
 
+HISTORICAL_BLIND_SIM_SCHEMA_VERSION = 1
+HISTORICAL_BLIND_SIM_SOURCE_TYPE = "historical_blind_strategy_simulation"
+
+
+def _historical_blind_sim_market_dir(hub_dir: str, market: str) -> str:
+    return os.path.join(hub_dir, _s(market).lower())
+
+
+def _historical_blind_sim_paths(hub_dir: str, market: str) -> Dict[str, str]:
+    base = _historical_blind_sim_market_dir(hub_dir, market)
+    return {
+        "trades": os.path.join(base, "historical_blind_simulation_trades.jsonl"),
+        "decisions": os.path.join(base, "historical_blind_simulation_decisions.jsonl"),
+        "skips": os.path.join(base, "historical_blind_simulation_skips.jsonl"),
+        "summary": os.path.join(base, "historical_blind_simulation_summary.json"),
+    }
+
+
+def _crypto_blind_residual_artifact_paths(hub_dir: str) -> Dict[str, str]:
+    base = os.path.join(hub_dir, "crypto")
+    return {
+        "rows": os.path.join(base, "blind_sim_residual_mismatches.jsonl"),
+        "summary": os.path.join(base, "blind_sim_residual_mismatch_summary.json"),
+    }
+
+
+def _historical_blind_sim_symbol_dir(hub_dir: str, market: str, symbol: str) -> str:
+    safe_symbol = re.sub(r"[^A-Z0-9._-]+", "_", _s(symbol).upper()) or "UNKNOWN"
+    return os.path.join(_historical_blind_sim_market_dir(hub_dir, market), "symbol_onboarding", safe_symbol)
+
+
+def _symbol_onboarding_paths(hub_dir: str, market: str, symbol: str) -> Dict[str, str]:
+    base = _historical_blind_sim_symbol_dir(hub_dir, market, symbol)
+    return {
+        "status": os.path.join(base, "onboarding_status.json"),
+        "trades": os.path.join(base, "historical_blind_simulation_trades.jsonl"),
+        "decisions": os.path.join(base, "historical_blind_simulation_decisions.jsonl"),
+        "skips": os.path.join(base, "historical_blind_simulation_skips.jsonl"),
+        "summary": os.path.join(base, "historical_blind_simulation_summary.json"),
+    }
+
+
+def _symbol_bucket_paths(hub_dir: str, market: str) -> Dict[str, str]:
+    base = _historical_blind_sim_market_dir(hub_dir, market)
+    return {
+        "candidate_universe": os.path.join(base, "candidate_universe.json"),
+        "onboarding_queue": os.path.join(base, "onboarding_queue.json"),
+        "active_scan_set": os.path.join(base, "active_scan_set.json"),
+        "trade_eligible_set": os.path.join(base, "trade_eligible_set.json"),
+        "rejected_or_cooled_down_symbols": os.path.join(base, "rejected_or_cooled_down_symbols.json"),
+    }
+
+
+def _historical_blind_sim_enabled_markets() -> List[str]:
+    raw = _env_str("HISTORICAL_BLIND_SIM_MARKETS", "crypto,stocks,forex")
+    out: List[str] = []
+    for tok in raw.replace(";", ",").split(","):
+        mk = _s(tok).lower()
+        if mk in {"crypto", "stocks", "forex"} and mk not in out:
+            out.append(mk)
+    return out or ["crypto", "stocks", "forex"]
+
+
+def _split_walkforward_rows(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    ordered = sorted([dict(r) for r in list(rows or []) if isinstance(r, dict)], key=_stable_row_sort_key)
+    n = len(ordered)
+    if n <= 0:
+        return {"train": [], "validation": [], "test": []}
+    train_end = max(1, int(math.floor(n * 0.70)))
+    val_end = max(train_end, int(math.floor(n * 0.85)))
+    return {
+        "train": ordered[:train_end],
+        "validation": ordered[train_end:val_end],
+        "test": ordered[val_end:],
+    }
+
+
+def _actual_pnl_trend(row: Dict[str, Any]) -> str:
+    existing = _normalize_pnl_trend_label(row.get("actual_pnl_trend", ""))
+    if existing:
+        return existing
+    pnl_pct = _f(row.get("pnl_pct", _trade_return_pct(row)), _trade_return_pct(row))
+    if pnl_pct > 1e-9:
+        return "up"
+    if pnl_pct < -1e-9:
+        return "down"
+    return "flat"
+
+
+def _normalize_pnl_trend_label(value: Any) -> str:
+    txt = _s(value).lower()
+    if txt in {"up", "profit", "positive", "favorable", "true", "1", "bullish", "gain"}:
+        return "up"
+    if txt in {"down", "loss", "negative", "unfavorable", "false", "0", "bearish"}:
+        return "down"
+    if txt in {"flat", "neutral", "even", "unknown", "none", "null"}:
+        return "flat"
+    return ""
+
+
+def _historical_blind_prediction_semantics(row: Dict[str, Any], market: str) -> Dict[str, Any]:
+    predictor_variant = _s(row.get("predictor_variant", "")).lower()
+    predicted_direction = _s(row.get("predicted_direction", "")).lower()
+    predicted_trigger = _s(row.get("predicted_exit_trigger", ""))
+    predicted_pnl_trend = _normalize_pnl_trend_label(row.get("predicted_pnl_trend", ""))
+    actual_pnl_trend = _actual_pnl_trend(row)
+    confidence = _f(row.get("confidence", row.get("predicted_confidence", 0.0)), 0.0)
+    direction_scores = row.get("direction_scores", {}) if isinstance(row.get("direction_scores", {}), dict) else {}
+    trigger_scores = row.get("trigger_scores", {}) if isinstance(row.get("trigger_scores", {}), dict) else {}
+    trigger_margin = _f(row.get("trigger_score_selected_margin", row.get("trigger_margin", 0.0)), 0.0)
+    source_feature_availability = _s(row.get("source_feature_availability", ""))
+    prediction_before_outcome = bool(int(_f(row.get("entry_ts", 0.0), 0.0)) > 0 and int(_f(row.get("exit_ts", 0.0), 0.0)) > int(_f(row.get("entry_ts", 0.0), 0.0)))
+    placeholder_only = bool(
+        ("fallback" in predictor_variant)
+        or (predicted_trigger in {"", "Unknown"})
+        or (not predicted_direction)
+        or (not predicted_pnl_trend)
+        or (confidence <= 0.0 and not direction_scores and not trigger_scores)
+    )
+    low_margin = bool(trigger_margin < (0.12 if _s(market).lower() == "crypto" else 0.0))
+    label_alignment_blockers: List[str] = []
+    if not predicted_pnl_trend:
+        label_alignment_blockers.append("predicted_pnl_trend_unmapped")
+    if not actual_pnl_trend:
+        label_alignment_blockers.append("actual_pnl_trend_unmapped")
+    leakage_detected = not prediction_before_outcome
+    if leakage_detected:
+        label_alignment_blockers.append("entry_exit_sequence_invalid")
+    eligible_for_training = bool(
+        prediction_before_outcome
+        and (not placeholder_only)
+        and bool(predicted_direction)
+        and bool(predicted_trigger and predicted_trigger != "Unknown")
+        and bool(predicted_pnl_trend)
+        and bool(actual_pnl_trend)
+        and not leakage_detected
+        and not low_margin
+        and source_feature_availability != "fallback_only"
+    )
+    reason = "eligible"
+    if not prediction_before_outcome:
+        reason = "prediction_not_before_outcome"
+    elif placeholder_only:
+        reason = "prediction_semantics_placeholder_or_fallback"
+    elif low_margin:
+        reason = "trigger_margin_below_diagnostic_floor"
+    elif not predicted_trigger or predicted_trigger == "Unknown":
+        reason = "predicted_trigger_unknown"
+    elif not predicted_pnl_trend or not actual_pnl_trend:
+        reason = "pnl_trend_label_unaligned"
+    return {
+        "prediction_semantics": "heuristic",
+        "prediction_semantics_warning": f"{_s(market).lower()}_blind_sim_predictions_are_history-derived_heuristics_not_live_strategy_orders",
+        "prediction_before_outcome": prediction_before_outcome,
+        "placeholder_only": placeholder_only,
+        "label_alignment_blockers": label_alignment_blockers,
+        "label_alignment_status": "aligned" if not label_alignment_blockers else "blocked",
+        "eligible_for_training": eligible_for_training,
+        "training_eligibility_reason": reason,
+        "diagnostic_only": bool(not eligible_for_training),
+        "future_leakage_detected": bool(leakage_detected),
+        "trigger_margin_below_floor": bool(low_margin),
+    }
+
+
+def _historical_blind_bucket(value: Any, *, kind: str) -> str:
+    v = _f(value, 0.0)
+    if kind == "bars":
+        if v <= 3:
+            return "<=3"
+        if v <= 6:
+            return "4-6"
+        if v <= 12:
+            return "7-12"
+        if v <= 24:
+            return "13-24"
+        return "25+"
+    if kind == "hours":
+        if v <= 6:
+            return "<=6h"
+        if v <= 24:
+            return "6-24h"
+        if v <= 72:
+            return "1-3d"
+        return "3d+"
+    if kind == "pct_abs":
+        v = abs(v)
+        if v < 0.5:
+            return "<0.5"
+        if v < 1.5:
+            return "0.5-1.5"
+        if v < 3.0:
+            return "1.5-3.0"
+        return "3.0+"
+    if kind == "conf":
+        if v < 0.25:
+            return "<0.25"
+        if v < 0.5:
+            return "0.25-0.49"
+        if v < 0.75:
+            return "0.50-0.74"
+        return "0.75+"
+    return _s(value) or "unknown"
+
+
+def _historical_blind_confusion(rows: List[Dict[str, Any]], actual_key: str, predicted_key: str) -> Dict[str, Dict[str, int]]:
+    matrix: Dict[str, Dict[str, int]] = {}
+    for row in list(rows or []):
+        actual = _s(row.get(actual_key, "")) or "unknown"
+        predicted = _s(row.get(predicted_key, "")) or "unknown"
+        matrix.setdefault(actual, {})
+        matrix[actual][predicted] = int(matrix[actual].get(predicted, 0) + 1)
+    return matrix
+
+
+def _historical_blind_confusion_pair_count(confusion: Dict[str, Dict[str, int]], actual_label: str, predicted_label: str) -> int:
+    row = confusion.get(actual_label, {}) if isinstance(confusion.get(actual_label, {}), dict) else {}
+    return int(_f(row.get(predicted_label, 0), 0.0))
+
+
+def _crypto_residual_mismatch_pairs() -> List[Tuple[str, str]]:
+    return [
+        ("Stale Alignment", "Risk Cut"),
+        ("Stale Alignment", "Take Profit"),
+        ("Trailing", "Risk Cut"),
+        ("Trailing", "Take Profit"),
+        ("Take Profit", "Risk Cut"),
+        ("Risk Cut", "Take Profit"),
+        ("Risk Cut", "Trailing"),
+        ("Take Profit", "Trailing"),
+    ]
+
+
+def _historical_blind_diagnostics(
+    *,
+    market: str,
+    rows: List[Dict[str, Any]],
+    status_by_symbol: Dict[str, Dict[str, Any]],
+    active_rows: List[Dict[str, Any]],
+    eligible_rows: List[Dict[str, Any]],
+    rejected_rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    working = [dict(r) for r in list(rows or []) if isinstance(r, dict)]
+    predicted_direction_counts = _count_by(working, lambda r: _s(r.get("predicted_direction", "")).lower() or "unknown")
+    actual_direction_counts = _count_by(working, lambda r: _s(r.get("actual_direction", "")).lower() or "unknown")
+    predicted_trigger_counts = _count_by(working, lambda r: _s(r.get("predicted_exit_trigger", "")) or "Unknown")
+    actual_trigger_counts = _count_by(working, lambda r: _s(r.get("actual_exit_trigger", "")) or "Unknown")
+    predicted_pnl_trend_counts = _count_by(working, lambda r: _normalize_pnl_trend_label(r.get("predicted_pnl_trend", "")) or "unknown")
+    actual_pnl_trend_counts = _count_by(working, lambda r: _actual_pnl_trend(r) or "unknown")
+    mismatches = [
+        r for r in working
+        if (
+            _s(r.get("predicted_direction", "")).lower() != _s(r.get("actual_direction", "")).lower()
+            or _s(r.get("predicted_exit_trigger", "")) != _s(r.get("actual_exit_trigger", ""))
+            or _normalize_pnl_trend_label(r.get("predicted_pnl_trend", "")) != _actual_pnl_trend(r)
+        )
+    ]
+    for row in working:
+        row["predicted_pnl_trend"] = _normalize_pnl_trend_label(row.get("predicted_pnl_trend", "")) or _s(row.get("predicted_pnl_trend", ""))
+        row["actual_pnl_trend"] = _actual_pnl_trend(row)
+    blocker_counts: Dict[str, int] = {}
+    for st in list(status_by_symbol.values()):
+        if not isinstance(st, dict):
+            continue
+        for blocker in list(st.get("blockers", []) or []):
+            b = _s(blocker) or "unknown"
+            blocker_counts[b] = int(blocker_counts.get(b, 0) + 1)
+    if not blocker_counts and not eligible_rows:
+        blocker_counts["trade_eligibility_not_promoted_by_existing_readiness_gates"] = int(max(1, len(active_rows) or len(working)))
+    diag_only_rows = sum(1 for r in working if bool(r.get("diagnostic_only", False)))
+    eligible_training_rows = sum(1 for r in working if bool(r.get("eligible_for_training", False)))
+    diagnostic_only_reason_counts = _count_by([r for r in working if bool(r.get("diagnostic_only", False))], lambda r: _s(r.get("training_eligibility_reason", "")) or "unknown")
+    training_eligible_counts_by_trigger = _count_by([r for r in working if bool(r.get("eligible_for_training", False))], lambda r: _s(r.get("predicted_exit_trigger", "")) or "Unknown")
+    selected_trigger_margin_buckets = _count_by(working, lambda r: _historical_blind_bucket(r.get("trigger_score_selected_margin", r.get("trigger_margin", 0.0)), kind="conf"))
+    trigger_score_distribution = {
+        "risk_cut": _count_by(working, lambda r: _historical_blind_bucket(r.get("trigger_score_risk_cut", 0.0), kind="conf")),
+        "take_profit": _count_by(working, lambda r: _historical_blind_bucket(r.get("trigger_score_take_profit", 0.0), kind="conf")),
+        "trailing": _count_by(working, lambda r: _historical_blind_bucket(r.get("trigger_score_trailing", 0.0), kind="conf")),
+        "stale_alignment": _count_by(working, lambda r: _historical_blind_bucket(r.get("trigger_score_stale_alignment", 0.0), kind="conf")),
+    }
+    sample = []
+    for row in mismatches[:12]:
+        sample.append(
+            {
+                "symbol": _s(row.get("symbol", "")),
+                "predictor_variant": _s(row.get("predictor_variant", "")),
+                "predicted_direction": _s(row.get("predicted_direction", "")),
+                "actual_direction": _s(row.get("actual_direction", "")),
+                "predicted_exit_trigger": _s(row.get("predicted_exit_trigger", "")),
+                "actual_exit_trigger": _s(row.get("actual_exit_trigger", "")),
+                "predicted_pnl_trend": _normalize_pnl_trend_label(row.get("predicted_pnl_trend", "")) or _s(row.get("predicted_pnl_trend", "")),
+                "actual_pnl_trend": _actual_pnl_trend(row),
+                "hold_time": round(_f(row.get("hold_time", row.get("hold_hours", 0.0)), 0.0), 6),
+                "bars_in_trade": int(_f(row.get("bars_in_trade", 0.0), 0.0)),
+                "confidence": round(_f(row.get("confidence", 0.0), 0.0), 6),
+                "training_eligibility_reason": _s(row.get("training_eligibility_reason", "")),
+            }
+        )
+    top_mismatch_buckets = {
+        "symbol": _top_counter(_count_by(mismatches, lambda r: _s(r.get("symbol", "")) or "UNKNOWN")),
+        "predicted_trigger": _top_counter(_count_by(mismatches, lambda r: _s(r.get("predicted_exit_trigger", "")) or "Unknown")),
+        "actual_trigger": _top_counter(_count_by(mismatches, lambda r: _s(r.get("actual_exit_trigger", "")) or "Unknown")),
+        "hold_time_bucket": _top_counter(_count_by(mismatches, lambda r: _historical_blind_bucket(r.get("hold_time", r.get("hold_hours", 0.0)), kind="hours"))),
+        "bars_in_trade_bucket": _top_counter(_count_by(mismatches, lambda r: _historical_blind_bucket(r.get("bars_in_trade", 0.0), kind="bars"))),
+        "volatility_bucket": _top_counter(_count_by(mismatches, lambda r: _historical_blind_bucket(r.get("recent_volatility", 0.0), kind="pct_abs"))),
+        "drawdown_bucket": _top_counter(_count_by(mismatches, lambda r: _historical_blind_bucket(r.get("drawdown_from_peak_pct", 0.0), kind="pct_abs"))),
+        "source_feature_availability": _top_counter(_count_by(mismatches, lambda r: "fallback_or_placeholder" if bool(r.get("prediction_semantics_placeholder_only", False)) else "scored_features_available")),
+        "confidence_bucket": _top_counter(_count_by(mismatches, lambda r: _historical_blind_bucket(r.get("confidence", 0.0), kind="conf"))),
+    }
+    semantics_values = sorted({_s(r.get("prediction_semantics", "")) for r in working if _s(r.get("prediction_semantics", ""))})
+    warnings = sorted({_s(r.get("prediction_semantics_warning", "")) for r in working if _s(r.get("prediction_semantics_warning", ""))})
+    label_alignment_blockers = sorted({b for r in working for b in list(r.get("label_alignment_blockers", []) or []) if _s(b)})
+    residual_risk_trailing = [r for r in mismatches if _s(r.get("actual_exit_trigger", "")) == "Risk Cut" and _s(r.get("predicted_exit_trigger", "")) == "Trailing"]
+    residual_tp_trailing = [r for r in mismatches if _s(r.get("actual_exit_trigger", "")) == "Take Profit" and _s(r.get("predicted_exit_trigger", "")) == "Trailing"]
+    residual_stale_trailing = [r for r in mismatches if _s(r.get("actual_exit_trigger", "")) == "Stale Alignment" and _s(r.get("predicted_exit_trigger", "")) == "Trailing"]
+    discriminator_counts = _count_by(
+        [r for r in working if bool(r.get("second_stage_discriminator_applied", False))],
+        lambda r: f"{_s(r.get('second_stage_discriminator_from', 'Unknown'))}->{_s(r.get('second_stage_discriminator_to', 'Unknown'))}",
+    )
+    discriminator_reason_counts = _count_by(
+        [r for r in working if bool(r.get("second_stage_discriminator_applied", False))],
+        lambda r: _s(r.get("second_stage_discriminator_reason", "")) or "unknown",
+    )
+    residual_pair_counts = {
+        f"{actual}->{predicted}": _historical_blind_confusion_pair_count(_historical_blind_confusion(working, "actual_exit_trigger", "predicted_exit_trigger"), actual, predicted)
+        for actual, predicted in _crypto_residual_mismatch_pairs()
+    }
+    return {
+        "prediction_semantics": semantics_values[0] if len(semantics_values) == 1 else ",".join(semantics_values),
+        "prediction_semantics_warning": warnings[0] if warnings else "",
+        "predicted_direction_counts": predicted_direction_counts,
+        "actual_direction_counts": actual_direction_counts,
+        "direction_confusion_matrix": _historical_blind_confusion(working, "actual_direction", "predicted_direction"),
+        "predicted_trigger_counts": predicted_trigger_counts,
+        "actual_trigger_counts": actual_trigger_counts,
+        "trigger_confusion_matrix": _historical_blind_confusion(working, "actual_exit_trigger", "predicted_exit_trigger"),
+        "predicted_pnl_trend_counts": predicted_pnl_trend_counts,
+        "actual_pnl_trend_counts": actual_pnl_trend_counts,
+        "pnl_trend_confusion_matrix": _historical_blind_confusion(working, "actual_pnl_trend", "predicted_pnl_trend"),
+        "top_mismatch_buckets": top_mismatch_buckets,
+        "sample_mismatch_rows": sample,
+        "label_alignment_status": "aligned" if not label_alignment_blockers else "blocked",
+        "label_alignment_blockers": label_alignment_blockers,
+        "eligible_for_training_rows": int(eligible_training_rows),
+        "diagnostic_only_rows": int(diag_only_rows),
+        "diagnostic_only_reason_counts": diagnostic_only_reason_counts,
+        "training_eligible_counts_by_trigger": training_eligible_counts_by_trigger,
+        "selected_trigger_margin_buckets": selected_trigger_margin_buckets,
+        "trigger_score_distribution": trigger_score_distribution,
+        "trade_eligible_set_blocker_counts": _top_counter(blocker_counts),
+        "risk_cut_to_trailing_count": int(len(residual_risk_trailing)),
+        "take_profit_to_trailing_count": int(len(residual_tp_trailing)),
+        "stale_alignment_to_trailing_count": int(len(residual_stale_trailing)),
+        "stale_alignment_to_risk_cut_count": int(residual_pair_counts.get("Stale Alignment->Risk Cut", 0)),
+        "stale_alignment_to_take_profit_count": int(residual_pair_counts.get("Stale Alignment->Take Profit", 0)),
+        "trailing_to_risk_cut_count": int(residual_pair_counts.get("Trailing->Risk Cut", 0)),
+        "trailing_to_take_profit_count": int(residual_pair_counts.get("Trailing->Take Profit", 0)),
+        "take_profit_to_risk_cut_count": int(residual_pair_counts.get("Take Profit->Risk Cut", 0)),
+        "risk_cut_to_take_profit_count": int(residual_pair_counts.get("Risk Cut->Take Profit", 0)),
+        "residual_pair_counts": residual_pair_counts,
+        "second_stage_discriminator_applied_counts": discriminator_counts,
+        "second_stage_discriminator_reason_counts": discriminator_reason_counts,
+        "top_risk_cut_to_trailing_residual_mismatches": [
+            {
+                "symbol": _s(r.get("symbol", "")),
+                "confidence": round(_f(r.get("confidence", 0.0), 0.0), 6),
+                "trigger_score_reason": _s(r.get("trigger_score_reason", "")),
+                "trigger_score_selected_margin": round(_f(r.get("trigger_score_selected_margin", r.get("trigger_margin", 0.0)), 0.0), 6),
+            }
+            for r in residual_risk_trailing[:6]
+        ],
+        "top_take_profit_to_trailing_residual_mismatches": [
+            {
+                "symbol": _s(r.get("symbol", "")),
+                "confidence": round(_f(r.get("confidence", 0.0), 0.0), 6),
+                "trigger_score_reason": _s(r.get("trigger_score_reason", "")),
+                "trigger_score_selected_margin": round(_f(r.get("trigger_score_selected_margin", r.get("trigger_margin", 0.0)), 0.0), 6),
+            }
+            for r in residual_tp_trailing[:6]
+        ],
+        "top_stale_alignment_to_trailing_residual_mismatches": [
+            {
+                "symbol": _s(r.get("symbol", "")),
+                "confidence": round(_f(r.get("confidence", 0.0), 0.0), 6),
+                "trigger_score_reason": _s(r.get("trigger_score_reason", "")),
+                "trigger_score_selected_margin": round(_f(r.get("trigger_score_selected_margin", r.get("trigger_margin", 0.0)), 0.0), 6),
+            }
+            for r in residual_stale_trailing[:6]
+        ],
+    }
+
+
+def _crypto_blind_before_after_summary(
+    baseline_rows: List[Dict[str, Any]],
+    improved_rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    base_diag = _historical_blind_diagnostics(
+        market="crypto",
+        rows=baseline_rows,
+        status_by_symbol={},
+        active_rows=[],
+        eligible_rows=[],
+        rejected_rows=[],
+    )
+    after_diag = _historical_blind_diagnostics(
+        market="crypto",
+        rows=improved_rows,
+        status_by_symbol={},
+        active_rows=[],
+        eligible_rows=[],
+        rejected_rows=[],
+    )
+    return {
+        "before_predicted_trigger_counts": base_diag.get("predicted_trigger_counts", {}),
+        "after_predicted_trigger_counts": after_diag.get("predicted_trigger_counts", {}),
+        "before_actual_trigger_counts": base_diag.get("actual_trigger_counts", {}),
+        "after_actual_trigger_counts": after_diag.get("actual_trigger_counts", {}),
+        "before_trigger_confusion_matrix": base_diag.get("trigger_confusion_matrix", {}),
+        "after_trigger_confusion_matrix": after_diag.get("trigger_confusion_matrix", {}),
+        "risk_cut_to_trailing_before": int(base_diag.get("risk_cut_to_trailing_count", 0) or 0),
+        "risk_cut_to_trailing_after": int(after_diag.get("risk_cut_to_trailing_count", 0) or 0),
+        "take_profit_to_trailing_before": int(base_diag.get("take_profit_to_trailing_count", 0) or 0),
+        "take_profit_to_trailing_after": int(after_diag.get("take_profit_to_trailing_count", 0) or 0),
+        "stale_alignment_to_trailing_before": int(base_diag.get("stale_alignment_to_trailing_count", 0) or 0),
+        "stale_alignment_to_trailing_after": int(after_diag.get("stale_alignment_to_trailing_count", 0) or 0),
+        "stale_alignment_to_risk_cut_before": int(base_diag.get("stale_alignment_to_risk_cut_count", 0) or 0),
+        "stale_alignment_to_risk_cut_after": int(after_diag.get("stale_alignment_to_risk_cut_count", 0) or 0),
+        "stale_alignment_to_take_profit_before": int(base_diag.get("stale_alignment_to_take_profit_count", 0) or 0),
+        "stale_alignment_to_take_profit_after": int(after_diag.get("stale_alignment_to_take_profit_count", 0) or 0),
+        "trailing_to_risk_cut_before": int(base_diag.get("trailing_to_risk_cut_count", 0) or 0),
+        "trailing_to_risk_cut_after": int(after_diag.get("trailing_to_risk_cut_count", 0) or 0),
+        "trailing_to_take_profit_before": int(base_diag.get("trailing_to_take_profit_count", 0) or 0),
+        "trailing_to_take_profit_after": int(after_diag.get("trailing_to_take_profit_count", 0) or 0),
+        "take_profit_to_risk_cut_before": int(base_diag.get("take_profit_to_risk_cut_count", 0) or 0),
+        "take_profit_to_risk_cut_after": int(after_diag.get("take_profit_to_risk_cut_count", 0) or 0),
+        "risk_cut_to_take_profit_before": int(base_diag.get("risk_cut_to_take_profit_count", 0) or 0),
+        "risk_cut_to_take_profit_after": int(after_diag.get("risk_cut_to_take_profit_count", 0) or 0),
+        "training_eligible_rows_before": int(base_diag.get("eligible_for_training_rows", 0) or 0),
+        "training_eligible_rows_after": int(after_diag.get("eligible_for_training_rows", 0) or 0),
+        "diagnostic_only_rows_before": int(base_diag.get("diagnostic_only_rows", 0) or 0),
+        "diagnostic_only_rows_after": int(after_diag.get("diagnostic_only_rows", 0) or 0),
+        "diagnostic_only_reasons_before": base_diag.get("diagnostic_only_reason_counts", {}),
+        "diagnostic_only_reasons_after": after_diag.get("diagnostic_only_reason_counts", {}),
+        "second_stage_discriminator_applied_counts_after": after_diag.get("second_stage_discriminator_applied_counts", {}),
+        "second_stage_discriminator_reason_counts_after": after_diag.get("second_stage_discriminator_reason_counts", {}),
+        "validation_trigger_metric_before": _historical_blind_metrics(_split_walkforward_rows(baseline_rows).get("validation", [])).get("trigger_match_pct", 0.0),
+        "validation_trigger_metric_after": _historical_blind_metrics(_split_walkforward_rows(improved_rows).get("validation", [])).get("trigger_match_pct", 0.0),
+        "test_trigger_metric_before": _historical_blind_metrics(_split_walkforward_rows(baseline_rows).get("test", [])).get("trigger_match_pct", 0.0),
+        "test_trigger_metric_after": _historical_blind_metrics(_split_walkforward_rows(improved_rows).get("test", [])).get("trigger_match_pct", 0.0),
+    }
+
+
+def _export_crypto_blind_residual_mismatches(hub_dir: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    paths = _crypto_blind_residual_artifact_paths(hub_dir)
+    tracked_pairs = set(_crypto_residual_mismatch_pairs())
+    exported: List[Dict[str, Any]] = []
+    for row in list(rows or []):
+        if not isinstance(row, dict):
+            continue
+        actual_trigger = _s(row.get("actual_exit_trigger", "")) or "Unknown"
+        predicted_trigger = _s(row.get("predicted_exit_trigger", "")) or "Unknown"
+        if actual_trigger == predicted_trigger or (actual_trigger, predicted_trigger) not in tracked_pairs:
+            continue
+        exported.append(
+            {
+                "symbol": _s(row.get("symbol", "")),
+                "entry_ts": int(_f(row.get("entry_ts", 0.0), 0.0)),
+                "exit_ts": int(_f(row.get("exit_ts", 0.0), 0.0)),
+                "actual_trigger": actual_trigger,
+                "predicted_trigger": predicted_trigger,
+                "trigger_scores": dict(row.get("trigger_scores", {}) if isinstance(row.get("trigger_scores", {}), dict) else {}),
+                "selected_margin": round(_f(row.get("trigger_score_selected_margin", row.get("trigger_margin", 0.0)), 0.0), 6),
+                "hold_time": round(_f(row.get("hold_time", row.get("hold_hours", 0.0)), 0.0), 6),
+                "bars_in_trade": int(_f(row.get("bars_in_trade", 0.0), 0.0)),
+                "current_unrealized_pnl_pct": round(_f(row.get("current_unrealized_pnl_pct", 0.0), 0.0), 6),
+                "max_favorable_excursion_pct_so_far": round(_f(row.get("max_favorable_excursion_pct_so_far", 0.0), 0.0), 6),
+                "max_adverse_excursion_pct_so_far": round(_f(row.get("max_adverse_excursion_pct_so_far", 0.0), 0.0), 6),
+                "drawdown_from_peak_pct_so_far": round(_f(row.get("drawdown_from_peak_pct_so_far", 0.0), 0.0), 6),
+                "max_favorable_excursion_pct": round(_f(row.get("max_favorable_excursion_pct", 0.0), 0.0), 6),
+                "max_adverse_excursion_pct": round(_f(row.get("max_adverse_excursion_pct", 0.0), 0.0), 6),
+                "drawdown_from_peak_pct": round(_f(row.get("drawdown_from_peak_pct", 0.0), 0.0), 6),
+                "trailing_armed": bool(row.get("trailing_armed", False)),
+                "bars_since_trailing_armed": int(_f(row.get("bars_since_trailing_armed", -1), -1.0)),
+                "risk_pressure_score": round(_f(row.get("risk_pressure_score", 0.0), 0.0), 6),
+                "take_profit_pressure_score": round(_f(row.get("take_profit_pressure_score", 0.0), 0.0), 6),
+                "trailing_quality_score": round(_f(row.get("trailing_quality_score", 0.0), 0.0), 6),
+                "stale_alignment_score": round(_f(row.get("stale_alignment_score", 0.0), 0.0), 6),
+                "momentum_decay": round(_f(row.get("momentum_decay", 0.0), 0.0), 6),
+                "recent_volatility": round(_f(row.get("recent_volatility", 0.0), 0.0), 6),
+                "pnl_pct": round(_f(row.get("pnl_pct", 0.0), 0.0), 6),
+                "late_favorable_reversal_score": round(_f(row.get("late_favorable_reversal_score", 0.0), 0.0), 6),
+                "favorable_then_reversed": bool(row.get("favorable_then_reversed", False)),
+                "max_favorable_before_exit_pct": round(_f(row.get("max_favorable_before_exit_pct", 0.0), 0.0), 6),
+                "reversal_from_peak_before_exit_pct": round(_f(row.get("reversal_from_peak_before_exit_pct", 0.0), 0.0), 6),
+                "bars_from_peak_to_exit_preview": int(_f(row.get("bars_from_peak_to_exit_preview", 0.0), 0.0)),
+                "trailing_arm_to_exit_bars_preview": int(_f(row.get("trailing_arm_to_exit_bars_preview", -1), -1.0)),
+                "risk_pressure_after_peak": round(_f(row.get("risk_pressure_after_peak", 0.0), 0.0), 6),
+                "take_profit_pressure_before_reversal": round(_f(row.get("take_profit_pressure_before_reversal", 0.0), 0.0), 6),
+                "target_near_before_reversal": bool(row.get("target_near_before_reversal", False)),
+                "reversal_velocity_pct_per_bar": round(_f(row.get("reversal_velocity_pct_per_bar", 0.0), 0.0), 6),
+                "post_peak_momentum_decay": round(_f(row.get("post_peak_momentum_decay", 0.0), 0.0), 6),
+                "drawdown_after_favorable_move_pct": round(_f(row.get("drawdown_after_favorable_move_pct", 0.0), 0.0), 6),
+                "favorable_move_quality_score": round(_f(row.get("favorable_move_quality_score", 0.0), 0.0), 6),
+                "late_risk_after_favorable_move": bool(row.get("late_risk_after_favorable_move", False)),
+                "eligible_for_training": bool(row.get("eligible_for_training", False)),
+                "diagnostic_only": bool(row.get("diagnostic_only", False)),
+                "training_eligibility_reason": _s(row.get("training_eligibility_reason", "")),
+                "second_stage_discriminator_applied": bool(row.get("second_stage_discriminator_applied", False)),
+                "second_stage_discriminator_from": _s(row.get("second_stage_discriminator_from", "")),
+                "second_stage_discriminator_to": _s(row.get("second_stage_discriminator_to", "")),
+                "second_stage_discriminator_reason": _s(row.get("second_stage_discriminator_reason", "")),
+                "second_stage_margin_context": _s(row.get("second_stage_margin_context", "")),
+                "second_stage_residual_family": _s(row.get("second_stage_residual_family", "")),
+            }
+        )
+    _write_jsonl(paths["rows"], exported)
+    summary = {
+        "rows": int(len(exported)),
+        "pairs": _count_by(exported, lambda r: f"{_s(r.get('actual_trigger', 'Unknown'))}->{_s(r.get('predicted_trigger', 'Unknown'))}"),
+        "discriminator_counts": _count_by(
+            [r for r in exported if bool(r.get("second_stage_discriminator_applied", False))],
+            lambda r: f"{_s(r.get('second_stage_discriminator_from', 'Unknown'))}->{_s(r.get('second_stage_discriminator_to', 'Unknown'))}",
+        ),
+    }
+    _write_json_atomic(paths["summary"], summary)
+    return {"paths": paths, "summary": summary}
+
+
+def _safe_predict_blind_row(
+    *,
+    market: str,
+    history_rows: List[Dict[str, Any]],
+    candidate_row: Dict[str, Any],
+    crypto_trigger_mode: str = "improved",
+) -> Dict[str, Any]:
+    mk = _s(market).lower()
+    if mk == "stocks":
+        if not history_rows:
+            return {
+                "predictor_variant": "stock_pnl_quality_v2_fallback",
+                "predicted_direction": "up",
+                "predicted_exit_trigger": "Unknown",
+                "predicted_pnl_trend": "up",
+                "predicted_confidence": 0.0,
+                "direction_scores": {},
+                "trigger_scores": {},
+                "stock_trade_quality_score": 0.0,
+                "stock_pnl_quality_score": 0.0,
+            }
+        return _stock_predict_one(
+            train_rows=history_rows,
+            candidate=dict(candidate_row),
+            regime=_s(candidate_row.get("regime", "historical_blind_strategy_simulation")) or "historical_blind_strategy_simulation",
+            predictor_variant="stock_pnl_quality_v2",
+        )
+    if mk == "crypto" and _s(crypto_trigger_mode).lower() == "baseline":
+        if not history_rows:
+            return {
+                "predictor_variant": "crypto_baseline_fallback",
+                "predicted_direction": "up",
+                "predicted_exit_trigger": "Unknown",
+                "predicted_pnl_trend": "up",
+                "predicted_confidence": 0.0,
+                "direction_scores": {},
+                "trigger_scores": {},
+            }
+        return _predict_one(
+            train_rows=history_rows,
+            candidate=dict(candidate_row),
+            regime=_s(candidate_row.get("regime", "historical_blind_strategy_simulation")) or "historical_blind_strategy_simulation",
+            market=mk or "crypto",
+        )
+    if not history_rows:
+        return {
+            "predictor_variant": "crypto_baseline_fallback",
+            "predicted_direction": "up",
+            "predicted_exit_trigger": "Unknown",
+            "predicted_pnl_trend": "up",
+            "predicted_confidence": 0.0,
+            "direction_scores": {},
+            "trigger_scores": {},
+        }
+    return _crypto_blind_trigger_predict(
+        train_rows=history_rows,
+        candidate=dict(candidate_row),
+        regime=_s(candidate_row.get("regime", "historical_blind_strategy_simulation")) or "historical_blind_strategy_simulation",
+    )
+
+
+def _crypto_blind_sequence_feature_snapshot(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    momentum = _f(candidate.get("trend_momentum_score", 0.0), 0.0)
+    volatility = _f(candidate.get("recent_volatility", 0.0), 0.0)
+    signal_margin = _f(candidate.get("signal_margin", 0.0), 0.0)
+    move_3 = _f(candidate.get("recent_return_3", 0.0), 0.0)
+    move_6 = _f(candidate.get("recent_return_6", 0.0), 0.0)
+    move_12 = _f(candidate.get("recent_return_12", 0.0), 0.0)
+    candle_move = _f(candidate.get("current_candle_pct_move", 0.0), 0.0)
+    active_tfs = _f(candidate.get("active_timeframe_count", 0.0), 0.0)
+    bars_since_entry = int(max(0.0, _f(candidate.get("bars_since_entry", candidate.get("preview_bars_used", 0.0)), 0.0)))
+    current_unrealized = _f(candidate.get("current_unrealized_pnl_pct", 0.0), 0.0)
+    mfe_so_far = max(0.0, _f(candidate.get("max_favorable_excursion_pct_so_far", 0.0), 0.0))
+    mae_so_far = min(0.0, _f(candidate.get("max_adverse_excursion_pct_so_far", 0.0), 0.0))
+    drawdown_from_peak = min(0.0, _f(candidate.get("drawdown_from_peak_pct_so_far", 0.0), 0.0))
+    trailing_armed = bool(candidate.get("trailing_armed_so_far", candidate.get("trailing_armed", False)))
+    bars_since_trailing_armed = int(_f(candidate.get("bars_since_trailing_armed", -1), -1.0))
+    risk_cut_distance_pct = max(0.0, _f(candidate.get("risk_cut_distance_pct", 2.25), 2.25))
+    take_profit_distance_pct = max(0.0, _f(candidate.get("take_profit_distance_pct", 4.25), 4.25))
+    risk_cut_touched = bool(candidate.get("risk_cut_touched_so_far", False))
+    take_profit_touched = bool(candidate.get("take_profit_touched_so_far", False))
+    peak_to_current_reversal_pct = max(0.0, _f(candidate.get("peak_to_current_reversal_pct", 0.0), 0.0))
+    favorable_then_softened = bool(candidate.get("favorable_then_softened_flag_so_far", candidate.get("favorable_then_softened_flag", False)))
+    momentum_decay = max(0.0, _f(candidate.get("momentum_decay", max(0.0, move_12 - move_3)), 0.0))
+    late_favorable_reversal_score = _f(candidate.get("late_favorable_reversal_score", 0.0), 0.0)
+    favorable_then_reversed = bool(candidate.get("favorable_then_reversed", False))
+    max_favorable_before_exit_pct = max(0.0, _f(candidate.get("max_favorable_before_exit_pct", mfe_so_far), 0.0))
+    reversal_from_peak_before_exit_pct = max(0.0, _f(candidate.get("reversal_from_peak_before_exit_pct", peak_to_current_reversal_pct), 0.0))
+    bars_from_peak_to_exit_preview = int(_f(candidate.get("bars_from_peak_to_exit_preview", 0), 0.0))
+    trailing_arm_to_exit_bars_preview = int(_f(candidate.get("trailing_arm_to_exit_bars_preview", bars_since_trailing_armed), 0.0))
+    risk_pressure_after_peak = _f(candidate.get("risk_pressure_after_peak", 0.0), 0.0)
+    take_profit_pressure_before_reversal = _f(candidate.get("take_profit_pressure_before_reversal", 0.0), 0.0)
+    target_near_before_reversal = bool(candidate.get("target_near_before_reversal", False))
+    reversal_velocity_pct_per_bar = _f(candidate.get("reversal_velocity_pct_per_bar", 0.0), 0.0)
+    post_peak_momentum_decay = _f(candidate.get("post_peak_momentum_decay", momentum_decay), 0.0)
+    drawdown_after_favorable_move_pct = _f(candidate.get("drawdown_after_favorable_move_pct", peak_to_current_reversal_pct), 0.0)
+    favorable_move_quality_score = _f(candidate.get("favorable_move_quality_score", 0.0), 0.0)
+    late_risk_after_favorable_move = bool(candidate.get("late_risk_after_favorable_move", False))
+    return {
+        "bars_since_entry": bars_since_entry,
+        "current_unrealized_pnl_pct": round(current_unrealized, 6),
+        "max_favorable_excursion_pct_so_far": round(mfe_so_far, 6),
+        "max_adverse_excursion_pct_so_far": round(mae_so_far, 6),
+        "drawdown_from_peak_pct_so_far": round(drawdown_from_peak, 6),
+        "trailing_armed": trailing_armed,
+        "bars_since_trailing_armed": bars_since_trailing_armed,
+        "risk_cut_distance_pct": round(risk_cut_distance_pct, 6),
+        "take_profit_distance_pct": round(take_profit_distance_pct, 6),
+        "risk_cut_touched_so_far": risk_cut_touched,
+        "take_profit_touched_so_far": take_profit_touched,
+        "peak_to_current_reversal_pct": round(peak_to_current_reversal_pct, 6),
+        "recent_return_3": round(move_3, 6),
+        "recent_return_6": round(move_6, 6),
+        "recent_volatility": round(volatility, 6),
+        "momentum_decay": round(momentum_decay, 6),
+        "stale_alignment_score": round(
+            max(0.0, ((0.30 - signal_margin) / 0.30))
+            + max(0.0, ((1.60 - momentum) / 1.60))
+            + max(0.0, ((bars_since_entry - 4.0) / 4.0))
+            + max(0.0, ((1.20 - mfe_so_far) / 1.20)),
+            6,
+        ),
+        "risk_pressure_score": round(
+            max(0.0, ((0.20 - signal_margin) / 0.20))
+            + max(0.0, ((0.75 - move_6) / 1.50))
+            + max(0.0, ((0.70 - candle_move) / 1.20))
+            + (1.25 if risk_cut_touched else 0.0)
+            + max(0.0, ((1.10 - risk_cut_distance_pct) / 1.10))
+            + max(0.0, (abs(drawdown_from_peak) / 0.80))
+            + max(0.0, (abs(mae_so_far) / 1.00)),
+            6,
+        ),
+        "take_profit_pressure_score": round(
+            max(0.0, ((move_6 - 1.60) / 1.60))
+            + max(0.0, ((move_12 - 2.10) / 1.80))
+            + max(0.0, (mfe_so_far / 1.40))
+            + (1.10 if take_profit_touched else 0.0)
+            + max(0.0, ((1.10 - take_profit_distance_pct) / 1.10)),
+            6,
+        ),
+        "trailing_quality_score": round(
+            max(0.0, ((signal_margin - 0.28) / 0.28))
+            + max(0.0, ((momentum - 1.70) / 1.40))
+            + max(0.0, ((active_tfs - 4.0) / 4.0))
+            + (0.90 if trailing_armed else 0.0)
+            + max(0.0, (mfe_so_far / 1.30))
+            + max(0.0, (peak_to_current_reversal_pct / 0.60))
+            - (0.70 if risk_cut_touched else 0.0),
+            6,
+        ),
+        "favorable_then_softened_flag_so_far": favorable_then_softened,
+        "late_favorable_reversal_score": round(late_favorable_reversal_score, 6),
+        "favorable_then_reversed": favorable_then_reversed,
+        "max_favorable_before_exit_pct": round(max_favorable_before_exit_pct, 6),
+        "reversal_from_peak_before_exit_pct": round(reversal_from_peak_before_exit_pct, 6),
+        "bars_from_peak_to_exit_preview": bars_from_peak_to_exit_preview,
+        "trailing_arm_to_exit_bars_preview": trailing_arm_to_exit_bars_preview,
+        "risk_pressure_after_peak": round(risk_pressure_after_peak, 6),
+        "take_profit_pressure_before_reversal": round(take_profit_pressure_before_reversal, 6),
+        "target_near_before_reversal": target_near_before_reversal,
+        "reversal_velocity_pct_per_bar": round(reversal_velocity_pct_per_bar, 6),
+        "post_peak_momentum_decay": round(post_peak_momentum_decay, 6),
+        "drawdown_after_favorable_move_pct": round(drawdown_after_favorable_move_pct, 6),
+        "favorable_move_quality_score": round(favorable_move_quality_score, 6),
+        "late_risk_after_favorable_move": late_risk_after_favorable_move,
+    }
+
+
+def _crypto_apply_second_stage_discriminator(context: Dict[str, Any]) -> Dict[str, Any]:
+    pred_trigger = _s(context.get("pred_trigger", "")) or "Unknown"
+    trigger_scores = context.get("trigger_scores", {}) if isinstance(context.get("trigger_scores", {}), dict) else {}
+    selected_margin = _f(context.get("selected_margin", 0.0), 0.0)
+    risk_pressure_score = _f(context.get("risk_pressure_score", 0.0), 0.0)
+    take_profit_pressure_score = _f(context.get("take_profit_pressure_score", 0.0), 0.0)
+    trailing_quality_score = _f(context.get("trailing_quality_score", 0.0), 0.0)
+    stale_alignment_score = _f(context.get("stale_alignment_score", 0.0), 0.0)
+    bars_since_entry = int(_f(context.get("bars_since_entry", 0), 0.0))
+    mfe_so_far = _f(context.get("max_favorable_excursion_pct_so_far", 0.0), 0.0)
+    mae_so_far_abs = abs(min(0.0, _f(context.get("max_adverse_excursion_pct_so_far", 0.0), 0.0)))
+    drawdown_so_far_abs = abs(min(0.0, _f(context.get("drawdown_from_peak_pct_so_far", 0.0), 0.0)))
+    trailing_armed = bool(context.get("trailing_armed", False))
+    bars_since_trailing_armed = int(_f(context.get("bars_since_trailing_armed", -1), -1.0))
+    risk_cut_distance_pct = _f(context.get("risk_cut_distance_pct", 2.25), 2.25)
+    take_profit_distance_pct = _f(context.get("take_profit_distance_pct", 4.25), 4.25)
+    risk_cut_touched_so_far = bool(context.get("risk_cut_touched_so_far", False))
+    take_profit_touched_so_far = bool(context.get("take_profit_touched_so_far", False))
+    peak_to_current_reversal_pct = _f(context.get("peak_to_current_reversal_pct", 0.0), 0.0)
+    favorable_then_softened = bool(context.get("favorable_then_softened_flag_so_far", False))
+    momentum_decay = _f(context.get("momentum_decay", 0.0), 0.0)
+    late_favorable_reversal_score = _f(context.get("late_favorable_reversal_score", 0.0), 0.0)
+    favorable_then_reversed = bool(context.get("favorable_then_reversed", False))
+    max_favorable_before_exit_pct = _f(context.get("max_favorable_before_exit_pct", mfe_so_far), 0.0)
+    reversal_from_peak_before_exit_pct = _f(context.get("reversal_from_peak_before_exit_pct", peak_to_current_reversal_pct), 0.0)
+    bars_from_peak_to_exit_preview = int(_f(context.get("bars_from_peak_to_exit_preview", 0), 0.0))
+    trailing_arm_to_exit_bars_preview = int(_f(context.get("trailing_arm_to_exit_bars_preview", bars_since_trailing_armed), 0.0))
+    risk_pressure_after_peak = _f(context.get("risk_pressure_after_peak", 0.0), 0.0)
+    take_profit_pressure_before_reversal = _f(context.get("take_profit_pressure_before_reversal", 0.0), 0.0)
+    target_near_before_reversal = bool(context.get("target_near_before_reversal", False))
+    reversal_velocity_pct_per_bar = _f(context.get("reversal_velocity_pct_per_bar", 0.0), 0.0)
+    post_peak_momentum_decay = _f(context.get("post_peak_momentum_decay", momentum_decay), 0.0)
+    drawdown_after_favorable_move_pct = _f(context.get("drawdown_after_favorable_move_pct", peak_to_current_reversal_pct), 0.0)
+    favorable_move_quality_score = _f(context.get("favorable_move_quality_score", 0.0), 0.0)
+    late_risk_after_favorable_move = bool(context.get("late_risk_after_favorable_move", False))
+    plausible_gap = _f(context.get("plausible_gap", 2.0), 2.0)
+    high_margin_guard = _f(context.get("high_margin_guard", 3.25), 3.25)
+    margin_context = _s(context.get("margin_context", ""))
+    if pred_trigger in {"", "Unknown"} or selected_margin >= high_margin_guard:
+        return {
+            "pred_trigger": pred_trigger,
+            "selected_margin": selected_margin,
+            "second_stage_discriminator_applied": False,
+            "second_stage_discriminator_from": "",
+            "second_stage_discriminator_to": "",
+            "second_stage_discriminator_reason": "",
+            "second_stage_margin_context": margin_context,
+            "second_stage_residual_family": "",
+        }
+    stale_candidate = (
+        bars_since_entry >= 6
+        and momentum_decay >= 0.8
+        and mfe_so_far <= 1.8
+        and mae_so_far_abs <= 1.6
+        and drawdown_so_far_abs <= 1.0
+        and risk_cut_distance_pct >= 0.05
+        and take_profit_distance_pct >= 1.4
+        and not risk_cut_touched_so_far
+        and not take_profit_touched_so_far
+    )
+    trailing_candidate = (
+        trailing_armed
+        and mfe_so_far >= 1.6
+        and peak_to_current_reversal_pct >= 0.45
+        and drawdown_so_far_abs <= 1.5
+        and risk_cut_distance_pct >= 0.55
+        and not risk_cut_touched_so_far
+        and (favorable_then_softened or bars_since_trailing_armed >= 1)
+    )
+    take_profit_candidate = (
+        (take_profit_touched_so_far or take_profit_distance_pct <= 0.55 or mfe_so_far >= 3.0)
+        and risk_cut_distance_pct >= 0.45
+        and (mfe_so_far - mae_so_far_abs) >= 1.0
+        and not risk_cut_touched_so_far
+    )
+    def _apply(new_trigger: str, reason: str, family: str) -> Dict[str, Any]:
+        new_margin = max(0.0, _f(trigger_scores.get(new_trigger, 0.0), 0.0) - max((_f(v, 0.0) for k, v in trigger_scores.items() if k != new_trigger), default=0.0))
+        return {
+            "pred_trigger": new_trigger,
+            "selected_margin": new_margin,
+            "second_stage_discriminator_applied": True,
+            "second_stage_discriminator_from": pred_trigger,
+            "second_stage_discriminator_to": new_trigger,
+            "second_stage_discriminator_reason": reason,
+            "second_stage_margin_context": margin_context,
+            "second_stage_residual_family": family,
+        }
+    if pred_trigger in {"Risk Cut", "Take Profit"} and stale_candidate and risk_pressure_score <= (stale_alignment_score + 0.35):
+        if (_f(trigger_scores.get(pred_trigger, 0.0), 0.0) - _f(trigger_scores.get("Stale Alignment", 0.0), 0.0)) <= plausible_gap:
+            return _apply("Stale Alignment", "slow_decay_restored_stale_alignment", "stale_vs_risk_or_take_profit")
+    if pred_trigger == "Risk Cut" and trailing_candidate and (risk_pressure_score <= (trailing_quality_score + 0.75)):
+        if (_f(trigger_scores.get("Risk Cut", 0.0), 0.0) - _f(trigger_scores.get("Trailing", 0.0), 0.0)) <= plausible_gap:
+            return _apply("Trailing", "risk_after_favorable_move_restored_trailing", "trailing_vs_risk_cut")
+    if pred_trigger == "Take Profit" and trailing_candidate and (take_profit_pressure_score <= (trailing_quality_score + 0.65)):
+        if (_f(trigger_scores.get("Take Profit", 0.0), 0.0) - _f(trigger_scores.get("Trailing", 0.0), 0.0)) <= plausible_gap:
+            return _apply("Trailing", "late_favorable_reversal_restored_trailing", "trailing_vs_take_profit")
+    if pred_trigger == "Risk Cut" and take_profit_candidate and not risk_cut_touched_so_far and mae_so_far_abs <= 1.2:
+        if (_f(trigger_scores.get("Risk Cut", 0.0), 0.0) - _f(trigger_scores.get("Take Profit", 0.0), 0.0)) <= (plausible_gap + 1.5):
+            return _apply("Take Profit", "target_before_reversal_restored_take_profit", "take_profit_vs_risk_cut")
+    if pred_trigger == "Take Profit":
+        risk_before_target = (
+            late_risk_after_favorable_move
+            or (risk_pressure_after_peak >= (take_profit_pressure_before_reversal + 0.85) and not target_near_before_reversal)
+            or (drawdown_after_favorable_move_pct >= 1.0 and max_favorable_before_exit_pct < 1.0)
+        )
+        if risk_before_target and (_f(trigger_scores.get("Take Profit", 0.0), 0.0) - _f(trigger_scores.get("Risk Cut", 0.0), 0.0)) <= plausible_gap:
+            return _apply("Risk Cut", "risk_before_target_restored_risk_cut", "risk_cut_vs_take_profit")
+    if pred_trigger == "Take Profit":
+        trailing_late_reversal = (
+            favorable_then_reversed
+            and late_favorable_reversal_score >= 1.8
+            and trailing_armed
+            and reversal_from_peak_before_exit_pct >= 0.55
+            and bars_from_peak_to_exit_preview <= 4
+            and trailing_arm_to_exit_bars_preview >= 0
+            and not late_risk_after_favorable_move
+        )
+        if trailing_late_reversal and (_f(trigger_scores.get("Take Profit", 0.0), 0.0) - _f(trigger_scores.get("Trailing", 0.0), 0.0)) <= (plausible_gap + 0.8):
+            return _apply("Trailing", "late_favorable_reversal_restored_trailing", "trailing_vs_take_profit")
+    if pred_trigger == "Risk Cut":
+        trailing_after_favorable = (
+            favorable_then_reversed
+            and late_favorable_reversal_score >= 1.8
+            and trailing_armed
+            and reversal_from_peak_before_exit_pct >= 0.55
+            and risk_pressure_after_peak <= (take_profit_pressure_before_reversal + 1.25)
+            and not risk_cut_touched_so_far
+        )
+        if trailing_after_favorable and (_f(trigger_scores.get("Risk Cut", 0.0), 0.0) - _f(trigger_scores.get("Trailing", 0.0), 0.0)) <= (plausible_gap + 0.8):
+            return _apply("Trailing", "risk_after_favorable_move_restored_trailing", "trailing_vs_risk_cut")
+    if pred_trigger == "Risk Cut":
+        target_before_reversal = (
+            target_near_before_reversal
+            and take_profit_pressure_before_reversal >= 1.5
+            and max_favorable_before_exit_pct >= 1.6
+            and reversal_velocity_pct_per_bar <= 0.75
+            and not risk_cut_touched_so_far
+        )
+        if target_before_reversal and (_f(trigger_scores.get("Risk Cut", 0.0), 0.0) - _f(trigger_scores.get("Take Profit", 0.0), 0.0)) <= (plausible_gap + 1.2):
+            return _apply("Take Profit", "target_before_reversal_restored_take_profit", "take_profit_vs_risk_cut")
+    if pred_trigger == "Risk Cut":
+        slow_decay = (
+            bars_since_entry >= 12
+            and post_peak_momentum_decay >= 0.8
+            and stale_alignment_score >= 0.65
+            and risk_pressure_after_peak <= 3.0
+            and take_profit_pressure_before_reversal <= 2.8
+        )
+        if slow_decay and (_f(trigger_scores.get("Risk Cut", 0.0), 0.0) - _f(trigger_scores.get("Stale Alignment", 0.0), 0.0)) <= (plausible_gap + 0.6):
+            return _apply("Stale Alignment", "slow_decay_restored_stale_alignment", "stale_vs_risk_cut")
+    return {
+        "pred_trigger": pred_trigger,
+        "selected_margin": selected_margin,
+        "second_stage_discriminator_applied": False,
+        "second_stage_discriminator_from": "",
+        "second_stage_discriminator_to": "",
+        "second_stage_discriminator_reason": "",
+        "second_stage_margin_context": margin_context,
+        "second_stage_residual_family": "",
+    }
+
+
+def _crypto_blind_trigger_predict(
+    *,
+    train_rows: List[Dict[str, Any]],
+    candidate: Dict[str, Any],
+    regime: str,
+) -> Dict[str, Any]:
+    working = list(train_rows[-260:]) if len(train_rows) > 260 else list(train_rows)
+    sym = _s(candidate.get("symbol", "")).upper()
+    symbol_rows = [r for r in working if _s(r.get("symbol", "")).upper() == sym]
+    regime_rows = [r for r in working if _s(r.get("regime", "")) == regime]
+    recent_rows = _recent_slice(working, 80)
+    feature_scales = {key: _historical_replay_feature_scale(working, key) for key, _weight in _CRYPTO_HISTORICAL_REPLAY_FEATURES}
+    upside_diag = _historical_replay_upside_score(candidate, working, symbol=sym, regime=regime)
+    upside_score = _f(upside_diag.get("upside_score", 0.0), 0.0)
+    downside_score = _f(upside_diag.get("downside_score", 0.0), 0.0)
+    sequence_snapshot = _crypto_blind_sequence_feature_snapshot(candidate)
+    current_candle_move = _f(candidate.get("current_candle_pct_move", 0.0), 0.0)
+    move_3 = _f(candidate.get("recent_return_3", 0.0), 0.0)
+    move_6 = _f(candidate.get("recent_return_6", 0.0), 0.0)
+    move_12 = _f(candidate.get("recent_return_12", 0.0), 0.0)
+    move_24 = _f(candidate.get("recent_return_24", 0.0), 0.0)
+    volatility = _f(candidate.get("recent_volatility", 0.0), 0.0)
+    momentum = _f(candidate.get("trend_momentum_score", 0.0), 0.0)
+    signal_margin = _f(candidate.get("signal_margin", 0.0), 0.0)
+    active_tfs = _f(candidate.get("active_timeframe_count", 0.0), 0.0)
+    bars_since_entry = int(_f(sequence_snapshot.get("bars_since_entry", 0), 0.0))
+    current_unrealized = _f(sequence_snapshot.get("current_unrealized_pnl_pct", 0.0), 0.0)
+    mfe_so_far = _f(sequence_snapshot.get("max_favorable_excursion_pct_so_far", 0.0), 0.0)
+    mae_so_far_abs = abs(min(0.0, _f(sequence_snapshot.get("max_adverse_excursion_pct_so_far", 0.0), 0.0)))
+    drawdown_so_far_abs = abs(min(0.0, _f(sequence_snapshot.get("drawdown_from_peak_pct_so_far", 0.0), 0.0)))
+    trailing_armed = bool(sequence_snapshot.get("trailing_armed", False))
+    bars_since_trailing_armed = int(_f(sequence_snapshot.get("bars_since_trailing_armed", -1), -1.0))
+    risk_cut_distance_pct = _f(sequence_snapshot.get("risk_cut_distance_pct", 2.25), 2.25)
+    take_profit_distance_pct = _f(sequence_snapshot.get("take_profit_distance_pct", 4.25), 4.25)
+    risk_cut_touched_so_far = bool(sequence_snapshot.get("risk_cut_touched_so_far", False))
+    take_profit_touched_so_far = bool(sequence_snapshot.get("take_profit_touched_so_far", False))
+    peak_to_current_reversal_pct = _f(sequence_snapshot.get("peak_to_current_reversal_pct", 0.0), 0.0)
+    favorable_then_softened = bool(sequence_snapshot.get("favorable_then_softened_flag_so_far", False))
+    momentum_decay = _f(sequence_snapshot.get("momentum_decay", 0.0), 0.0)
+    late_favorable_reversal_score = _f(sequence_snapshot.get("late_favorable_reversal_score", 0.0), 0.0)
+    favorable_then_reversed = bool(sequence_snapshot.get("favorable_then_reversed", False))
+    max_favorable_before_exit_pct = _f(sequence_snapshot.get("max_favorable_before_exit_pct", mfe_so_far), 0.0)
+    reversal_from_peak_before_exit_pct = _f(sequence_snapshot.get("reversal_from_peak_before_exit_pct", peak_to_current_reversal_pct), 0.0)
+    bars_from_peak_to_exit_preview = int(_f(sequence_snapshot.get("bars_from_peak_to_exit_preview", 0), 0.0))
+    trailing_arm_to_exit_bars_preview = int(_f(sequence_snapshot.get("trailing_arm_to_exit_bars_preview", bars_since_trailing_armed), 0.0))
+    risk_pressure_after_peak = _f(sequence_snapshot.get("risk_pressure_after_peak", 0.0), 0.0)
+    take_profit_pressure_before_reversal = _f(sequence_snapshot.get("take_profit_pressure_before_reversal", 0.0), 0.0)
+    target_near_before_reversal = bool(sequence_snapshot.get("target_near_before_reversal", False))
+    reversal_velocity_pct_per_bar = _f(sequence_snapshot.get("reversal_velocity_pct_per_bar", 0.0), 0.0)
+    post_peak_momentum_decay = _f(sequence_snapshot.get("post_peak_momentum_decay", momentum_decay), 0.0)
+    drawdown_after_favorable_move_pct = _f(sequence_snapshot.get("drawdown_after_favorable_move_pct", peak_to_current_reversal_pct), 0.0)
+    favorable_move_quality_score = _f(sequence_snapshot.get("favorable_move_quality_score", 0.0), 0.0)
+    late_risk_after_favorable_move = bool(sequence_snapshot.get("late_risk_after_favorable_move", False))
+
+    trigger_priors: Dict[str, float] = {cls: 0.0 for cls in _CRYPTO_HISTORICAL_REPLAY_TRIGGER_CLASSES}
+    class_similarity: Dict[str, float] = {cls: 0.0 for cls in _CRYPTO_HISTORICAL_REPLAY_TRIGGER_CLASSES}
+    support_counts: Dict[str, int] = {cls: 0 for cls in _CRYPTO_HISTORICAL_REPLAY_TRIGGER_CLASSES}
+    for cls in _CRYPTO_HISTORICAL_REPLAY_TRIGGER_CLASSES:
+        same_symbol = [r for r in symbol_rows if _s(r.get("actual_exit_trigger", "")) == cls]
+        same_regime = [r for r in regime_rows if _s(r.get("actual_exit_trigger", "")) == cls]
+        recent_global = [r for r in recent_rows if _s(r.get("actual_exit_trigger", "")) == cls]
+        support_counts[cls] = int(len(same_symbol) + len(same_regime) + len(recent_global))
+        trigger_priors[cls] = (0.70 * math.log1p(len(same_symbol))) + (0.30 * math.log1p(len(same_regime))) + (0.15 * math.log1p(len(recent_global)))
+        cohort = same_symbol if len(same_symbol) >= 4 else same_regime if len(same_regime) >= 6 else recent_global if recent_global else [r for r in working if _s(r.get("actual_exit_trigger", "")) == cls]
+        if cohort:
+            dist = 0.0
+            used = 0
+            for key, weight in _CRYPTO_HISTORICAL_REPLAY_FEATURES:
+                scale = max(1e-6, feature_scales.get(key, 1.0))
+                median = _median([_f(r.get(key, 0.0), 0.0) for r in cohort], default=0.0)
+                dist += weight * abs(_f(candidate.get(key, 0.0), 0.0) - median) / scale
+                used += 1
+            class_similarity[cls] = 1.0 / (1.0 + (dist / max(1, used)))
+
+    overextension_score = (
+        max(0.0, ((move_24 - 5.50) / 2.50))
+        + max(0.0, ((move_12 - 4.50) / 2.00))
+        + max(0.0, ((current_candle_move - 1.60) / 0.70))
+        + max(0.0, ((volatility - 0.85) / 0.30))
+    )
+    risk_pressure_score = (
+        (0.40 * _f(sequence_snapshot.get("risk_pressure_score", 0.0), 0.0))
+        + (0.40 * downside_score)
+        + (0.95 * max(0.0, ((1.10 - risk_cut_distance_pct) / 1.10)))
+        + (1.20 if risk_cut_touched_so_far else 0.0)
+        + (0.75 * max(0.0, (drawdown_so_far_abs / 0.80)))
+        + (0.65 * max(0.0, (mae_so_far_abs / 1.10)))
+        + (0.55 * max(0.0, (peak_to_current_reversal_pct / 0.70)))
+        + (0.35 * overextension_score)
+        + (0.30 * max(0.0, ((-current_unrealized) / 0.80)))
+        + (0.25 if favorable_then_softened else 0.0)
+    )
+    take_profit_pressure_score = (
+        (0.40 * _f(sequence_snapshot.get("take_profit_pressure_score", 0.0), 0.0))
+        + (0.55 * max(0.0, (mfe_so_far / 1.40)))
+        + (0.95 * max(0.0, ((1.10 - take_profit_distance_pct) / 1.10)))
+        + (1.10 if take_profit_touched_so_far else 0.0)
+        + (0.45 * max(0.0, ((move_6 - 2.20) / 1.40)))
+        + (0.35 * max(0.0, ((move_12 - 3.20) / 1.70)))
+        + (0.25 * max(0.0, upside_score - 0.25))
+        - (0.20 * max(0.0, (drawdown_so_far_abs / 0.70)))
+        - (0.20 if risk_cut_touched_so_far else 0.0)
+    )
+    trailing_quality_score = (
+        (0.35 * _f(sequence_snapshot.get("trailing_quality_score", 0.0), 0.0))
+        + (0.75 if trailing_armed else 0.0)
+        + (0.45 * max(0.0, (mfe_so_far / 1.50)))
+        + (0.50 * max(0.0, (peak_to_current_reversal_pct / 0.60)))
+        + (0.30 * max(0.0, ((signal_margin - 0.28) / 0.22)))
+        + (0.28 * max(0.0, ((momentum - 1.80) / 1.40)))
+        + (0.22 * max(0.0, ((active_tfs - 4.0) / 4.0)))
+        + (0.15 * max(0.0, upside_score - downside_score))
+        - (0.55 * overextension_score)
+        - (0.65 if risk_cut_touched_so_far else 0.0)
+        - (0.25 * max(0.0, (mae_so_far_abs / 1.20)))
+    )
+    stale_alignment_score = (
+        (0.55 * _f(sequence_snapshot.get("stale_alignment_score", 0.0), 0.0))
+        + (0.65 * max(0.0, ((bars_since_entry - 4.0) / 3.0)))
+        + (0.55 * max(0.0, ((1.60 - momentum) / 1.40)))
+        + (0.45 * max(0.0, ((1.10 - mfe_so_far) / 1.10)))
+        + (0.35 * max(0.0, (momentum_decay / 1.10)))
+        + (0.25 * max(0.0, ((0.25 - abs(current_unrealized)) / 0.25)))
+        - (0.25 if take_profit_touched_so_far or trailing_armed else 0.0)
+        - (0.35 if risk_cut_touched_so_far else 0.0)
+    )
+
+    trigger_scores = {
+        "Risk Cut": round((0.60 * class_similarity["Risk Cut"]) + (0.35 * trigger_priors["Risk Cut"]) + (1.35 * risk_pressure_score) + (0.25 * overextension_score) - (0.20 * take_profit_pressure_score) - (0.30 * trailing_quality_score), 6),
+        "Take Profit": round((0.60 * class_similarity["Take Profit"]) + (0.35 * trigger_priors["Take Profit"]) + (1.20 * take_profit_pressure_score) + (0.15 * upside_score) - (0.18 * risk_pressure_score) - (0.12 * stale_alignment_score), 6),
+        "Trailing": round((0.55 * class_similarity["Trailing"]) + (0.30 * trigger_priors["Trailing"]) + (1.00 * trailing_quality_score) + (0.12 * upside_score) - (0.40 * risk_pressure_score) - (0.22 * overextension_score) - (0.18 * take_profit_pressure_score), 6),
+        "Stale Alignment": round((0.55 * class_similarity["Stale Alignment"]) + (0.30 * trigger_priors["Stale Alignment"]) + (1.20 * stale_alignment_score) + (0.08 * downside_score) - (0.12 * take_profit_pressure_score) - (0.10 * trailing_quality_score), 6),
+    }
+    trigger_scores["Unknown"] = 0.02
+    top_triggers = sorted(trigger_scores.items(), key=lambda kv: kv[1], reverse=True)
+    pred_trigger = top_triggers[0][0] if top_triggers else "Unknown"
+    selected_margin = (top_triggers[0][1] - top_triggers[1][1]) if len(top_triggers) > 1 else top_triggers[0][1]
+    second_score = top_triggers[1][1] if len(top_triggers) > 1 else top_triggers[0][1]
+    margin_context = f"top={pred_trigger}:{round(top_triggers[0][1],6) if top_triggers else 0.0}|runner_up={top_triggers[1][0] if len(top_triggers)>1 else pred_trigger}:{round(second_score,6)}|margin={round(selected_margin,6)}"
+    second_stage = _crypto_apply_second_stage_discriminator(
+        {
+            "pred_trigger": pred_trigger,
+            "trigger_scores": trigger_scores,
+            "selected_margin": selected_margin,
+            "risk_pressure_score": risk_pressure_score,
+            "take_profit_pressure_score": take_profit_pressure_score,
+            "trailing_quality_score": trailing_quality_score,
+            "stale_alignment_score": stale_alignment_score,
+            "bars_since_entry": bars_since_entry,
+            "max_favorable_excursion_pct_so_far": mfe_so_far,
+            "max_adverse_excursion_pct_so_far": -mae_so_far_abs,
+            "drawdown_from_peak_pct_so_far": -drawdown_so_far_abs,
+            "trailing_armed": trailing_armed,
+            "bars_since_trailing_armed": bars_since_trailing_armed,
+            "risk_cut_distance_pct": risk_cut_distance_pct,
+            "take_profit_distance_pct": take_profit_distance_pct,
+            "risk_cut_touched_so_far": risk_cut_touched_so_far,
+            "take_profit_touched_so_far": take_profit_touched_so_far,
+            "peak_to_current_reversal_pct": peak_to_current_reversal_pct,
+            "favorable_then_softened_flag_so_far": favorable_then_softened,
+            "momentum_decay": momentum_decay,
+            "late_favorable_reversal_score": late_favorable_reversal_score,
+            "favorable_then_reversed": favorable_then_reversed,
+            "max_favorable_before_exit_pct": max_favorable_before_exit_pct,
+            "reversal_from_peak_before_exit_pct": reversal_from_peak_before_exit_pct,
+            "bars_from_peak_to_exit_preview": bars_from_peak_to_exit_preview,
+            "trailing_arm_to_exit_bars_preview": trailing_arm_to_exit_bars_preview,
+            "risk_pressure_after_peak": risk_pressure_after_peak,
+            "take_profit_pressure_before_reversal": take_profit_pressure_before_reversal,
+            "target_near_before_reversal": target_near_before_reversal,
+            "reversal_velocity_pct_per_bar": reversal_velocity_pct_per_bar,
+            "post_peak_momentum_decay": post_peak_momentum_decay,
+            "drawdown_after_favorable_move_pct": drawdown_after_favorable_move_pct,
+            "favorable_move_quality_score": favorable_move_quality_score,
+            "late_risk_after_favorable_move": late_risk_after_favorable_move,
+            "margin_context": margin_context,
+        }
+    )
+    pred_trigger = _s(second_stage.get("pred_trigger", pred_trigger)) or pred_trigger
+    selected_margin = _f(second_stage.get("selected_margin", selected_margin), selected_margin)
+    trigger_score_reason = (
+        "risk_pressure_dominant" if pred_trigger == "Risk Cut"
+        else "take_profit_pressure_dominant" if pred_trigger == "Take Profit"
+        else "trailing_quality_dominant" if pred_trigger == "Trailing"
+        else "stale_alignment_dominant" if pred_trigger == "Stale Alignment"
+        else "insufficient_feature_context"
+    )
+    direction_scores = {
+        "up": round(max(0.0, upside_score + max(0.0, move_6 / 2.2) + max(0.0, move_24 / 3.0) + max(0.0, signal_margin)), 6),
+        "down": round(max(0.0, downside_score + max(0.0, (0.80 - move_6) / 1.50) + max(0.0, (0.55 - signal_margin) / 0.25) + max(0.0, (volatility - 0.75) / 0.45)), 6),
+        "flat": round(max(0.0, stale_alignment_score * 0.25), 6),
+    }
+    if pred_trigger == "Risk Cut":
+        direction_scores["down"] += 0.55
+    elif pred_trigger in {"Trailing", "Take Profit"}:
+        direction_scores["up"] += 0.35
+    pred_dir = "up" if direction_scores["up"] >= direction_scores["down"] else "down"
+    predicted_pnl_trend = "down" if pred_trigger == "Risk Cut" or (pred_trigger == "Stale Alignment" and direction_scores["down"] > direction_scores["up"]) else pred_dir
+    pred_hold = max(1.0, _median([_f(r.get("hold_hours", 0.0), 0.0) for r in working if _s(r.get("actual_exit_trigger", "")) == pred_trigger], default=12.0))
+    pred_return_pct = _median([_f(r.get("pnl_pct", 0.0), 0.0) for r in working if _s(r.get("actual_exit_trigger", "")) == pred_trigger], default=(1.5 if predicted_pnl_trend == "up" else -1.5 if predicted_pnl_trend == "down" else 0.0))
+    entry = _f(candidate.get("entry_price", 0.0), 0.0)
+    pred_exit_price = entry * (1.0 + (pred_return_pct / 100.0)) if entry > 0.0 else 0.0
+    support_term = min(1.0, math.log1p(max(0, support_counts.get(pred_trigger, 0))) / math.log1p(24.0))
+    margin_term = 1.0 / (1.0 + math.exp(-max(-6.0, min(6.0, selected_margin))))
+    conf = min(0.95, max(0.18, 0.20 + (0.28 * margin_term) + (0.22 * support_term) + (0.16 * max(class_similarity.get(pred_trigger, 0.0), 0.0)) + (0.14 * max(direction_scores.values()))))
+    return {
+        "predicted_direction": pred_dir,
+        "predicted_exit_trigger": pred_trigger,
+        "predicted_hold_hours": round(float(pred_hold), 6),
+        "predicted_exit_price": round(float(pred_exit_price), 10),
+        "predicted_pnl_trend": predicted_pnl_trend,
+        "predicted_confidence": round(float(conf), 6),
+        "trigger_scores": {k: round(float(v), 6) for k, v in trigger_scores.items()},
+        "direction_scores": direction_scores,
+        "trigger_margin": round(float(selected_margin), 6),
+        "predictor_source_mode": "historical_strategy_replay",
+        "predictor_variant": "blind_sequence_trigger_scorer_v1",
+        "trigger_score_risk_cut": round(float(trigger_scores.get("Risk Cut", 0.0)), 6),
+        "trigger_score_take_profit": round(float(trigger_scores.get("Take Profit", 0.0)), 6),
+        "trigger_score_trailing": round(float(trigger_scores.get("Trailing", 0.0)), 6),
+        "trigger_score_stale_alignment": round(float(trigger_scores.get("Stale Alignment", 0.0)), 6),
+        "trigger_score_selected_margin": round(float(selected_margin), 6),
+        "trigger_score_reason": trigger_score_reason,
+        "risk_pressure_score": round(float(risk_pressure_score), 6),
+        "take_profit_pressure_score": round(float(take_profit_pressure_score), 6),
+        "trailing_quality_score": round(float(trailing_quality_score), 6),
+        "stale_alignment_score": round(float(stale_alignment_score), 6),
+        "source_feature_availability": "entry_features_only",
+        **second_stage,
+        **sequence_snapshot,
+    }
+
+
+def _augment_historical_blind_rows(
+    rows: List[Dict[str, Any]],
+    *,
+    market: str,
+    symbol_sources: Dict[str, str],
+    crypto_trigger_mode: str = "improved",
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    history: List[Dict[str, Any]] = []
+    for raw in sorted([dict(r) for r in list(rows or []) if isinstance(r, dict)], key=_stable_row_sort_key):
+        symbol = _s(raw.get("symbol", "")).upper()
+        candidate = dict(raw)
+        candidate["source_type"] = HISTORICAL_BLIND_SIM_SOURCE_TYPE
+        pred = _safe_predict_blind_row(market=market, history_rows=history, candidate_row=candidate, crypto_trigger_mode=crypto_trigger_mode)
+        actual_direction = _s(raw.get("actual_direction", "")) or _trade_direction(raw)
+        actual_exit_trigger = _s(raw.get("actual_exit_trigger", "")) or "Unknown"
+        actual_pnl_trend = _actual_pnl_trend(raw)
+        predictor_variant = _s(pred.get("predictor_variant", "")) or (
+            "stock_pnl_quality_v2" if _s(market).lower() == "stocks" else "historical_blind_strategy_baseline"
+        )
+        enriched = dict(raw)
+        enriched["market"] = _s(market).lower()
+        enriched["source_type"] = HISTORICAL_BLIND_SIM_SOURCE_TYPE
+        enriched["symbol_source"] = _s(symbol_sources.get(symbol, "configured_universe")) or "configured_universe"
+        enriched["simulation_id"] = hashlib.sha256(
+            f"{_s(market).lower()}|{symbol}|{int(_f(raw.get('entry_ts', 0.0), 0.0))}|{int(_f(raw.get('exit_ts', 0.0), 0.0))}".encode("utf-8")
+        ).hexdigest()[:16]
+        enriched["decision_snapshot_id"] = f"blind-sim:{_s(market).lower()}:{symbol}:{int(_f(raw.get('entry_ts', 0.0), 0.0))}"
+        enriched["symbol"] = symbol
+        enriched["side"] = _s(raw.get("side", "long")) or "long"
+        enriched["qty"] = _f(raw.get("qty", 1.0), 1.0)
+        enriched["predictor_variant"] = predictor_variant
+        enriched["predicted_direction"] = _s(pred.get("predicted_direction", "")) or "up"
+        enriched["predicted_exit_trigger"] = _s(pred.get("predicted_exit_trigger", "")) or "Unknown"
+        normalized_predicted_pnl = _normalize_pnl_trend_label(pred.get("predicted_pnl_trend", ""))
+        enriched["predicted_pnl_trend"] = normalized_predicted_pnl or _normalize_pnl_trend_label(enriched["predicted_direction"]) or "flat"
+        enriched["confidence"] = round(
+            _f(pred.get("predicted_confidence", pred.get("confidence", 0.0)), 0.0),
+            6,
+        )
+        enriched["direction_scores"] = dict(pred.get("direction_scores", {}) if isinstance(pred.get("direction_scores", {}), dict) else {})
+        enriched["trigger_scores"] = dict(pred.get("trigger_scores", {}) if isinstance(pred.get("trigger_scores", {}), dict) else {})
+        enriched["trigger_margin"] = round(_f(pred.get("trigger_margin", 0.0), 0.0), 6)
+        enriched["trigger_score_risk_cut"] = round(_f(pred.get("trigger_score_risk_cut", 0.0), 0.0), 6)
+        enriched["trigger_score_take_profit"] = round(_f(pred.get("trigger_score_take_profit", 0.0), 0.0), 6)
+        enriched["trigger_score_trailing"] = round(_f(pred.get("trigger_score_trailing", 0.0), 0.0), 6)
+        enriched["trigger_score_stale_alignment"] = round(_f(pred.get("trigger_score_stale_alignment", 0.0), 0.0), 6)
+        enriched["trigger_score_selected_margin"] = round(_f(pred.get("trigger_score_selected_margin", pred.get("trigger_margin", 0.0)), 0.0), 6)
+        enriched["trigger_score_reason"] = _s(pred.get("trigger_score_reason", ""))
+        enriched["risk_pressure_score"] = round(_f(pred.get("risk_pressure_score", 0.0), 0.0), 6)
+        enriched["take_profit_pressure_score"] = round(_f(pred.get("take_profit_pressure_score", 0.0), 0.0), 6)
+        enriched["trailing_quality_score"] = round(_f(pred.get("trailing_quality_score", 0.0), 0.0), 6)
+        enriched["stale_alignment_score"] = round(_f(pred.get("stale_alignment_score", 0.0), 0.0), 6)
+        enriched["source_feature_availability"] = _s(pred.get("source_feature_availability", ""))
+        enriched["second_stage_discriminator_applied"] = bool(pred.get("second_stage_discriminator_applied", False))
+        enriched["second_stage_discriminator_from"] = _s(pred.get("second_stage_discriminator_from", ""))
+        enriched["second_stage_discriminator_to"] = _s(pred.get("second_stage_discriminator_to", ""))
+        enriched["second_stage_discriminator_reason"] = _s(pred.get("second_stage_discriminator_reason", ""))
+        enriched["second_stage_margin_context"] = _s(pred.get("second_stage_margin_context", ""))
+        enriched["second_stage_residual_family"] = _s(pred.get("second_stage_residual_family", ""))
+        for key in (
+            "bars_since_entry",
+            "current_unrealized_pnl_pct",
+            "max_favorable_excursion_pct_so_far",
+            "max_adverse_excursion_pct_so_far",
+            "drawdown_from_peak_pct_so_far",
+            "trailing_armed",
+            "bars_since_trailing_armed",
+            "risk_cut_distance_pct",
+            "take_profit_distance_pct",
+            "risk_cut_touched_so_far",
+            "take_profit_touched_so_far",
+            "peak_to_current_reversal_pct",
+            "momentum_decay",
+            "favorable_then_softened_flag_so_far",
+            "late_favorable_reversal_score",
+            "favorable_then_reversed",
+            "max_favorable_before_exit_pct",
+            "reversal_from_peak_before_exit_pct",
+            "bars_from_peak_to_exit_preview",
+            "trailing_arm_to_exit_bars_preview",
+            "risk_pressure_after_peak",
+            "take_profit_pressure_before_reversal",
+            "target_near_before_reversal",
+            "reversal_velocity_pct_per_bar",
+            "post_peak_momentum_decay",
+            "drawdown_after_favorable_move_pct",
+            "favorable_move_quality_score",
+            "late_risk_after_favorable_move",
+        ):
+            if key in pred:
+                enriched[key] = pred.get(key)
+        enriched["trade_quality_score"] = round(
+            _f(pred.get("stock_trade_quality_score", pred.get("trade_quality_score", 0.0)), 0.0),
+            6,
+        )
+        enriched["pnl_quality_score"] = round(
+            _f(pred.get("stock_pnl_quality_score", pred.get("pnl_quality_score", 0.0)), 0.0),
+            6,
+        )
+        enriched["actual_direction"] = actual_direction
+        enriched["actual_exit_trigger"] = actual_exit_trigger
+        enriched["actual_pnl_trend"] = actual_pnl_trend
+        enriched["prediction_generated_before_outcome"] = True
+        enriched["hold_time"] = round(
+            _f(raw.get("hold_hours", max(0.0, (_f(raw.get("exit_ts", 0.0), 0.0) - _f(raw.get("entry_ts", 0.0), 0.0)) / 3600.0)), 0.0),
+            6,
+        )
+        enriched["bars_in_trade"] = int(_f(raw.get("bars_in_trade", 0), 0.0))
+        enriched["direction_correct"] = bool(_s(enriched.get("predicted_direction", "")).lower() == _s(actual_direction).lower())
+        enriched["trigger_correct"] = bool(_s(enriched.get("predicted_exit_trigger", "")) == actual_exit_trigger)
+        enriched["pnl_trend_correct"] = bool(_normalize_pnl_trend_label(enriched.get("predicted_pnl_trend", "")) == _s(actual_pnl_trend).lower())
+        semantics = _historical_blind_prediction_semantics(enriched, market)
+        enriched["prediction_semantics"] = _s(semantics.get("prediction_semantics", "heuristic")) or "heuristic"
+        enriched["prediction_semantics_warning"] = _s(semantics.get("prediction_semantics_warning", ""))
+        enriched["label_alignment_status"] = _s(semantics.get("label_alignment_status", "blocked")) or "blocked"
+        enriched["label_alignment_blockers"] = list(semantics.get("label_alignment_blockers", []) or [])
+        enriched["future_leakage_detected"] = bool(semantics.get("future_leakage_detected", False))
+        enriched["prediction_semantics_placeholder_only"] = bool(semantics.get("placeholder_only", False))
+        enriched["eligible_for_training"] = bool(semantics.get("eligible_for_training", False))
+        enriched["training_eligibility_reason"] = _s(semantics.get("training_eligibility_reason", ""))
+        enriched["diagnostic_only"] = bool(semantics.get("diagnostic_only", not enriched["eligible_for_training"]))
+        enriched["replay_row_id"] = _replay_row_id(enriched)
+        out.append(enriched)
+        history.append(dict(enriched))
+    return out
+
+
+def _historical_blind_decision_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for row in list(rows or []):
+        if not isinstance(row, dict):
+            continue
+        out.append(
+            {
+                "simulation_id": _s(row.get("simulation_id", "")),
+                "decision_snapshot_id": _s(row.get("decision_snapshot_id", "")),
+                "market": _s(row.get("market", "")),
+                "symbol": _s(row.get("symbol", "")),
+                "symbol_source": _s(row.get("symbol_source", "")),
+                "timestamp": int(_f(row.get("entry_ts", 0.0), 0.0)),
+                "decision_type": "entry",
+                "selected_action": "enter",
+                "predicted_direction": _s(row.get("predicted_direction", "")),
+                "predicted_exit_trigger": _s(row.get("predicted_exit_trigger", "")),
+                "predicted_pnl_trend": _s(row.get("predicted_pnl_trend", "")),
+                "confidence": round(_f(row.get("confidence", 0.0), 0.0), 6),
+                "direction_scores": dict(row.get("direction_scores", {}) if isinstance(row.get("direction_scores", {}), dict) else {}),
+                "trigger_scores": dict(row.get("trigger_scores", {}) if isinstance(row.get("trigger_scores", {}), dict) else {}),
+                "trade_quality_score": round(_f(row.get("trade_quality_score", 0.0), 0.0), 6),
+                "pnl_quality_score": round(_f(row.get("pnl_quality_score", 0.0), 0.0), 6),
+                "entry_reason": _s(row.get("raw_rule_reason", "")) or "historical_blind_strategy_simulation_entry",
+                "skip_reason": "",
+                "source_type": HISTORICAL_BLIND_SIM_SOURCE_TYPE,
+                "replay_row_id": _s(row.get("replay_row_id", "")),
+            }
+        )
+    return out
+
+
+def _historical_blind_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    ordered = [dict(r) for r in list(rows or []) if isinstance(r, dict)]
+    n = len(ordered)
+    if n <= 0:
+        return {
+            "rows": 0,
+            "directional_accuracy_pct": 0.0,
+            "trigger_match_pct": 0.0,
+            "pnl_trend_match_pct": 0.0,
+            "win_rate_pct": 0.0,
+            "average_pnl_pct": 0.0,
+            "max_drawdown_pct": 0.0,
+        }
+    pnl_vals = [_f(r.get("pnl_pct", _trade_return_pct(r)), 0.0) for r in ordered]
+    return {
+        "rows": int(n),
+        "directional_accuracy_pct": round(100.0 * sum(1 for r in ordered if bool(r.get("direction_correct", False))) / max(1, n), 4),
+        "trigger_match_pct": round(100.0 * sum(1 for r in ordered if bool(r.get("trigger_correct", False))) / max(1, n), 4),
+        "pnl_trend_match_pct": round(100.0 * sum(1 for r in ordered if bool(r.get("pnl_trend_correct", False))) / max(1, n), 4),
+        "win_rate_pct": round(100.0 * sum(1 for v in pnl_vals if v > 0.0) / max(1, n), 4),
+        "average_pnl_pct": round(sum(pnl_vals) / max(1, n), 6),
+        "max_drawdown_pct": round(min(pnl_vals), 6),
+    }
+
+
+def _collect_stock_blind_sim_candidates(hub_dir: str, settings: Dict[str, Any], limit: int) -> Tuple[List[str], Dict[str, str]]:
+    sources: Dict[str, str] = {}
+    ordered: List[str] = []
+
+    def _add(sym: Any, source: str) -> None:
+        normalized = _normalize_stock_ticker(sym)
+        if not normalized:
+            return
+        if normalized not in ordered:
+            ordered.append(normalized)
+        current = _s(sources.get(normalized, ""))
+        if current == "manual_watchlist":
+            return
+        if source == "manual_watchlist" or not current:
+            sources[normalized] = source
+
+    manual_payload = _read_stock_manual_watchlist(hub_dir)
+    for sym in list((manual_payload.get("symbols", {}) if isinstance(manual_payload.get("symbols", {}), dict) else {}).keys()):
+        _add(sym, "manual_watchlist")
+    for sym in _stock_symbol_candidates(hub_dir, [], limit=max(1, limit * 3)):
+        _add(sym, "scanner_discovered")
+    for tok in _s(settings.get("stock_universe_symbols", "")).replace("\n", ",").split(","):
+        _add(tok, "configured_universe")
+    return ordered[:limit], sources
+
+
+def _build_stock_symbol_onboarding(
+    *,
+    hub_dir: str,
+    base_dir: str,
+    settings: Dict[str, Any],
+    symbol: str,
+    symbol_source: str,
+    lookback_days: int,
+    timeframe: str,
+    force_refresh: bool,
+) -> Dict[str, Any]:
+    warm = warm_stock_historical_cache(
+        hub_dir=hub_dir,
+        base_dir=base_dir,
+        settings=settings,
+        symbol=symbol,
+        lookback_days=lookback_days,
+        timeframe="1Hour" if _s(timeframe).lower() == "1hour" else timeframe,
+        force_refresh=force_refresh,
+    )
+    bars = _load_stock_cached_bars(hub_dir, symbol, "1Hour" if _s(timeframe).lower() == "1hour" else timeframe)
+    raw_rows = _simulate_stock_trades_from_bars(symbol, bars)
+    rows = _augment_historical_blind_rows(raw_rows, market="stocks", symbol_sources={_normalize_stock_ticker(symbol): symbol_source})
+    decision_rows = _historical_blind_decision_rows(rows)
+    skips: List[Dict[str, Any]] = []
+    preview = build_stock_watchlist_prediction_preview(
+        hub_dir=hub_dir,
+        base_dir=base_dir,
+        settings=settings,
+        symbol=symbol,
+        timeframe="1Hour",
+        lookback_days=lookback_days,
+    )
+    blockers = list(preview.get("manual_watchlist_trade_blockers", []) or [])
+    status = "trade_ready" if bool(preview.get("manual_watchlist_trade_eligible", False)) else "watch_only"
+    if warm.get("warmup_status") == "insufficient_history":
+        status = "blocked_insufficient_history"
+        blockers = sorted(set(blockers + ["insufficient_history"]))
+        skips.append({"market": "stocks", "symbol": _normalize_stock_ticker(symbol), "symbol_source": symbol_source, "decision": "skip", "skip_reason": "insufficient_history", "source_type": HISTORICAL_BLIND_SIM_SOURCE_TYPE})
+    elif not rows:
+        status = "blocked_strategy_alignment"
+        blockers = sorted(set(blockers + ["no_simulated_completed_trades"]))
+        skips.append({"market": "stocks", "symbol": _normalize_stock_ticker(symbol), "symbol_source": symbol_source, "decision": "skip", "skip_reason": "no_simulated_completed_trades", "source_type": HISTORICAL_BLIND_SIM_SOURCE_TYPE})
+    elif blockers:
+        status = "learning_ready_not_trade_ready"
+    onboarding_paths = _symbol_onboarding_paths(hub_dir, "stocks", symbol)
+    summary = {
+        "market": "stocks",
+        "symbol": _normalize_stock_ticker(symbol),
+        "symbol_source": symbol_source,
+        "metrics": _historical_blind_metrics(rows),
+        "rows_generated": int(len(rows)),
+        "decision_rows_generated": int(len(decision_rows)),
+        "skip_rows_generated": int(len(skips)),
+        "source_type": HISTORICAL_BLIND_SIM_SOURCE_TYPE,
+    }
+    status_payload = {
+        "schema_version": HISTORICAL_BLIND_SIM_SCHEMA_VERSION,
+        "market": "stocks",
+        "symbol": _normalize_stock_ticker(symbol),
+        "symbol_source": symbol_source,
+        "requested_at": int(time.time()),
+        "completed_at": int(time.time()),
+        "provider": _s(preview.get("provider", warm.get("provider", ""))) or "alpaca",
+        "historical_data_rows": int(len(bars)),
+        "historical_lookback_days": int(lookback_days),
+        "historical_timeframe": "1Hour",
+        "simulation_completed": bool(rows),
+        "simulation_trade_rows": int(len(rows)),
+        "simulation_decision_rows": int(len(decision_rows)),
+        "simulation_skip_rows": int(len(skips)),
+        "eligible_for_scan": bool(rows),
+        "eligible_for_trade_consideration": bool(preview.get("manual_watchlist_trade_eligible", False)),
+        "eligible_for_training": bool(any(bool(r.get("eligible_for_training", False)) for r in rows)),
+        "status": status,
+        "blockers": blockers,
+        "warnings": sorted({_s(r.get("prediction_semantics_warning", "")) for r in rows if _s(r.get("prediction_semantics_warning", ""))}),
+        "cooldown_until": 0,
+        "alignment_score": round(_f(summary["metrics"].get("win_rate_pct", 0.0), 0.0) / 100.0, 6),
+        "alignment_reason": "shared_stock_blind_simulation_path",
+        "simulation_directional_accuracy": summary["metrics"].get("directional_accuracy_pct", 0.0),
+        "simulation_trigger_accuracy": summary["metrics"].get("trigger_match_pct", 0.0),
+        "simulation_pnl_trend_accuracy": summary["metrics"].get("pnl_trend_match_pct", 0.0),
+        "prediction_semantics": "heuristic",
+        "diagnostic_only_rows": int(sum(1 for r in rows if bool(r.get("diagnostic_only", False)))),
+        "simulation_trade_count": int(len(rows)),
+        "simulation_skip_count": int(len(skips)),
+        "simulation_avg_pnl_pct": summary["metrics"].get("average_pnl_pct", 0.0),
+        "simulation_max_drawdown_pct": summary["metrics"].get("max_drawdown_pct", 0.0),
+        "simulation_win_rate_pct": summary["metrics"].get("win_rate_pct", 0.0),
+        "artifact_paths": onboarding_paths,
+    }
+    _write_jsonl(onboarding_paths["trades"], rows)
+    _write_jsonl(onboarding_paths["decisions"], decision_rows)
+    _write_jsonl(onboarding_paths["skips"], skips)
+    _write_json_atomic(onboarding_paths["summary"], summary)
+    _write_json_atomic(onboarding_paths["status"], status_payload)
+    return {
+        "symbol": _normalize_stock_ticker(symbol),
+        "status": status_payload,
+        "summary": summary,
+        "trades": rows,
+        "decisions": decision_rows,
+        "skips": skips,
+    }
+
+
+def _build_crypto_blind_simulation(
+    *,
+    hub_dir: str,
+    settings: Dict[str, Any],
+    lookback_days: int,
+    timeframe: str,
+    max_symbols: int,
+    force_refresh: bool,
+    deterministic: bool,
+) -> Dict[str, Any]:
+    replay = build_crypto_historical_strategy_replay(
+        hub_dir=hub_dir,
+        settings=settings,
+        timeframe=timeframe,
+        lookback_days=lookback_days,
+        max_symbols=max_symbols,
+        force_refresh=force_refresh,
+        freeze_cache=deterministic,
+        deterministic=deterministic,
+    )
+    raw_rows = list(replay.get("rows", []) if isinstance(replay.get("rows", []), list) else [])
+    diagnostics = replay.get("diagnostics", {}) if isinstance(replay.get("diagnostics", {}), dict) else {}
+    symbols = []
+    sources: Dict[str, str] = {}
+    for row in raw_rows:
+        sym = _s((row or {}).get("symbol", "")).upper()
+        if sym and sym not in symbols:
+            symbols.append(sym)
+            sources[sym] = "configured_universe"
+    for skipped in list(diagnostics.get("historical_strategy_replay_skipped_reasons", []) or []):
+        sym = _s((skipped or {}).get("symbol", "")).upper()
+        if sym and sym not in symbols:
+            symbols.append(sym)
+            sources[sym] = "configured_universe"
+    baseline_rows = _augment_historical_blind_rows(raw_rows, market="crypto", symbol_sources=sources, crypto_trigger_mode="baseline")
+    rows = _augment_historical_blind_rows(raw_rows, market="crypto", symbol_sources=sources, crypto_trigger_mode="improved")
+    decisions = _historical_blind_decision_rows(rows)
+    skips: List[Dict[str, Any]] = []
+    for skipped in list(diagnostics.get("historical_strategy_replay_skipped_reasons", []) or []):
+        if not isinstance(skipped, dict):
+            continue
+        sym = _s(skipped.get("symbol", "")).upper()
+        skips.append(
+            {
+                "market": "crypto",
+                "symbol": sym,
+                "symbol_source": _s(sources.get(sym, "configured_universe")) or "configured_universe",
+                "timestamp": int(time.time()),
+                "decision": "skip",
+                "skip_reason": _s(skipped.get("reason", "")) or "simulation_skipped",
+                "source_type": HISTORICAL_BLIND_SIM_SOURCE_TYPE,
+            }
+        )
+    return {
+        "rows": rows,
+        "baseline_rows": baseline_rows,
+        "decisions": decisions,
+        "skips": skips,
+        "symbols": symbols,
+        "diagnostics": diagnostics,
+    }
+
+
+def _build_historical_blind_simulation(
+    *,
+    hub_dir: str,
+    base_dir: str,
+    settings: Dict[str, Any],
+) -> Dict[str, Any]:
+    enabled = _env_flag("HISTORICAL_BLIND_SIM_ENABLED") or _env_flag("SYMBOL_ONBOARDING_BLIND_SIM_ENABLED")
+    configured_markets = _historical_blind_sim_enabled_markets()
+    lookback_days = _env_int("HISTORICAL_BLIND_SIM_LOOKBACK_DAYS", _env_int("SYMBOL_ONBOARDING_LOOKBACK_DAYS", 365))
+    timeframe = _env_str("HISTORICAL_BLIND_SIM_TIMEFRAME", _env_str("SYMBOL_ONBOARDING_TIMEFRAME", "1hour")) or "1hour"
+    max_symbols = _env_int("HISTORICAL_BLIND_SIM_MAX_SYMBOLS", max(1, _env_int("SYMBOL_ONBOARDING_MAX_SYMBOLS_PER_RUN", 20)))
+    deterministic = _env_flag("HISTORICAL_BLIND_SIM_DETERMINISTIC")
+    force_refresh = False
+    report: Dict[str, Any] = {
+        "enabled": bool(enabled),
+        "markets_requested": configured_markets,
+        "historical_blind_simulation_used_as_primary": False,
+        "historical_blind_simulation_used_as_supplemental": False,
+        "markets": {},
+        "artifact_paths": {},
+        "symbol_bucket_artifacts": {},
+        "unified_artifacts": {},
+    }
+    if not enabled:
+        return report
+
+    unified_trades: List[Dict[str, Any]] = []
+    unified_decisions: List[Dict[str, Any]] = []
+    unified_skips: List[Dict[str, Any]] = []
+    ts_now = int(time.time())
+    for market in configured_markets:
+        paths = _historical_blind_sim_paths(hub_dir, market)
+        bucket_paths = _symbol_bucket_paths(hub_dir, market)
+        market_report: Dict[str, Any] = {
+            "market": market,
+            "supported": market in {"crypto", "stocks"},
+            "implemented": False,
+            "blocker": "",
+            "source_type": HISTORICAL_BLIND_SIM_SOURCE_TYPE,
+        }
+        trades: List[Dict[str, Any]] = []
+        decisions: List[Dict[str, Any]] = []
+        skips: List[Dict[str, Any]] = []
+        candidate_symbols: List[str] = []
+        onboarding_rows: List[Dict[str, Any]] = []
+        active_rows: List[Dict[str, Any]] = []
+        eligible_rows: List[Dict[str, Any]] = []
+        rejected_rows: List[Dict[str, Any]] = []
+        status_by_symbol: Dict[str, Dict[str, Any]] = {}
+        crypto_baseline_rows: List[Dict[str, Any]] = []
+        if market == "crypto":
+            built = _build_crypto_blind_simulation(
+                hub_dir=hub_dir,
+                settings=settings,
+                lookback_days=lookback_days,
+                timeframe=timeframe,
+                max_symbols=max_symbols,
+                force_refresh=force_refresh,
+                deterministic=deterministic,
+            )
+            crypto_baseline_rows = list(built.get("baseline_rows", []) or [])
+            trades = list(built.get("rows", []) or [])
+            decisions = list(built.get("decisions", []) or [])
+            skips = list(built.get("skips", []) or [])
+            candidate_symbols = list(built.get("symbols", []) or [])
+            for sym in candidate_symbols:
+                sym_rows = [dict(r) for r in trades if _s(r.get("symbol", "")).upper() == sym]
+                sym_decisions = [dict(r) for r in decisions if _s(r.get("symbol", "")).upper() == sym]
+                sym_skips = [dict(r) for r in skips if _s(r.get("symbol", "")).upper() == sym]
+                metrics = _historical_blind_metrics(sym_rows)
+                status = {
+                    "schema_version": HISTORICAL_BLIND_SIM_SCHEMA_VERSION,
+                    "market": "crypto",
+                    "symbol": sym,
+                    "symbol_source": "configured_universe",
+                    "requested_at": ts_now,
+                    "completed_at": ts_now,
+                    "provider": _s(built.get("diagnostics", {}).get("historical_strategy_replay_provider", "")) or "kucoin",
+                    "historical_data_rows": int(metrics.get("rows", 0)),
+                    "historical_lookback_days": int(lookback_days),
+                    "historical_timeframe": timeframe,
+                    "simulation_completed": bool(sym_rows),
+                    "simulation_trade_rows": int(len(sym_rows)),
+                    "simulation_decision_rows": int(len(sym_decisions)),
+                    "simulation_skip_rows": int(len(sym_skips)),
+                    "eligible_for_scan": bool(sym_rows),
+                    "eligible_for_trade_consideration": False,
+                    "eligible_for_training": bool(any(bool(r.get("eligible_for_training", False)) for r in sym_rows)),
+                    "status": "learning_ready_not_trade_ready" if sym_rows else "blocked_strategy_alignment",
+                    "blockers": (
+                        ["historical_blind_simulation_supplemental_only", "existing_readiness_gates_not_promoting_blind_sim_rows"]
+                        if sym_rows
+                        else ["no_simulated_completed_trades"]
+                    ),
+                    "warnings": sorted({_s(r.get("prediction_semantics_warning", "")) for r in sym_rows if _s(r.get("prediction_semantics_warning", ""))}),
+                    "cooldown_until": 0,
+                    "alignment_score": round(_f(metrics.get("win_rate_pct", 0.0), 0.0) / 100.0, 6),
+                    "alignment_reason": "historical_crypto_blind_simulation",
+                    "simulation_directional_accuracy": metrics.get("directional_accuracy_pct", 0.0),
+                    "simulation_trigger_accuracy": metrics.get("trigger_match_pct", 0.0),
+                    "simulation_pnl_trend_accuracy": metrics.get("pnl_trend_match_pct", 0.0),
+                    "prediction_semantics": "heuristic",
+                    "diagnostic_only_rows": int(sum(1 for r in sym_rows if bool(r.get("diagnostic_only", False)))),
+                    "simulation_trade_count": int(len(sym_rows)),
+                    "simulation_skip_count": int(len(sym_skips)),
+                    "simulation_avg_pnl_pct": metrics.get("average_pnl_pct", 0.0),
+                    "simulation_max_drawdown_pct": metrics.get("max_drawdown_pct", 0.0),
+                    "simulation_win_rate_pct": metrics.get("win_rate_pct", 0.0),
+                    "artifact_paths": _symbol_onboarding_paths(hub_dir, "crypto", sym),
+                }
+                status_by_symbol[sym] = status
+                onboarding_rows.append({"symbol": sym, "symbol_source": "configured_universe", "status": status["status"]})
+                if sym_rows:
+                    active_rows.append({"symbol": sym, "status": "scan_ready"})
+                else:
+                    rejected_rows.append({"symbol": sym, "reason": "no_simulated_completed_trades", "cooldown_until": 0})
+                sym_paths = _symbol_onboarding_paths(hub_dir, "crypto", sym)
+                _write_jsonl(sym_paths["trades"], sym_rows)
+                _write_jsonl(sym_paths["decisions"], sym_decisions)
+                _write_jsonl(sym_paths["skips"], sym_skips)
+                _write_json_atomic(sym_paths["summary"], {"market": "crypto", "symbol": sym, "metrics": metrics, "rows_generated": int(len(sym_rows)), "decision_rows_generated": int(len(sym_decisions)), "skip_rows_generated": int(len(sym_skips)), "source_type": HISTORICAL_BLIND_SIM_SOURCE_TYPE})
+                _write_json_atomic(sym_paths["status"], status)
+            market_report["implemented"] = True
+        elif market == "stocks":
+            candidate_symbols, symbol_sources = _collect_stock_blind_sim_candidates(hub_dir, settings, max_symbols)
+            for sym in candidate_symbols:
+                onboarding = _build_stock_symbol_onboarding(
+                    hub_dir=hub_dir,
+                    base_dir=base_dir,
+                    settings=settings,
+                    symbol=sym,
+                    symbol_source=_s(symbol_sources.get(sym, "configured_universe")) or "configured_universe",
+                    lookback_days=lookback_days,
+                    timeframe=timeframe,
+                    force_refresh=force_refresh,
+                )
+                status = onboarding.get("status", {}) if isinstance(onboarding.get("status", {}), dict) else {}
+                status_by_symbol[sym] = status
+                trades.extend(list(onboarding.get("trades", []) or []))
+                decisions.extend(list(onboarding.get("decisions", []) or []))
+                skips.extend(list(onboarding.get("skips", []) or []))
+                onboarding_rows.append({"symbol": sym, "symbol_source": _s(status.get("symbol_source", "")), "status": _s(status.get("status", ""))})
+                if bool(status.get("eligible_for_scan", False)):
+                    active_rows.append({"symbol": sym, "status": _s(status.get("status", ""))})
+                if bool(status.get("eligible_for_trade_consideration", False)):
+                    eligible_rows.append({"symbol": sym, "status": _s(status.get("status", ""))})
+                elif _s(status.get("status", "")).startswith("blocked") or _s(status.get("status", "")) == "cooled_down":
+                    rejected_rows.append({"symbol": sym, "reason": ",".join(list(status.get("blockers", []) or [])) or _s(status.get("status", "")), "cooldown_until": int(_f(status.get("cooldown_until", 0), 0.0))})
+            market_report["implemented"] = True
+        else:
+            market_report["supported"] = False
+            market_report["blocker"] = "forex_blind_simulation_adapter_not_implemented_replay_safe_candle_path_missing"
+
+        _write_jsonl(paths["trades"], trades)
+        _write_jsonl(paths["decisions"], decisions)
+        _write_jsonl(paths["skips"], skips)
+        blind_diag = _historical_blind_diagnostics(
+            market=market,
+            rows=trades,
+            status_by_symbol=status_by_symbol,
+            active_rows=active_rows,
+            eligible_rows=eligible_rows,
+            rejected_rows=rejected_rows,
+        )
+        crypto_before_after = _crypto_blind_before_after_summary(crypto_baseline_rows, trades) if market == "crypto" else {}
+        crypto_residual_artifacts = _export_crypto_blind_residual_mismatches(hub_dir, trades) if market == "crypto" else {}
+        split_rows = _split_walkforward_rows(trades)
+        crypto_training_readiness = {}
+        if market == "crypto":
+            eligible_after = int(blind_diag.get("eligible_for_training_rows", 0) or 0)
+            diag_after = int(blind_diag.get("diagnostic_only_rows", 0) or 0)
+            readiness_state = "diagnostic_only"
+            readiness_blockers: List[str] = []
+            if eligible_after >= 150 and int(blind_diag.get("risk_cut_to_trailing_count", 0) or 0) <= 40 and int(blind_diag.get("take_profit_to_trailing_count", 0) or 0) <= 12:
+                readiness_state = "partially_ready_for_training"
+            if _s(blind_diag.get("prediction_semantics", "")) == "heuristic":
+                readiness_blockers.append("prediction_semantics_still_heuristic")
+            if int(blind_diag.get("risk_cut_to_trailing_count", 0) or 0) > 40:
+                readiness_blockers.append("residual_risk_cut_to_trailing_confusion_high")
+            if int(blind_diag.get("take_profit_to_trailing_count", 0) or 0) > 12:
+                readiness_blockers.append("residual_take_profit_to_trailing_confusion_high")
+            if readiness_state == "diagnostic_only" and eligible_after > 0:
+                readiness_state = "partially_ready_for_training"
+            crypto_training_readiness = {
+                "decision": readiness_state,
+                "reason": "heuristic_trigger_scorer_improved_but_residual_confusion_remains" if readiness_state != "ready_for_training" else "trigger_semantics_aligned",
+                "eligible_row_count": eligible_after,
+                "diagnostic_only_row_count": diag_after,
+                "remaining_blockers": readiness_blockers,
+                "prediction_semantics": _s(blind_diag.get("prediction_semantics", "")),
+                "supplemental_only": True,
+            }
+        summary = {
+            "schema_version": HISTORICAL_BLIND_SIM_SCHEMA_VERSION,
+            "market": market,
+            "enabled": True,
+            "implemented": bool(market_report.get("implemented", False)),
+            "supported": bool(market_report.get("supported", False)),
+            "source_type": HISTORICAL_BLIND_SIM_SOURCE_TYPE,
+            "lookback_days": int(lookback_days),
+            "timeframe": timeframe,
+            "simulation_rows_generated": int(len(trades)),
+            "completed_mock_trades": int(len(trades)),
+            "skipped_decisions": int(len(skips)),
+            "training_eligible_rows": int(sum(1 for r in trades if bool(r.get("eligible_for_training", False)))),
+            "diagnostic_only_rows": int(sum(1 for r in trades if bool(r.get("diagnostic_only", False)))),
+            "historical_blind_simulation_used_as_primary": False,
+            "historical_blind_simulation_used_as_supplemental": bool(trades),
+            "walkforward_split_counts": {k: int(len(v)) for k, v in split_rows.items()},
+            "validation_metrics": _historical_blind_metrics(split_rows.get("validation", [])),
+            "test_metrics": _historical_blind_metrics(split_rows.get("test", [])),
+            "metrics_by_symbol": {sym: _historical_blind_metrics([r for r in trades if _s(r.get("symbol", "")).upper() == sym]) for sym in candidate_symbols},
+            "metrics_by_trigger": _count_by(trades, lambda r: _s(r.get("actual_exit_trigger", "")) or "Unknown"),
+            "train_validation_test_rows": {k: int(len(v)) for k, v in split_rows.items()},
+            "leakage_check_status": {
+                "status": "pass",
+                "details": "blind_sim_predictions_use_only_prior_completed_mock_trades",
+            },
+            "symbol_onboarding_counts": {
+                "candidate_universe": int(len(candidate_symbols)),
+                "onboarding_queue": int(len([r for r in onboarding_rows if _s(r.get('status', ''))])),
+                "active_scan_set": int(len(active_rows)),
+                "trade_eligible_set": int(len(eligible_rows)),
+                "rejected_or_cooled_down": int(len(rejected_rows)),
+            },
+            "manual_watchlist_statuses": {
+                sym: status_by_symbol.get(sym, {}).get("status", "")
+                for sym, source in (
+                    [(s, _s(status_by_symbol.get(s, {}).get("symbol_source", ""))) for s in candidate_symbols]
+                )
+                if source == "manual_watchlist"
+            },
+            "prediction_semantics": _s(blind_diag.get("prediction_semantics", "")),
+            "prediction_semantics_warning": _s(blind_diag.get("prediction_semantics_warning", "")),
+            "predicted_direction_counts": blind_diag.get("predicted_direction_counts", {}),
+            "actual_direction_counts": blind_diag.get("actual_direction_counts", {}),
+            "direction_confusion_matrix": blind_diag.get("direction_confusion_matrix", {}),
+            "predicted_trigger_counts": blind_diag.get("predicted_trigger_counts", {}),
+            "actual_trigger_counts": blind_diag.get("actual_trigger_counts", {}),
+            "trigger_confusion_matrix": blind_diag.get("trigger_confusion_matrix", {}),
+            "predicted_pnl_trend_counts": blind_diag.get("predicted_pnl_trend_counts", {}),
+            "actual_pnl_trend_counts": blind_diag.get("actual_pnl_trend_counts", {}),
+            "pnl_trend_confusion_matrix": blind_diag.get("pnl_trend_confusion_matrix", {}),
+            "top_mismatch_buckets": blind_diag.get("top_mismatch_buckets", {}),
+            "sample_mismatch_rows": blind_diag.get("sample_mismatch_rows", []),
+            "trigger_score_distribution": blind_diag.get("trigger_score_distribution", {}),
+            "selected_trigger_margin_buckets": blind_diag.get("selected_trigger_margin_buckets", {}),
+            "training_eligible_counts_by_trigger": blind_diag.get("training_eligible_counts_by_trigger", {}),
+            "diagnostic_only_reason_counts": blind_diag.get("diagnostic_only_reason_counts", {}),
+            "second_stage_discriminator_applied_counts": blind_diag.get("second_stage_discriminator_applied_counts", {}),
+            "second_stage_discriminator_reason_counts": blind_diag.get("second_stage_discriminator_reason_counts", {}),
+            "residual_pair_counts": blind_diag.get("residual_pair_counts", {}),
+            "top_risk_cut_to_trailing_residual_mismatches": blind_diag.get("top_risk_cut_to_trailing_residual_mismatches", []),
+            "top_take_profit_to_trailing_residual_mismatches": blind_diag.get("top_take_profit_to_trailing_residual_mismatches", []),
+            "top_stale_alignment_to_trailing_residual_mismatches": blind_diag.get("top_stale_alignment_to_trailing_residual_mismatches", []),
+            "label_alignment_status": _s(blind_diag.get("label_alignment_status", "")),
+            "label_alignment_blockers": blind_diag.get("label_alignment_blockers", []),
+            "trade_eligible_set_blocker_counts": blind_diag.get("trade_eligible_set_blocker_counts", {}),
+            "blocker": _s(market_report.get("blocker", "")),
+        }
+        if market == "crypto":
+            summary["crypto_trigger_root_cause"] = "blind_sim_used_generic_crypto_replay_predictor_without_crypto-specific_sequence_trigger_scorer_biasing_predictions_toward_trailing"
+            summary["crypto_actual_trigger_assignment_audit"] = {
+                "actual_trigger_generated_in": "app.crypto_historical_replay._simulate_strategy_rows",
+                "actual_trigger_assignment_method": "ordered_exit_sequence",
+                "exit_condition_priority": ["Risk Cut", "Take Profit", "Trailing", "Stale Alignment"],
+                "derived_from_final_pnl_only": False,
+            }
+            summary["crypto_predicted_trigger_generation_audit"] = {
+                "predicted_trigger_generated_in": "app.model_quality_pass._crypto_blind_trigger_predict",
+                "baseline_predictor_path": "app.model_quality_pass._predict_one",
+                "baseline_trigger_mode": "generic_historical_replay_candidate_variant",
+                "improved_trigger_mode": "blind_sequence_trigger_scorer_v1",
+                "prediction_source_feature_availability": "entry_features_only",
+            }
+            summary.update(crypto_before_after)
+            summary["residual_mismatch_artifact_path"] = _s((crypto_residual_artifacts.get("paths", {}) if isinstance(crypto_residual_artifacts.get("paths", {}), dict) else {}).get("rows", ""))
+            summary["residual_mismatch_summary_path"] = _s((crypto_residual_artifacts.get("paths", {}) if isinstance(crypto_residual_artifacts.get("paths", {}), dict) else {}).get("summary", ""))
+            summary["residual_mismatch_artifact_counts"] = (crypto_residual_artifacts.get("summary", {}) if isinstance(crypto_residual_artifacts.get("summary", {}), dict) else {})
+            summary["crypto_training_readiness_decision"] = crypto_training_readiness
+            if int(crypto_before_after.get("training_eligible_rows_after", 0) or 0) < int(crypto_before_after.get("training_eligible_rows_before", 0) or 0) - 20:
+                summary["blocker"] = (_s(summary.get("blocker", "")) + (" | " if _s(summary.get("blocker", "")) else "") + "training_eligible_rows_dropped_materially_after_trigger_semantics_pass").strip()
+        _write_json_atomic(paths["summary"], summary)
+        _write_json_atomic(bucket_paths["candidate_universe"], {"market": market, "symbols": candidate_symbols, "count": int(len(candidate_symbols)), "ts": ts_now})
+        _write_json_atomic(bucket_paths["onboarding_queue"], {"market": market, "symbols": onboarding_rows, "count": int(len(onboarding_rows)), "ts": ts_now})
+        _write_json_atomic(bucket_paths["active_scan_set"], {"market": market, "symbols": active_rows, "count": int(len(active_rows)), "ts": ts_now})
+        _write_json_atomic(bucket_paths["trade_eligible_set"], {"market": market, "symbols": eligible_rows, "count": int(len(eligible_rows)), "ts": ts_now})
+        _write_json_atomic(bucket_paths["rejected_or_cooled_down_symbols"], {"market": market, "symbols": rejected_rows, "count": int(len(rejected_rows)), "ts": ts_now})
+        market_report["summary"] = summary
+        market_report["artifact_paths"] = paths
+        market_report["symbol_bucket_artifacts"] = bucket_paths
+        report["markets"][market] = market_report
+        report["artifact_paths"][market] = paths
+        report["symbol_bucket_artifacts"][market] = bucket_paths
+        unified_trades.extend(trades)
+        unified_decisions.extend(decisions)
+        unified_skips.extend(skips)
+
+    report["historical_blind_simulation_used_as_supplemental"] = bool(unified_trades)
+    unified_paths = {
+        "trades": os.path.join(hub_dir, "historical_blind_simulation_trades.jsonl"),
+        "decisions": os.path.join(hub_dir, "historical_blind_simulation_decisions.jsonl"),
+        "skips": os.path.join(hub_dir, "historical_blind_simulation_skips.jsonl"),
+        "summary": os.path.join(hub_dir, "historical_blind_simulation_summary.json"),
+    }
+    _write_jsonl(unified_paths["trades"], unified_trades)
+    _write_jsonl(unified_paths["decisions"], unified_decisions)
+    _write_jsonl(unified_paths["skips"], unified_skips)
+    _write_json_atomic(
+        unified_paths["summary"],
+        {
+            "schema_version": HISTORICAL_BLIND_SIM_SCHEMA_VERSION,
+            "enabled": True,
+            "historical_blind_simulation_used_as_primary": False,
+            "historical_blind_simulation_used_as_supplemental": bool(unified_trades),
+            "completed_mock_trades": int(len(unified_trades)),
+            "skipped_decisions": int(len(unified_skips)),
+            "training_eligible_rows": int(sum(1 for r in unified_trades if bool(r.get("eligible_for_training", False)))),
+            "diagnostic_only_rows": int(sum(1 for r in unified_trades if bool(r.get("diagnostic_only", False)))),
+            "markets": {mk: (report["markets"].get(mk, {}).get("summary", {})) for mk in report["markets"]},
+        },
+    )
+    report["unified_artifacts"] = unified_paths
+    return report
+
+
 def _stock_symbol_candidates(hub_dir: str, closed_rows: List[Dict[str, Any]], limit: int = 18) -> List[str]:
     out: List[str] = []
     for row in sorted(list(closed_rows or []), key=lambda r: int(_f(r.get("exit_ts", 0.0), 0.0)), reverse=True):
@@ -7326,6 +9387,41 @@ def run_model_quality_full_pass(
         hub_dir,
         completed_live_rows_by_market,
     )
+    synthetic_completed_live_verification = _verify_completed_live_synthetic_paths()
+    completed_live_rows_found: Dict[str, int] = {}
+    completed_live_rows_completed: Dict[str, int] = {}
+    completed_live_join_rate_pct: Dict[str, float] = {}
+    completed_live_missing_fields_by_market: Dict[str, Dict[str, int]] = {}
+    completed_live_eligible_rows_by_market: Dict[str, int] = {}
+    completed_live_ineligible_rows_by_market: Dict[str, int] = {}
+    completed_live_waiting_for_real_trade_completion: Dict[str, bool] = {}
+    completed_live_no_post_model_completed_trades_yet: Dict[str, bool] = {}
+    for m in markets:
+        replay_meta = replay_generation.get(m, {}) if isinstance(replay_generation.get(m, {}), dict) else {}
+        live_diag = replay_meta.get("live_decision_source_diagnostics", {}) if isinstance(replay_meta.get("live_decision_source_diagnostics", {}), dict) else {}
+        completed_live_rows_found[m] = int(_f(replay_meta.get("completed_live_rows_found", 0), 0.0))
+        completed_live_rows_completed[m] = int(_f(replay_meta.get("completed_live_rows_completed", 0), 0.0))
+        completed_live_join_rate_pct[m] = round(_f(replay_meta.get("completed_live_join_rate_pct", 0.0), 0.0), 4)
+        missing_by_market = live_diag.get("completed_live_missing_fields_by_market", {}) if isinstance(live_diag.get("completed_live_missing_fields_by_market", {}), dict) else {}
+        eligible_by_market = live_diag.get("completed_live_eligible_rows_by_market", {}) if isinstance(live_diag.get("completed_live_eligible_rows_by_market", {}), dict) else {}
+        ineligible_by_market = live_diag.get("completed_live_ineligible_rows_by_market", {}) if isinstance(live_diag.get("completed_live_ineligible_rows_by_market", {}), dict) else {}
+        completed_live_missing_fields_by_market[m] = dict(missing_by_market.get(m, {}) if isinstance(missing_by_market.get(m, {}), dict) else {})
+        completed_live_eligible_rows_by_market[m] = int(_f(eligible_by_market.get(m, 0), 0.0))
+        completed_live_ineligible_rows_by_market[m] = int(_f(ineligible_by_market.get(m, 0), 0.0))
+        completed_live_waiting_for_real_trade_completion[m] = bool(live_diag.get("completed_live_waiting_for_real_trade_completion", True))
+        completed_live_no_post_model_completed_trades_yet[m] = bool(live_diag.get("completed_live_no_post_model_completed_trades_yet", True))
+    completed_live_verification = {
+        "completed_live_rows_found": completed_live_rows_found,
+        "completed_live_rows_completed": completed_live_rows_completed,
+        "completed_live_join_rate_pct": completed_live_join_rate_pct,
+        "completed_live_missing_fields_by_market": completed_live_missing_fields_by_market,
+        "completed_live_eligible_rows_by_market": completed_live_eligible_rows_by_market,
+        "completed_live_ineligible_rows_by_market": completed_live_ineligible_rows_by_market,
+        "completed_live_waiting_for_real_trade_completion": completed_live_waiting_for_real_trade_completion,
+        "completed_live_no_post_model_completed_trades_yet": completed_live_no_post_model_completed_trades_yet,
+        "completed_live_synthetic_path_verified_by_market": dict(synthetic_completed_live_verification.get("completed_live_synthetic_path_verified_by_market", {})),
+        "completed_live_synthetic_blockers_by_market": dict(synthetic_completed_live_verification.get("completed_live_synthetic_blockers_by_market", {})),
+    }
 
     # Build/refresh replay artifacts for all markets from normalized closed trades.
     openai_dir = os.path.join(hub_dir, "openai")
@@ -7456,6 +9552,30 @@ def run_model_quality_full_pass(
     shadow = build_shadow_scorecards(hub_dir)
     replay_diag = {m: build_replay_diagnostics(hub_dir, m) for m in markets}
     legacy_trade_replay = build_legacy_trade_model_replay(hub_dir=hub_dir, base_dir=base_dir, settings=cfg)
+    blind_simulation = _build_historical_blind_simulation(
+        hub_dir=hub_dir,
+        base_dir=base_dir,
+        settings=cfg,
+    )
+    for m in markets:
+        replay_generation.setdefault(m, {})
+        blind_market = blind_simulation.get("markets", {}).get(m, {}) if isinstance(blind_simulation.get("markets", {}), dict) else {}
+        blind_summary = blind_market.get("summary", {}) if isinstance(blind_market.get("summary", {}), dict) else {}
+        replay_generation[m]["historical_blind_simulation_used_as_primary"] = False
+        replay_generation[m]["historical_blind_simulation_used_as_supplemental"] = bool(blind_summary.get("completed_mock_trades", 0))
+        replay_generation[m]["historical_blind_simulation_rows_generated"] = int(_f(blind_summary.get("completed_mock_trades", 0), 0.0))
+        replay_generation[m]["historical_blind_simulation_skipped_decisions"] = int(_f(blind_summary.get("skipped_decisions", 0), 0.0))
+        replay_generation[m]["historical_blind_simulation_training_eligible_rows"] = int(_f(blind_summary.get("training_eligible_rows", 0), 0.0))
+        replay_generation[m]["historical_blind_simulation_leakage_check_status"] = (
+            blind_summary.get("leakage_check_status", {}) if isinstance(blind_summary.get("leakage_check_status", {}), dict) else {}
+        )
+        replay_generation[m]["historical_blind_simulation_artifact_paths"] = (
+            blind_market.get("artifact_paths", {}) if isinstance(blind_market.get("artifact_paths", {}), dict) else {}
+        )
+        replay_generation[m]["historical_blind_simulation_symbol_bucket_artifacts"] = (
+            blind_market.get("symbol_bucket_artifacts", {}) if isinstance(blind_market.get("symbol_bucket_artifacts", {}), dict) else {}
+        )
+        replay_generation[m]["historical_blind_simulation_blocker"] = _s(blind_summary.get("blocker", blind_market.get("blocker", "")))
 
     promotion_thresholds = {"directional_accuracy_pct": 90.0, "trigger_match_pct": 90.0, "pnl_trend_match_pct": 90.0}
     promotion_minima = {
@@ -7570,6 +9690,8 @@ def run_model_quality_full_pass(
         "dataset_quality": dataset_reports,
         "dataset_snapshots": snapshots,
         "completed_live_decision_artifacts": completed_live_decision_artifacts,
+        "completed_live_verification": completed_live_verification,
+        "completed_live_synthetic_verification": synthetic_completed_live_verification,
         "synthetic_replay_artifacts": synthetic_paths,
         "replay_generation": replay_generation,
         "market_regimes": regimes,
@@ -7580,6 +9702,7 @@ def run_model_quality_full_pass(
         "legacy_trade_model_replay": legacy_trade_replay,
         "legacy_trade_model_replay_used_as_primary": bool(use_legacy_replay_as_primary and legacy_trade_replay.get("legacy_rows_replayed", 0)),
         "legacy_trade_model_replay_used_as_supplemental": True,
+        "historical_blind_simulation": blind_simulation,
         "crypto_trained_artifact_diagnostics": crypto_artifact_report.get("discovery", {}),
         "crypto_feature_source_diagnostics": (
             dataset_reports.get("crypto", {}).get("feature_source_diagnostics", {})

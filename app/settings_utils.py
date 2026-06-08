@@ -1152,6 +1152,7 @@ def _recommended_forex_trade_units(
     bp = max(0.0, float(buying_power_usd))
     cur = max(0, int(current_open_positions))
     max_pos = max(1, int(max_open_positions))
+    sizing_slots = int(max_pos)
     factor = {
         "safe": 0.15,
         "balanced": 0.20,
@@ -1163,16 +1164,20 @@ def _recommended_forex_trade_units(
         # Keep larger accounts unchanged while letting micro/small accounts
         # deploy meaningfully more size in managed day-trader mode.
         if acct < 250.0:
-            factor = 0.70
-            room_cap_mult = 0.85
+            factor = 2.20 if acct < 100.0 else 1.60
+            room_cap_mult = 4.00 if acct < 100.0 else 3.20
+            # When capital is small we usually hold fewer FX positions in practice,
+            # so concentrate sizing into up to two active slots.
+            sizing_slots = min(sizing_slots, 2)
         elif acct < 1_000.0:
-            factor = 0.55
-            room_cap_mult = 0.75
+            factor = 0.90
+            room_cap_mult = 1.60
+            sizing_slots = min(sizing_slots, 3)
         elif acct < 2_500.0:
-            factor = 0.40
-            room_cap_mult = 0.65
+            factor = 0.55
+            room_cap_mult = 1.00
     base = max(1.0, acct * factor)
-    remaining_slots = max(1, max_pos - cur)
+    remaining_slots = max(1, min(max(1, max_pos - cur), max(1, sizing_slots)))
     room_cap = (bp / remaining_slots) * room_cap_mult if bp > 0.0 else base
     if pkey == "max_growth":
         if acct >= 2_500.0:
@@ -1180,11 +1185,11 @@ def _recommended_forex_trade_units(
         elif acct >= 1_000.0:
             floor_units = 80.0
         elif acct >= 250.0:
-            floor_units = 55.0
+            floor_units = 70.0
         elif acct >= 100.0:
-            floor_units = 40.0
+            floor_units = 140.0
         else:
-            floor_units = 30.0
+            floor_units = 120.0
     elif pkey == "aggressive":
         floor_units = 30.0 if acct >= 250.0 else 20.0
     elif pkey == "balanced":
@@ -1193,7 +1198,13 @@ def _recommended_forex_trade_units(
         floor_units = 10.0 if acct >= 250.0 else 6.0
     units = max(floor_units, min(max(base, floor_units), max(floor_units, room_cap)))
     if bp > 0.0:
-        units = min(units, max(1.0, bp * 0.95))
+        leverage_room_mult = {
+            "safe": 2.5,
+            "balanced": 4.0,
+            "aggressive": 6.0,
+            "max_growth": 10.0 if acct < 250.0 else 8.0,
+        }.get(pkey, 4.0)
+        units = min(units, max(1.0, bp * leverage_room_mult))
     if units < 25.0:
         step = 1
     elif units < 100.0:
@@ -1308,11 +1319,8 @@ def recommend_market_profile_overrides(
             crypto_metrics.get("buying_power_usd", 0.0),
             int(crypto_metrics.get("open_positions", 0) or 0),
         ),
-        "max_total_exposure_pct": _recommended_crypto_max_total_exposure_pct(
-            pkey,
-            crypto_metrics.get("account_value_usd", 0.0),
-            int(crypto_metrics.get("open_positions", 0) or 0),
-        ),
+        # Preset-managed per-market exposure baseline.
+        "max_total_exposure_pct": 60.0,
         "max_dca_buys_per_24h": 1 if pkey == "safe" else 2 if pkey == "balanced" else 3 if pkey == "aggressive" else 4,
         "dca_multiplier": 1.8 if pkey == "safe" else 2.3 if pkey == "balanced" else 2.6 if pkey == "aggressive" else 2.9,
         "trailing_gap_pct": 0.35 if pkey == "safe" else 0.42 if pkey == "balanced" else 0.50 if pkey == "aggressive" else 0.56,
@@ -1333,6 +1341,7 @@ def recommend_market_profile_overrides(
             stock_max_open,
             int(stock_metrics.get("open_positions", 0) or 0),
         ),
+        "stock_max_total_exposure_pct": 60.0,
         "stock_max_open_positions": int(stock_max_open),
         "forex_trade_units": _recommended_forex_trade_units(
             pkey,
@@ -1341,6 +1350,7 @@ def recommend_market_profile_overrides(
             forex_max_open,
             int(forex_metrics.get("open_positions", 0) or 0),
         ),
+        "forex_max_total_exposure_pct": 60.0,
         "forex_max_open_positions": int(forex_max_open),
         "market_bg_stocks_interval_s": float(stocks_scan_interval_s),
         "market_bg_forex_interval_s": float(forex_scan_interval_s),
@@ -1511,7 +1521,7 @@ def recommend_market_profile_overrides(
                 "stock_opening_plan_enabled": True,
                 "stock_opening_plan_minutes": 60,
                 "stock_opening_plan_max_symbols": 10,
-                "stock_score_threshold": 0.26,
+                "stock_score_threshold": 0.30,
                 "stock_replay_adaptive_weight": 0.45,
                 "stock_replay_adaptive_step_cap_pct": 30.0,
                 "stock_max_day_trades": 1,
@@ -1526,16 +1536,16 @@ def recommend_market_profile_overrides(
                 "stock_pdt_max_day_trades_rolling_5d": 3,
                 "stock_profit_target_pct": 1.80,
                 "stock_trailing_gap_pct": 0.70,
-                "stock_live_guarded_score_mult": 1.15,
-                "stock_min_calib_prob_live_guarded": 0.56,
-                "stock_min_samples_live_guarded": 8,
+                "stock_live_guarded_score_mult": 1.20,
+                "stock_min_calib_prob_live_guarded": 0.64,
+                "stock_min_samples_live_guarded": 14,
                 "stock_max_slippage_bps": 30.0,
                 "stock_block_new_entries_near_close": True,
                 "stock_no_new_entries_mins_to_close": 45,
                 "stock_max_signal_age_seconds": 2700,
                 "stock_leader_stability_margin_pct": 14.0,
                 "forex_auto_trade_enabled": True,
-                "forex_score_threshold": 0.10,
+                "forex_score_threshold": 0.16,
                 "forex_replay_adaptive_weight": 0.60,
                 "forex_replay_adaptive_step_cap_pct": 60.0,
                 "forex_profit_target_pct": 0.18,
@@ -1543,9 +1553,9 @@ def recommend_market_profile_overrides(
                 "forex_min_bars_required": 16,
                 "forex_min_valid_bars_ratio": 0.62,
                 "forex_max_stale_hours": 10.0,
-                "forex_live_guarded_score_mult": 1.02,
-                "forex_min_calib_prob_live_guarded": 0.48,
-                "forex_min_samples_live_guarded": 4,
+                "forex_live_guarded_score_mult": 1.08,
+                "forex_min_calib_prob_live_guarded": 0.60,
+                "forex_min_samples_live_guarded": 10,
                 "forex_max_slippage_bps": 8.0,
                 "forex_leader_stability_margin_pct": 8.0,
                 "forex_cached_scan_entry_size_mult": 0.85,
@@ -1556,8 +1566,8 @@ def recommend_market_profile_overrides(
     if pkey == "max_growth":
         overrides.update(
             {
-                "stock_max_total_exposure_pct": 55.0,
-                "forex_max_total_exposure_pct": 55.0,
+                "stock_max_total_exposure_pct": 60.0,
+                "forex_max_total_exposure_pct": 60.0,
                 "stock_max_daily_loss_usd": 0.0,
                 "stock_max_daily_loss_pct": 0.0,
                 "forex_max_daily_loss_usd": 0.0,
@@ -1567,14 +1577,14 @@ def recommend_market_profile_overrides(
         )
         if live_profile_resolution:
             if crypto_bucket in {"micro", "small"}:
-                current_crypto_cap = max(0.0, float(_as_number(overrides.get("max_total_exposure_pct"), 55.0)))
-                overrides["max_total_exposure_pct"] = min(current_crypto_cap, 55.0)
+                current_crypto_cap = max(0.0, float(_as_number(overrides.get("max_total_exposure_pct"), 60.0)))
+                overrides["max_total_exposure_pct"] = min(current_crypto_cap, 60.0)
             if stock_bucket in {"micro", "small"}:
-                overrides["stock_max_total_exposure_pct"] = 35.0
+                overrides["stock_max_total_exposure_pct"] = 60.0
                 overrides["stock_max_daily_loss_usd"] = 0.0
                 overrides["stock_max_daily_loss_pct"] = 1.5
             if forex_bucket in {"micro", "small"}:
-                overrides["forex_max_total_exposure_pct"] = 35.0
+                overrides["forex_max_total_exposure_pct"] = 60.0
                 overrides["forex_max_daily_loss_usd"] = 0.0
                 overrides["forex_max_daily_loss_pct"] = 1.5
                 overrides["forex_stale_min_notional_usd"] = 0.05

@@ -40,6 +40,11 @@ _RUNBOOK_LINK_MAP: Dict[str, str] = {
     "notification_center_critical": "docs/RUNBOOK.md#6-core-logs",
 }
 
+_NON_ACTIONABLE_STARTUP_WARNING_PREFIXES = (
+    "stale_pid_file_removed",
+    "key_rotation_due:",
+)
+
 
 def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
     scan_health = runtime_state.get("scan_health", {}) if isinstance(runtime_state.get("scan_health", {}), dict) else {}
@@ -154,8 +159,17 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
     # Cadence drift already contributes through scan_cadence metrics; avoid double-counting it as generic runtime errors.
     err_count = max(0, int(err_count_raw - cadence_err_count))
     incident_count = int(warn_count + err_count)
-    warns = len(list(checks.get("warnings", []) or []))
-    startup_warnings = [str(x or "") for x in list(checks.get("warnings", []) or [])]
+    raw_startup_warnings = [
+        str(x or "").strip()
+        for x in list(checks.get("warnings", []) or [])
+        if str(x or "").strip()
+    ]
+    startup_warnings = [
+        row
+        for row in raw_startup_warnings
+        if not any(str(row).lower().startswith(prefix) for prefix in _NON_ACTIONABLE_STARTUP_WARNING_PREFIXES)
+    ]
+    warns = int(len(startup_warnings))
     startup_errors = len(list(checks.get("errors", []) or []))
     checks_ok_raw = bool(checks.get("ok", False))
     checks_indeterminate = bool((not checks_ok_raw) and startup_errors <= 0 and warns <= 0)
@@ -288,7 +302,7 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
     if warns >= startup_warn:
         reasons.append("startup_warnings")
         hints.append("Review startup warnings in runtime_startup_checks.json.")
-    if any(w.startswith("key_rotation_due:") for w in startup_warnings):
+    if any(str(w).lower().startswith("key_rotation_due:") for w in raw_startup_warnings):
         reasons.append("key_rotation_due")
         hints.append("API key age exceeded rotation threshold; rotate credentials.")
     if max_reject >= reject_warn:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -67,6 +68,18 @@ def _safe_read_json_rows(path: str) -> List[Any]:
 
 def _cache_root(hub_dir: str) -> str:
     return os.path.join(hub_dir, "crypto", "historical_replay_cache")
+
+
+def _derive_cached_cutoff_ts(hub_dir: str, symbols: List[str], timeframe: str) -> int:
+    latest = 0
+    for symbol in list(symbols or []):
+        rows = _load_cached_candles(hub_dir, symbol, timeframe)
+        if rows:
+            try:
+                latest = max(latest, max(int(r[0]) for r in rows if isinstance(r, list) and len(r) >= 1))
+            except Exception:
+                continue
+    return int(latest / 1000) if latest > 0 else 0
 
 
 def _cache_candle_path(hub_dir: str, symbol: str, timeframe: str) -> str:
@@ -231,8 +244,151 @@ def _simulate_strategy_rows(
     take_profit_touched = False
     risk_cut_touched = False
     bars_since_peak = 0
+    trailing_armed_bar = -1
+    risk_cut_touched_bar = -1
+    take_profit_touched_bar = -1
+    peak_bar = 0
+    trough_bar = 0
     label_rule_version = "historical_replay_v2"
     exit_condition_priority = ["Risk Cut", "Take Profit", "Trailing", "Stale Alignment"]
+
+    def _preview_state(entry_i: int, preview_i: int, start_px: float) -> Dict[str, Any]:
+        if entry_i < 0 or preview_i <= entry_i or start_px <= 0.0:
+            return {
+                "preview_bars_used": 0,
+                "bars_since_entry": 0,
+                "current_unrealized_pnl_pct": 0.0,
+                "max_favorable_excursion_pct_so_far": 0.0,
+                "max_adverse_excursion_pct_so_far": 0.0,
+                "drawdown_from_peak_pct_so_far": 0.0,
+                "trailing_armed_so_far": False,
+                "bars_since_trailing_armed": -1,
+                "risk_cut_distance_pct": float(thresholds["risk_cut_pct"]),
+                "take_profit_distance_pct": float(thresholds["take_profit_pct"]),
+                "risk_cut_touched_so_far": False,
+                "take_profit_touched_so_far": False,
+                "peak_to_current_reversal_pct": 0.0,
+                "favorable_then_softened_flag_so_far": False,
+            }
+        preview_peak = start_px
+        preview_trough = start_px
+        preview_close = start_px
+        preview_trailing_armed = False
+        preview_take_profit_touched = False
+        preview_risk_cut_touched = False
+        preview_trailing_armed_bar = -1
+        for pidx in range(entry_i + 1, preview_i + 1):
+            _ts, _open_px, close_px_i, high_px_i, low_px_i, _vol_i = candles[pidx]
+            preview_peak = max(preview_peak, high_px_i, close_px_i)
+            preview_trough = min(preview_trough, low_px_i, close_px_i)
+            preview_close = close_px_i
+            preview_mfe = ((preview_peak / start_px) - 1.0) * 100.0 if start_px > 0.0 else 0.0
+            preview_drawdown = ((preview_close / preview_peak) - 1.0) * 100.0 if preview_peak > 0.0 else 0.0
+            if (not preview_trailing_armed) and preview_mfe >= thresholds["trailing_arm_pct"]:
+                preview_trailing_armed_bar = max(0, pidx - entry_i)
+            preview_trailing_armed = preview_trailing_armed or (preview_mfe >= thresholds["trailing_arm_pct"])
+            preview_take_profit_touched = preview_take_profit_touched or (high_px_i >= (start_px * (1.0 + (thresholds["take_profit_pct"] / 100.0))))
+            preview_risk_cut_touched = preview_risk_cut_touched or (low_px_i <= (start_px * (1.0 - (thresholds["risk_cut_pct"] / 100.0))))
+        preview_mfe = ((preview_peak / start_px) - 1.0) * 100.0 if start_px > 0.0 else 0.0
+        preview_mae = ((preview_trough / start_px) - 1.0) * 100.0 if start_px > 0.0 else 0.0
+        preview_drawdown = ((preview_close / preview_peak) - 1.0) * 100.0 if preview_peak > 0.0 else 0.0
+        preview_pullback_pct = abs(min(0.0, preview_drawdown))
+        preview_bar = max(0, preview_i - entry_i)
+        return {
+            "preview_bars_used": int(preview_bar),
+            "bars_since_entry": int(preview_bar),
+            "current_unrealized_pnl_pct": round(float(((preview_close / start_px) - 1.0) * 100.0 if start_px > 0.0 else 0.0), 6),
+            "max_favorable_excursion_pct_so_far": round(float(max(0.0, preview_mfe)), 6),
+            "max_adverse_excursion_pct_so_far": round(float(min(0.0, preview_mae)), 6),
+            "drawdown_from_peak_pct_so_far": round(float(preview_drawdown), 6),
+            "trailing_armed_so_far": bool(preview_trailing_armed),
+            "bars_since_trailing_armed": int(preview_bar - preview_trailing_armed_bar) if preview_trailing_armed_bar >= 0 else -1,
+            "risk_cut_distance_pct": round(float(max(0.0, thresholds["risk_cut_pct"] - max(0.0, abs(min(0.0, preview_mae))))), 6),
+            "take_profit_distance_pct": round(float(max(0.0, thresholds["take_profit_pct"] - max(0.0, preview_mfe))), 6),
+            "risk_cut_touched_so_far": bool(preview_risk_cut_touched),
+            "take_profit_touched_so_far": bool(preview_take_profit_touched),
+            "peak_to_current_reversal_pct": round(float(preview_pullback_pct), 6),
+            "favorable_then_softened_flag_so_far": bool(preview_mfe >= thresholds["trailing_arm_pct"] and preview_pullback_pct >= max(0.35, thresholds["trailing_drawdown_pct"] * 0.50)),
+        }
+
+    def _late_reversal_preview_state(entry_i: int, preview_i: int, start_px: float) -> Dict[str, Any]:
+        preview = _preview_state(entry_i, preview_i, start_px)
+        if entry_i < 0 or preview_i <= entry_i or start_px <= 0.0:
+            return {
+                "late_favorable_reversal_score": 0.0,
+                "favorable_then_reversed": False,
+                "max_favorable_before_exit_pct": 0.0,
+                "reversal_from_peak_before_exit_pct": 0.0,
+                "bars_from_peak_to_exit_preview": 0,
+                "trailing_arm_to_exit_bars_preview": -1,
+                "risk_pressure_after_peak": 0.0,
+                "take_profit_pressure_before_reversal": 0.0,
+                "target_near_before_reversal": False,
+                "reversal_velocity_pct_per_bar": 0.0,
+                "post_peak_momentum_decay": 0.0,
+                "drawdown_after_favorable_move_pct": 0.0,
+                "favorable_move_quality_score": 0.0,
+                "late_risk_after_favorable_move": False,
+            }
+        preview_peak = start_px
+        preview_peak_bar = 0
+        preview_close = start_px
+        for pidx in range(entry_i + 1, preview_i + 1):
+            _ts, _open_px, close_px_i, high_px_i, _low_px_i, _vol_i = candles[pidx]
+            if max(high_px_i, close_px_i) > preview_peak + 1e-12:
+                preview_peak = max(high_px_i, close_px_i)
+                preview_peak_bar = max(0, pidx - entry_i)
+            preview_close = close_px_i
+        max_favorable_before_exit_pct = max(0.0, _f(preview.get("max_favorable_excursion_pct_so_far", 0.0), 0.0))
+        reversal_from_peak_before_exit_pct = max(0.0, abs(min(0.0, _f(preview.get("drawdown_from_peak_pct_so_far", 0.0), 0.0))))
+        bars_from_peak_to_exit_preview = max(0, int(_f(preview.get("bars_since_entry", 0), 0.0)) - int(preview_peak_bar))
+        trailing_arm_to_exit_bars_preview = int(_f(preview.get("bars_since_trailing_armed", -1), -1.0))
+        target_near_before_reversal = bool(
+            _f(preview.get("take_profit_distance_pct", thresholds["take_profit_pct"]), thresholds["take_profit_pct"]) <= max(0.75, thresholds["take_profit_pct"] * 0.35)
+            or bool(preview.get("take_profit_touched_so_far", False))
+        )
+        favorable_then_reversed = bool(max_favorable_before_exit_pct >= thresholds["trailing_arm_pct"] and reversal_from_peak_before_exit_pct >= max(0.35, thresholds["trailing_drawdown_pct"] * 0.45))
+        favorable_move_quality_score = (
+            max(0.0, max_favorable_before_exit_pct / max(1e-6, thresholds["trailing_arm_pct"]))
+            + (0.50 if bool(preview.get("trailing_armed_so_far", False)) else 0.0)
+            + max(0.0, (1.0 - _f(preview.get("risk_cut_distance_pct", thresholds["risk_cut_pct"]), thresholds["risk_cut_pct"]) / max(1e-6, thresholds["risk_cut_pct"])))
+        )
+        risk_pressure_after_peak = (
+            max(0.0, reversal_from_peak_before_exit_pct / max(0.5, thresholds["trailing_drawdown_pct"]))
+            + max(0.0, abs(min(0.0, _f(preview.get("max_adverse_excursion_pct_so_far", 0.0), 0.0))) / max(0.75, thresholds["risk_cut_pct"]))
+            + (0.75 if bool(preview.get("risk_cut_touched_so_far", False)) else 0.0)
+        )
+        take_profit_pressure_before_reversal = (
+            max(0.0, max_favorable_before_exit_pct / max(1.0, thresholds["take_profit_pct"]))
+            + (0.80 if target_near_before_reversal else 0.0)
+            + max(0.0, (1.0 - (_f(preview.get("take_profit_distance_pct", thresholds["take_profit_pct"]), thresholds["take_profit_pct"]) / max(1.0, thresholds["take_profit_pct"]))))
+        )
+        reversal_velocity_pct_per_bar = reversal_from_peak_before_exit_pct / max(1, bars_from_peak_to_exit_preview)
+        post_peak_momentum_decay = max(0.0, _f(preview.get("momentum_decay", 0.0), 0.0))
+        drawdown_after_favorable_move_pct = reversal_from_peak_before_exit_pct if max_favorable_before_exit_pct > 0.0 else 0.0
+        late_favorable_reversal_score = (
+            max(0.0, favorable_move_quality_score)
+            + max(0.0, reversal_from_peak_before_exit_pct / max(0.5, thresholds["trailing_drawdown_pct"]))
+            + (0.60 if favorable_then_reversed else 0.0)
+            - (0.35 if bool(preview.get("risk_cut_touched_so_far", False)) else 0.0)
+        )
+        return {
+            "late_favorable_reversal_score": round(float(late_favorable_reversal_score), 6),
+            "favorable_then_reversed": favorable_then_reversed,
+            "max_favorable_before_exit_pct": round(float(max_favorable_before_exit_pct), 6),
+            "reversal_from_peak_before_exit_pct": round(float(reversal_from_peak_before_exit_pct), 6),
+            "bars_from_peak_to_exit_preview": int(bars_from_peak_to_exit_preview),
+            "trailing_arm_to_exit_bars_preview": int(trailing_arm_to_exit_bars_preview),
+            "risk_pressure_after_peak": round(float(risk_pressure_after_peak), 6),
+            "take_profit_pressure_before_reversal": round(float(take_profit_pressure_before_reversal), 6),
+            "target_near_before_reversal": bool(target_near_before_reversal),
+            "reversal_velocity_pct_per_bar": round(float(reversal_velocity_pct_per_bar), 6),
+            "post_peak_momentum_decay": round(float(post_peak_momentum_decay), 6),
+            "drawdown_after_favorable_move_pct": round(float(drawdown_after_favorable_move_pct), 6),
+            "favorable_move_quality_score": round(float(favorable_move_quality_score), 6),
+            "late_risk_after_favorable_move": bool(max_favorable_before_exit_pct >= thresholds["trailing_arm_pct"] and bool(preview.get("risk_cut_touched_so_far", False))),
+        }
+
     for idx in range(24, len(candles)):
         ts_ms, open_px, close_px, high_px, low_px, _vol = candles[idx]
         prev3 = candles[idx - 3][2]
@@ -298,6 +454,11 @@ def _simulate_strategy_rows(
                 take_profit_touched = False
                 risk_cut_touched = False
                 bars_since_peak = 0
+                trailing_armed_bar = -1
+                risk_cut_touched_bar = -1
+                take_profit_touched_bar = -1
+                peak_bar = 0
+                trough_bar = 0
                 entry_features = dict(feature_payload)
             continue
         prior_peak = peak_px
@@ -305,17 +466,27 @@ def _simulate_strategy_rows(
         trough_px = min(trough_px, low_px, close_px) if trough_px > 0.0 else min(low_px, close_px)
         if peak_px > prior_peak + 1e-12:
             bars_since_peak = 0
+            peak_bar = max(0, idx - entry_idx)
         else:
             bars_since_peak += 1
         pnl_pct = ((close_px / entry_px) - 1.0) * 100.0 if entry_px > 0 else 0.0
         mfe_pct = ((peak_px / entry_px) - 1.0) * 100.0 if entry_px > 0 and peak_px > 0 else 0.0
         mae_pct = ((trough_px / entry_px) - 1.0) * 100.0 if entry_px > 0 and trough_px > 0 else 0.0
+        if abs(((low_px / entry_px) - 1.0) * 100.0 if entry_px > 0 else 0.0) >= abs(mae_pct) - 1e-9:
+            trough_bar = max(0, idx - entry_idx)
         drawdown_from_peak_pct = ((close_px / peak_px) - 1.0) * 100.0 if peak_px > 0 else 0.0
         hold_hours = ((ts_ms - candles[entry_idx][0]) / 3_600_000.0) if entry_idx >= 0 else 0.0
         bars_in_trade = max(1, idx - entry_idx + 1) if entry_idx >= 0 else 0
+        current_bar = max(0, idx - entry_idx)
+        if (not trailing_armed) and (mfe_pct >= thresholds["trailing_arm_pct"]):
+            trailing_armed_bar = current_bar
         trailing_armed = trailing_armed or (mfe_pct >= thresholds["trailing_arm_pct"])
         trailing_pullback_pct = abs(drawdown_from_peak_pct)
+        if (not take_profit_touched) and (high_px >= (entry_px * (1.0 + (thresholds["take_profit_pct"] / 100.0)))):
+            take_profit_touched_bar = current_bar
         take_profit_touched = take_profit_touched or (high_px >= (entry_px * (1.0 + (thresholds["take_profit_pct"] / 100.0))))
+        if (not risk_cut_touched) and (low_px <= (entry_px * (1.0 - (thresholds["risk_cut_pct"] / 100.0)))):
+            risk_cut_touched_bar = current_bar
         risk_cut_touched = risk_cut_touched or (low_px <= (entry_px * (1.0 - (thresholds["risk_cut_pct"] / 100.0))))
         take_profit_distance_pct = max(0.0, thresholds["take_profit_pct"] - max(0.0, mfe_pct))
         risk_cut_distance_pct = max(0.0, thresholds["risk_cut_pct"] - max(0.0, abs(min(0.0, mae_pct))))
@@ -349,6 +520,52 @@ def _simulate_strategy_rows(
         if not reason:
             continue
         normalized_trigger = normalize_exit_trigger(reason)
+        first_hard_exit_condition = ""
+        first_hard_exit_bar = -1
+        for hard_name, hard_bar in (
+            ("Risk Cut", risk_cut_touched_bar),
+            ("Take Profit", take_profit_touched_bar),
+            ("Trailing", trailing_armed_bar if trailing_now else -1),
+        ):
+            if hard_bar >= 0 and (first_hard_exit_bar < 0 or hard_bar < first_hard_exit_bar):
+                first_hard_exit_condition = hard_name
+                first_hard_exit_bar = int(hard_bar)
+        if first_hard_exit_bar < 0 and stale_now:
+            first_hard_exit_condition = "Stale Alignment"
+            first_hard_exit_bar = int(current_bar)
+        candle_range = max(1e-9, high_px - low_px)
+        exit_close_position_in_candle_range = max(0.0, min(1.0, (close_px - low_px) / candle_range))
+        bars_from_entry_to_trailing_arm = int(trailing_armed_bar) if trailing_armed_bar >= 0 else -1
+        bars_from_entry_to_risk_cut = int(risk_cut_touched_bar) if risk_cut_touched_bar >= 0 else -1
+        bars_from_trailing_arm_to_risk_cut = int(risk_cut_touched_bar - trailing_armed_bar) if trailing_armed_bar >= 0 and risk_cut_touched_bar >= 0 else -1
+        bars_from_peak_to_exit = int(max(0, current_bar - peak_bar))
+        reversal_from_peak_pct = abs(min(0.0, drawdown_from_peak_pct))
+        peak_to_exit_velocity_pct_per_bar = (
+            -reversal_from_peak_pct / max(1, bars_from_peak_to_exit)
+            if bars_from_peak_to_exit > 0
+            else 0.0
+        )
+        entry_to_trough_velocity_pct_per_bar = (
+            float(mae_pct) / max(1, trough_bar)
+            if trough_bar > 0
+            else float(mae_pct)
+        )
+        trade_slice = candles[entry_idx : idx + 1]
+        closes_in_trade = [float(c[2]) for c in trade_slice if isinstance(c, list) and len(c) >= 3 and _f(c[2], 0.0) > 0.0]
+        def _drawdown_over_last_n(n: int) -> float:
+            if len(closes_in_trade) < 2:
+                return 0.0
+            slice_vals = closes_in_trade[-max(2, n):]
+            peak_local = max(slice_vals) if slice_vals else 0.0
+            if peak_local <= 0.0:
+                return 0.0
+            return ((slice_vals[-1] / peak_local) - 1.0) * 100.0
+        last_3_bar_drawdown_pct = _drawdown_over_last_n(3)
+        last_6_bar_drawdown_pct = _drawdown_over_last_n(6)
+        risk_breach_depth_pct = max(0.0, abs(min(0.0, mae_pct)) - float(thresholds["risk_cut_pct"]))
+        preview_idx = entry_idx if current_bar <= 1 else min(idx - 1, entry_idx + 6)
+        preview_state = _preview_state(entry_idx, preview_idx, entry_px)
+        late_preview_state = _late_reversal_preview_state(entry_idx, max(entry_idx, idx - 1), entry_px)
         row = dict(entry_features)
         row.update(
             {
@@ -372,18 +589,44 @@ def _simulate_strategy_rows(
                 "drawdown_from_peak_pct": round(float(drawdown_from_peak_pct), 6),
                 "bars_since_peak": int(max(0, bars_since_peak)),
                 "bars_in_trade": int(max(1, bars_in_trade)),
+                "trailing_armed_bar": int(trailing_armed_bar),
+                "risk_cut_touched_bar": int(risk_cut_touched_bar),
+                "take_profit_touched_bar": int(take_profit_touched_bar),
+                "peak_bar": int(peak_bar),
+                "exit_bar": int(current_bar),
+                "first_hard_exit_condition": first_hard_exit_condition,
+                "first_hard_exit_bar": int(first_hard_exit_bar),
+                "bars_from_entry_to_trailing_arm": int(bars_from_entry_to_trailing_arm),
+                "bars_from_entry_to_risk_cut": int(bars_from_entry_to_risk_cut),
+                "bars_from_trailing_arm_to_risk_cut": int(bars_from_trailing_arm_to_risk_cut),
+                "bars_from_peak_to_exit": int(bars_from_peak_to_exit),
+                "risk_cut_before_trailing": bool(risk_cut_touched_bar >= 0 and (trailing_armed_bar < 0 or risk_cut_touched_bar < trailing_armed_bar)),
+                "trailing_before_risk_cut": bool(trailing_armed_bar >= 0 and (risk_cut_touched_bar < 0 or trailing_armed_bar < risk_cut_touched_bar)),
+                "risk_cut_after_trailing_arm": bool(risk_cut_touched_bar >= 0 and trailing_armed_bar >= 0 and risk_cut_touched_bar > trailing_armed_bar),
+                "risk_cut_after_peak": bool(risk_cut_touched_bar >= 0 and peak_bar >= 0 and risk_cut_touched_bar >= peak_bar),
+                "trailing_valid_before_risk": bool(trailing_armed_bar >= 0 and favorable_then_softened and (risk_cut_touched_bar < 0 or trailing_armed_bar < risk_cut_touched_bar)),
+                "same_candle_risk_and_trailing": bool(risk_cut_now and trailing_now),
                 "trailing_armed": bool(trailing_armed),
                 "trailing_pullback_pct": round(float(trailing_pullback_pct), 6),
                 "take_profit_touched": bool(take_profit_touched),
                 "take_profit_distance_pct": round(float(take_profit_distance_pct), 6),
                 "risk_cut_touched": bool(risk_cut_touched),
                 "risk_cut_distance_pct": round(float(risk_cut_distance_pct), 6),
+                "exit_close_position_in_candle_range": round(float(exit_close_position_in_candle_range), 6),
+                "peak_to_exit_velocity_pct_per_bar": round(float(peak_to_exit_velocity_pct_per_bar), 6),
+                "entry_to_trough_velocity_pct_per_bar": round(float(entry_to_trough_velocity_pct_per_bar), 6),
+                "last_3_bar_drawdown_pct": round(float(last_3_bar_drawdown_pct), 6),
+                "last_6_bar_drawdown_pct": round(float(last_6_bar_drawdown_pct), 6),
+                "reversal_from_peak_pct": round(float(reversal_from_peak_pct), 6),
+                "risk_breach_depth_pct": round(float(risk_breach_depth_pct), 6),
                 "exit_momentum_3": round(float(exit_momentum_3), 6),
                 "exit_momentum_6": round(float(exit_momentum_6), 6),
                 "favorable_then_softened_flag": bool(favorable_then_softened),
                 "label_rule_version": label_rule_version,
                 "exit_condition_priority_used": list(exit_condition_priority),
                 "same_candle_multi_exit_condition_count": int(same_candle_multi_exit_condition_count),
+                **preview_state,
+                **late_preview_state,
             }
         )
         rows.append(row)
@@ -402,6 +645,13 @@ def build_crypto_historical_strategy_replay(
     timeframe: str = "1hour",
     lookback_days: int = 90,
     max_symbols: int | None = None,
+    force_refresh: bool = False,
+    start_ts: int | None = None,
+    cutoff_ts: int | None = None,
+    symbols_lock_file: str = "",
+    freeze_symbols: bool = False,
+    freeze_cache: bool = False,
+    deterministic: bool = False,
 ) -> Dict[str, Any]:
     cfg = settings if isinstance(settings, dict) else {}
     main_neural_dir = _s(cfg.get("main_neural_dir", ""))
@@ -410,10 +660,32 @@ def build_crypto_historical_strategy_replay(
     cache_path = _cache_root(hub_dir)
     os.makedirs(cache_path, exist_ok=True)
     replay_symbols = [str(s) for s in list(symbols or []) if _s(s)] or _crypto_symbols(cfg, main_neural_dir, max_symbols=max_symbols)
+    lock_path = _s(symbols_lock_file) or os.path.join(hub_dir, "crypto", "historical_replay_cache", "symbols.lock.json")
+    if freeze_symbols and os.path.exists(lock_path):
+        try:
+            with open(lock_path, "r", encoding="utf-8") as f:
+                locked = json.load(f)
+            locked_symbols = [str(s) for s in list(locked.get("symbols", []) or []) if _s(s)]
+            if locked_symbols:
+                replay_symbols = locked_symbols
+        except Exception:
+            pass
     if max_symbols is not None and max_symbols > 0:
         replay_symbols = replay_symbols[: int(max_symbols)]
-    end_ts_ms = int(time.time() * 1000)
-    start_ts_ms = int(end_ts_ms - (max(7, int(lookback_days)) * 86400 * 1000))
+    if freeze_symbols and (not os.path.exists(lock_path)):
+        try:
+            os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+            with open(lock_path, "w", encoding="utf-8") as f:
+                json.dump({"symbols": list(replay_symbols)}, f, indent=2)
+        except Exception:
+            pass
+    derived_cutoff_ts = int(cutoff_ts) if cutoff_ts is not None else 0
+    if deterministic and freeze_cache and derived_cutoff_ts <= 0:
+        derived_cutoff_ts = _derive_cached_cutoff_ts(hub_dir, replay_symbols, timeframe)
+    if derived_cutoff_ts <= 0:
+        derived_cutoff_ts = int(time.time())
+    end_ts_ms = int(derived_cutoff_ts * 1000)
+    start_ts_ms = int((start_ts if start_ts is not None else int((end_ts_ms / 1000) - (max(7, int(lookback_days)) * 86400))) * 1000)
     thresholds = {
         "entry_signal_margin_min": 0.35,
         "entry_trend_score_min": 0.12,
@@ -442,14 +714,15 @@ def build_crypto_historical_strategy_replay(
         artifact_timeframes_used.extend(list(artifact_ctx.get("artifact_timeframes_used", []) or []))
         for reason in list(artifact_ctx.get("artifact_missing_reasons", []) or []):
             artifact_missing_reasons[_s(reason) or "unknown"] = int(artifact_missing_reasons.get(_s(reason) or "unknown", 0) + 1)
-        cached = _load_cached_candles(hub_dir, symbol, timeframe)
+        effective_force_refresh = bool(force_refresh and not freeze_cache)
+        cached = [] if effective_force_refresh else _load_cached_candles(hub_dir, symbol, timeframe)
         if cached:
             used_local_cache = True
             cache_rows_loaded += len(cached)
         final_candles = [row for row in cached if int(row[0]) >= start_ts_ms and int(row[0]) <= end_ts_ms]
         if len(final_candles) < 48:
             try:
-                fetched = _fetch_kucoin_candles(symbol, timeframe, start_ts_ms, end_ts_ms)
+                fetched = [] if freeze_cache else _fetch_kucoin_candles(symbol, timeframe, start_ts_ms, end_ts_ms)
                 if fetched:
                     used_remote_api = True
                     remote_rows_fetched += len(fetched)
@@ -471,7 +744,30 @@ def build_crypto_historical_strategy_replay(
             continue
         symbols_covered.append(symbol)
         rows.extend(trade_rows)
-    rows.sort(key=lambda r: (int(_f(r.get("entry_ts", 0.0), 0.0)), _s(r.get("symbol", ""))))
+    rows.sort(key=lambda r: (
+        int(_f(r.get("entry_ts", 0.0), 0.0)),
+        int(_f(r.get("exit_ts", 0.0), 0.0)),
+        _s(r.get("symbol", "")),
+        _s(r.get("actual_exit_trigger", "")),
+    ))
+    symbol_hash = hashlib.sha256("|".join(sorted(set(replay_symbols))).encode("utf-8")).hexdigest() if replay_symbols else ""
+    row_hash = hashlib.sha256(
+        json.dumps(
+            [
+                [
+                    _s(r.get("symbol", "")),
+                    int(_f(r.get("entry_ts", 0.0), 0.0)),
+                    int(_f(r.get("exit_ts", 0.0), 0.0)),
+                    round(_f(r.get("entry_price", 0.0), 0.0), 8),
+                    round(_f(r.get("exit_price", 0.0), 0.0), 8),
+                    _s(r.get("actual_exit_trigger", "")),
+                ]
+                for r in rows
+            ],
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
     diagnostics = {
         "replay_mutated_live_artifacts": False,
         "replay_cache_path": cache_path,
@@ -510,12 +806,36 @@ def build_crypto_historical_strategy_replay(
             "drawdown_from_peak_pct",
             "bars_since_peak",
             "bars_in_trade",
+            "trailing_armed_bar",
+            "risk_cut_touched_bar",
+            "take_profit_touched_bar",
+            "peak_bar",
+            "exit_bar",
+            "first_hard_exit_condition",
+            "first_hard_exit_bar",
+            "bars_from_entry_to_trailing_arm",
+            "bars_from_entry_to_risk_cut",
+            "bars_from_trailing_arm_to_risk_cut",
+            "bars_from_peak_to_exit",
+            "risk_cut_before_trailing",
+            "trailing_before_risk_cut",
+            "risk_cut_after_trailing_arm",
+            "risk_cut_after_peak",
+            "trailing_valid_before_risk",
+            "same_candle_risk_and_trailing",
             "trailing_armed",
             "trailing_pullback_pct",
             "take_profit_touched",
             "take_profit_distance_pct",
             "risk_cut_touched",
             "risk_cut_distance_pct",
+            "exit_close_position_in_candle_range",
+            "peak_to_exit_velocity_pct_per_bar",
+            "entry_to_trough_velocity_pct_per_bar",
+            "last_3_bar_drawdown_pct",
+            "last_6_bar_drawdown_pct",
+            "reversal_from_peak_pct",
+            "risk_breach_depth_pct",
             "exit_momentum_3",
             "exit_momentum_6",
             "favorable_then_softened_flag",
@@ -528,6 +848,15 @@ def build_crypto_historical_strategy_replay(
         },
         "rows_with_exit_shape_features": int(sum(1 for r in rows if "bars_in_trade" in r)),
         "rows_missing_exit_shape_features": int(sum(1 for r in rows if "bars_in_trade" not in r)),
+        "crypto_backfill_force_refresh": bool(force_refresh),
+        "crypto_replay_deterministic_mode_enabled": bool(deterministic),
+        "crypto_replay_eval_start_ts": int(start_ts_ms / 1000),
+        "crypto_replay_eval_cutoff_ts": int(end_ts_ms / 1000),
+        "crypto_replay_symbols_locked": bool(freeze_symbols),
+        "crypto_replay_symbol_list_hash": symbol_hash,
+        "crypto_replay_cache_frozen": bool(freeze_cache),
+        "crypto_replay_rows_hash": row_hash,
+        "crypto_replay_symbols_lock_file": lock_path,
     }
     state = "READY" if rows else "NO_DATA"
     return {"state": state, "rows": rows, "diagnostics": diagnostics, "skipped": skipped, "provider_cache_details": diagnostics}

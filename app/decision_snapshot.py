@@ -216,6 +216,16 @@ def attach_crypto_decision_snapshot(
     snapshot_id = _snapshot_id(ts, market, symbol, event, trigger)
     decision_type = _decision_type(payload)
     entry_features = payload.get("entry_features", {}) if isinstance(payload.get("entry_features", {}), dict) else {}
+    predicted_direction = _s(payload.get("predicted_direction", "")).lower()
+    if not predicted_direction:
+        selected_action = _s(payload.get("side", "")).lower()
+        predicted_direction = "up" if selected_action in {"buy", "long"} else ("down" if selected_action in {"sell", "short"} else "")
+    predicted_exit_trigger = _s(payload.get("predicted_exit_trigger", "")) or None
+    predicted_pnl_trend = _s(payload.get("predicted_pnl_trend", "")).lower() or (predicted_direction if predicted_direction in {"up", "down", "flat"} else None)
+    confidence = payload.get("predicted_confidence", payload.get("calib_prob", entry_features.get("calib_prob")))
+    selected_predictor = _s(payload.get("selected_predictor_name", payload.get("predictor_name", ""))) or "crypto_live_model"
+    predictor_variant = _s(payload.get("predictor_variant", "")) or "live"
+    source_used = _s(payload.get("source_used", "")) or "execution_log"
     snapshot = {
         "schema_version": 1,
         "decision_snapshot_id": snapshot_id,
@@ -224,6 +234,17 @@ def attach_crypto_decision_snapshot(
         "symbol": symbol,
         "decision_type": decision_type,
         "selected_action": "buy" if event == "entry" else "sell" if event == "exit" else event,
+        "selected_predictor": selected_predictor,
+        "predictor_variant": predictor_variant,
+        "source_used": source_used,
+        "predicted_direction": predicted_direction or None,
+        "predicted_exit_trigger": predicted_exit_trigger,
+        "predicted_pnl_trend": predicted_pnl_trend,
+        "confidence": _f(confidence, 0.0) if confidence is not None else None,
+        "direction_scores": payload.get("direction_scores") if isinstance(payload.get("direction_scores"), dict) else None,
+        "trigger_scores": payload.get("trigger_scores") if isinstance(payload.get("trigger_scores"), dict) else None,
+        "trade_quality_score": payload.get("trade_quality_score"),
+        "pnl_quality_score": payload.get("pnl_quality_score"),
         "raw_rule_reason": _s(payload.get("msg", "")) or _s(payload.get("tag", "")),
         "normalized_trigger": trigger,
         "stale_score": payload.get("stale_score"),

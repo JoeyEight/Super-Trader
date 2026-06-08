@@ -318,6 +318,10 @@ def _scan_diag_path(hub_dir: str) -> str:
     return os.path.join(hub_dir, "stocks", "scan_diagnostics.json")
 
 
+def _manual_watchlist_path(hub_dir: str) -> str:
+    return os.path.join(hub_dir, "stocks", "manual_watchlist.json")
+
+
 def _scan_pause_path(hub_dir: str) -> str:
     return os.path.join(hub_dir, "stocks", "scan_pause.json")
 
@@ -632,6 +636,30 @@ def _parse_watchlist(settings: Dict[str, Any]) -> List[str]:
         s = tok.strip().upper()
         if s and s not in out:
             out.append(s)
+    return out
+
+
+def _read_manual_watchlist_symbols(hub_dir: str) -> List[str]:
+    out: List[str] = []
+    try:
+        payload = _load_json_map(_manual_watchlist_path(hub_dir))
+    except Exception:
+        payload = {}
+    symbols_map = payload.get("symbols", {}) if isinstance(payload.get("symbols", {}), dict) else {}
+    for raw in list(symbols_map.keys()):
+        sym = str(raw or "").strip().upper()
+        if _symbol_is_scannable(sym) and sym not in out:
+            out.append(sym)
+    return out
+
+
+def _merge_priority_symbols(*symbol_lists: List[str]) -> List[str]:
+    out: List[str] = []
+    for group in list(symbol_lists or []):
+        for raw in list(group or []):
+            sym = str(raw or "").strip().upper()
+            if _symbol_is_scannable(sym) and sym not in out:
+                out.append(sym)
     return out
 
 
@@ -1586,6 +1614,11 @@ def _recent_priority_symbols(hub_dir: str) -> List[str]:
                 _add(row.get("symbol"))
     except Exception:
         pass
+    try:
+        for sym in _read_manual_watchlist_symbols(hub_dir):
+            _add(sym)
+    except Exception:
+        pass
     return out
 
 
@@ -1755,7 +1788,8 @@ def _select_twelvedata_scan_slice(
 
 def _select_universe(settings: Dict[str, Any], hub_dir: str, api_key: str, secret: str) -> List[str]:
     mode = str(settings.get("stock_universe_mode", "all_tradable_filtered") or "all_tradable_filtered").strip().lower()
-    watch = _parse_watchlist(settings)
+    manual_watch = _read_manual_watchlist_symbols(hub_dir)
+    watch = _merge_priority_symbols(_parse_watchlist(settings), manual_watch)
     if mode == "watchlist":
         return watch if watch else list(DEFAULT_STOCK_UNIVERSE)
     if mode == "core":
@@ -1817,6 +1851,37 @@ def _parse_feed_order(settings: Dict[str, Any]) -> List[str]:
     if not out:
         out = ["iex", "sip"]
     return out
+
+
+def _prioritized_all_scores_slice(scored: List[Dict[str, Any]], priority_symbols: List[str], limit: int = 40) -> List[Dict[str, Any]]:
+    rows = [dict(row) for row in list(scored or []) if isinstance(row, dict)]
+    cap = max(1, int(limit or 1))
+    if len(rows) <= cap:
+        return rows
+    priority_set = {
+        str(sym or "").strip().upper()
+        for sym in list(priority_symbols or [])
+        if _symbol_is_scannable(str(sym or "").strip().upper())
+    }
+    selected = list(rows[:cap])
+    selected_ids = {str((row or {}).get("symbol", "") or "").strip().upper() for row in selected}
+    replacement_idx = cap - 1
+    for row in rows[cap:]:
+        sym = str((row or {}).get("symbol", "") or "").strip().upper()
+        if (not sym) or (sym not in priority_set) or (sym in selected_ids):
+            continue
+        while replacement_idx >= 0:
+            cur_sym = str((selected[replacement_idx] or {}).get("symbol", "") or "").strip().upper()
+            if cur_sym not in priority_set:
+                selected_ids.discard(cur_sym)
+                selected[replacement_idx] = dict(row)
+                selected_ids.add(sym)
+                replacement_idx -= 1
+                break
+            replacement_idx -= 1
+        if replacement_idx < 0:
+            break
+    return selected
 
 
 def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
@@ -2038,7 +2103,8 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "market_clock": dict(clock_status),
         }
     open_position_symbols = _load_open_position_symbols(hub_dir)
-    priority_watch = _parse_watchlist(settings)[:16]
+    manual_watch = _read_manual_watchlist_symbols(hub_dir)
+    priority_watch = _merge_priority_symbols(_parse_watchlist(settings), manual_watch)[:16]
     max_scan = max(8, int(float(settings.get("stock_scan_max_symbols", 120) or 120)))
     if provider == "twelvedata":
         td_cap = max(1, int(float(settings.get("twelvedata_scan_symbol_cap", 8) or 8)))
@@ -3260,11 +3326,12 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         hints.append(
             f"Performance mode: skipped deep bar fallback on {int(symbol_fallback_skipped)} symbols this cycle."
         )
+    published_all_scores = _prioritized_all_scores_slice(scored, priority_watch, limit=40)
     opening_plan = _persist_opening_plan(
         settings,
         hub_dir,
         leaders=[dict(row) for row in leaders[:10] if isinstance(row, dict)],
-        all_scores=[dict(row) for row in scored[:40] if isinstance(row, dict)],
+        all_scores=[dict(row) for row in published_all_scores if isinstance(row, dict)],
         adaptive_threshold=float(adaptive_threshold),
         ts_now=ts_now,
         market_clock=clock_status,
@@ -3279,7 +3346,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "msg": msg,
         "universe": candidates,
         "leaders": leaders[:10],
-        "all_scores": scored[:40],
+        "all_scores": published_all_scores,
         "top_pick": top_pick,
         "top_chart": top_chart,
         "top_chart_map": top_chart_map,
