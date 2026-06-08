@@ -12,7 +12,13 @@ import app.crypto_historical_replay as crypto_historical_replay
 from app.crypto_artifacts import discover_crypto_trained_artifacts, load_crypto_artifact_features
 from app.crypto_historical_replay import build_crypto_historical_strategy_replay
 from app.model_quality_pass import (
+    _augment_historical_blind_rows,
+    _build_historical_blind_simulation,
+    _crypto_apply_second_stage_discriminator,
+    _crypto_blind_trigger_predict,
+    _historical_blind_diagnostics,
     _completed_live_decision_rows,
+    _verify_completed_live_synthetic_paths,
     _generate_stock_historical_replay_closed_trades,
     _normalize_stock_ticker,
     _prepare_forex_audit_rows,
@@ -48,6 +54,86 @@ class TestModelQualityPass(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as f:
             for row in rows:
                 f.write(json.dumps(row) + "\n")
+
+    def _crypto_trigger_train_rows(self) -> list[dict]:
+        return [
+            {
+                "symbol": "BTC-USD",
+                "regime": "high_volatility",
+                "actual_exit_trigger": "Risk Cut",
+                "actual_direction": "down",
+                "entry_price": 100.0,
+                "exit_price": 97.0,
+                "pnl_pct": -3.0,
+                "hold_hours": 6.0,
+                "current_candle_pct_move": 0.2,
+                "recent_return_3": 0.4,
+                "recent_return_6": 0.5,
+                "recent_return_12": 0.6,
+                "recent_return_24": 0.7,
+                "recent_volatility": 0.95,
+                "trend_momentum_score": 0.6,
+                "signal_margin": 0.12,
+                "active_timeframe_count": 3,
+            },
+            {
+                "symbol": "BTC-USD",
+                "regime": "high_volatility",
+                "actual_exit_trigger": "Take Profit",
+                "actual_direction": "up",
+                "entry_price": 100.0,
+                "exit_price": 104.0,
+                "pnl_pct": 4.0,
+                "hold_hours": 10.0,
+                "current_candle_pct_move": 0.9,
+                "recent_return_3": 2.0,
+                "recent_return_6": 2.2,
+                "recent_return_12": 2.4,
+                "recent_return_24": 2.6,
+                "recent_volatility": 0.42,
+                "trend_momentum_score": 2.0,
+                "signal_margin": 0.32,
+                "active_timeframe_count": 5,
+            },
+            {
+                "symbol": "BTC-USD",
+                "regime": "high_volatility",
+                "actual_exit_trigger": "Trailing",
+                "actual_direction": "up",
+                "entry_price": 100.0,
+                "exit_price": 103.0,
+                "pnl_pct": 3.0,
+                "hold_hours": 14.0,
+                "current_candle_pct_move": 1.3,
+                "recent_return_3": 2.4,
+                "recent_return_6": 2.8,
+                "recent_return_12": 3.2,
+                "recent_return_24": 3.5,
+                "recent_volatility": 0.72,
+                "trend_momentum_score": 2.7,
+                "signal_margin": 0.48,
+                "active_timeframe_count": 6,
+            },
+            {
+                "symbol": "BTC-USD",
+                "regime": "high_volatility",
+                "actual_exit_trigger": "Stale Alignment",
+                "actual_direction": "down",
+                "entry_price": 100.0,
+                "exit_price": 99.0,
+                "pnl_pct": -1.0,
+                "hold_hours": 18.0,
+                "current_candle_pct_move": 0.3,
+                "recent_return_3": 0.7,
+                "recent_return_6": 0.8,
+                "recent_return_12": 1.0,
+                "recent_return_24": 1.1,
+                "recent_volatility": 0.5,
+                "trend_momentum_score": 1.1,
+                "signal_margin": 0.18,
+                "active_timeframe_count": 4,
+            },
+        ] * 4
 
     def test_load_market_trade_events_infers_stock_qty_from_notional(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -2342,6 +2428,9 @@ class TestModelQualityPass(unittest.TestCase):
         self.assertIn("favorable_then_softened_flag", row)
         self.assertIn("label_rule_version", row)
         self.assertIn("exit_condition_priority_used", row)
+        self.assertIn("late_favorable_reversal_score", row)
+        self.assertIn("favorable_then_reversed", row)
+        self.assertIn("bars_from_peak_to_exit_preview", row)
         self.assertGreaterEqual(int(row.get("bars_in_trade", 0) or 0), 1)
         self.assertIn(row.get("actual_exit_trigger"), {"Trailing", "Stale Alignment", "Risk Cut", "Take Profit"})
 
@@ -2422,6 +2511,13 @@ class TestModelQualityPass(unittest.TestCase):
         risk_rows = [r for r in rows if r.get("actual_exit_trigger") == "Risk Cut"]
         self.assertTrue(risk_rows)
         self.assertTrue(bool(risk_rows[0].get("risk_cut_touched", False)))
+        self.assertIn("risk_cut_touched_so_far", risk_rows[0])
+        self.assertFalse(bool(risk_rows[0].get("risk_cut_touched_so_far", False)))
+        self.assertIn("max_favorable_excursion_pct_so_far", risk_rows[0])
+        self.assertLessEqual(
+            float(risk_rows[0].get("max_favorable_excursion_pct_so_far", 0.0) or 0.0),
+            float(risk_rows[0].get("max_favorable_excursion_pct", 0.0) or 0.0),
+        )
 
     def test_crypto_alignment_diagnostics_emitted(self) -> None:
         closed_rows = []
@@ -2873,7 +2969,11 @@ class TestModelQualityPass(unittest.TestCase):
                     "exit_ts": 200,
                     "entry_price": 100.0,
                     "exit_price": 104.0,
+                    "side": "buy",
+                    "qty": 1.0,
                     "hold_hours": 2.0,
+                    "pnl_usd": 4.0,
+                    "pnl_pct": 4.0,
                     "actual_exit_trigger": "Trailing",
                     "decision_snapshot_id": "snap-stock-1",
                     "entry_snapshot_selected_action": "buy",
@@ -2892,6 +2992,78 @@ class TestModelQualityPass(unittest.TestCase):
         self.assertEqual(rows[0].get("predicted_exit_trigger"), "Trailing")
         self.assertTrue(bool(rows[0].get("eligible_for_future_learning")))
         self.assertTrue(bool(diag.get("live_decision_source_available")))
+
+    def test_completed_live_decision_rows_builds_forex_row(self) -> None:
+        rows, diag = _completed_live_decision_rows(
+            market="forex",
+            events=[],
+            closed_rows=[
+                {
+                    "instrument": "EUR_USD",
+                    "symbol": "EUR_USD",
+                    "entry_ts": 100,
+                    "exit_ts": 200,
+                    "entry_price": 1.1000,
+                    "exit_price": 1.1020,
+                    "side": "long",
+                    "qty": 1000.0,
+                    "hold_hours": 2.0,
+                    "pnl_usd": 2.0,
+                    "pnl_pct": 0.1818,
+                    "actual_exit_trigger": "Trailing",
+                    "decision_snapshot_id": "snap-forex-1",
+                    "entry_snapshot_selected_action": "long",
+                    "entry_snapshot_predicted_direction": "up",
+                    "entry_snapshot_predicted_exit_trigger": "Trailing",
+                    "entry_snapshot_predicted_pnl_trend": "up",
+                    "entry_snapshot_predicted_confidence": 0.74,
+                    "entry_snapshot_selected_predictor": "local_market_model",
+                    "entry_snapshot_predictor_variant": "live",
+                }
+            ],
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].get("instrument"), "EUR_USD")
+        self.assertTrue(bool(rows[0].get("eligible_for_future_learning")))
+        self.assertEqual(int(diag.get("completed_live_eligible_rows_by_market", {}).get("forex", 0)), 1)
+
+    def test_completed_live_decision_rows_missing_prediction_fields_are_ineligible_without_crashing(self) -> None:
+        rows, diag = _completed_live_decision_rows(
+            market="stocks",
+            events=[],
+            closed_rows=[
+                {
+                    "symbol": "AAPL",
+                    "entry_ts": 100,
+                    "exit_ts": 200,
+                    "entry_price": 100.0,
+                    "exit_price": 99.0,
+                    "side": "buy",
+                    "qty": 1.0,
+                    "hold_hours": 1.0,
+                    "pnl_usd": -1.0,
+                    "pnl_pct": -1.0,
+                    "actual_exit_trigger": "Risk Cut",
+                }
+            ],
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(bool(rows[0].get("eligible_for_future_learning")))
+        self.assertIn("predicted_direction", list(rows[0].get("missing_fields", []) or []))
+        self.assertIn("decision_snapshot_id", list(rows[0].get("missing_fields", []) or []))
+        self.assertTrue(_s := str(rows[0].get("ineligible_reason", "")))
+        self.assertFalse(bool(diag.get("completed_live_eligible_rows_by_market", {}).get("stocks", 0)))
+
+    def test_synthetic_completed_live_paths_verify_all_markets(self) -> None:
+        diag = _verify_completed_live_synthetic_paths()
+        verified = diag.get("completed_live_synthetic_path_verified_by_market", {})
+        eligible = diag.get("completed_live_synthetic_eligible_by_market", {})
+        self.assertTrue(bool(verified.get("crypto")))
+        self.assertTrue(bool(verified.get("stocks")))
+        self.assertTrue(bool(verified.get("forex")))
+        self.assertTrue(bool(eligible.get("crypto")))
+        self.assertTrue(bool(eligible.get("stocks")))
+        self.assertTrue(bool(eligible.get("forex")))
 
     def test_completed_live_decision_rows_do_not_exist_before_close(self) -> None:
         rows, diag = _completed_live_decision_rows(
@@ -3732,6 +3904,657 @@ class TestModelQualityPass(unittest.TestCase):
     def _write_and_read(self, path: str) -> dict:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
+
+    def test_historical_blind_rows_use_only_prior_completed_mock_rows_for_predictions(self) -> None:
+        rows = [
+            {
+                "symbol": "MU",
+                "entry_ts": 100,
+                "exit_ts": 160,
+                "entry_price": 100.0,
+                "exit_price": 101.0,
+                "pnl_pct": 1.0,
+                "actual_direction": "up",
+                "actual_exit_trigger": "Trailing",
+                "bars_in_trade": 4,
+            },
+            {
+                "symbol": "MU",
+                "entry_ts": 200,
+                "exit_ts": 260,
+                "entry_price": 102.0,
+                "exit_price": 99.0,
+                "pnl_pct": -2.941176,
+                "actual_direction": "down",
+                "actual_exit_trigger": "Risk Cut",
+                "bars_in_trade": 5,
+            },
+        ]
+        history_sizes: list[int] = []
+
+        def _fake_predict(*, train_rows: list[dict], candidate: dict, regime: str, predictor_variant: str) -> dict:
+            history_sizes.append(len(train_rows))
+            return {
+                "predictor_variant": predictor_variant,
+                "predicted_direction": "down",
+                "predicted_exit_trigger": "Risk Cut",
+                "predicted_pnl_trend": "down",
+                "predicted_confidence": 0.81,
+                "direction_scores": {"down": 0.81},
+                "trigger_scores": {"Risk Cut": 0.81},
+            }
+
+        with mock.patch("app.model_quality_pass._stock_predict_one", side_effect=_fake_predict):
+            out = _augment_historical_blind_rows(rows, market="stocks", symbol_sources={"MU": "manual_watchlist"})
+
+        self.assertEqual(len(out), 2)
+        self.assertEqual(history_sizes, [1])
+        self.assertEqual(str(out[0].get("predicted_exit_trigger", "")), "Unknown")
+        self.assertEqual(str(out[1].get("predicted_exit_trigger", "")), "Risk Cut")
+        self.assertEqual(str(out[0].get("source_type", "")), "historical_blind_strategy_simulation")
+        self.assertTrue(str(out[0].get("replay_row_id", "")).endswith("historical_blind_strategy_simulation|stock_pnl_quality_v2_fallback"))
+        self.assertTrue(str(out[1].get("replay_row_id", "")).endswith("historical_blind_strategy_simulation|stock_pnl_quality_v2"))
+        self.assertEqual(str(out[0].get("actual_pnl_trend", "")), "up")
+        self.assertEqual(str(out[1].get("actual_pnl_trend", "")), "down")
+        self.assertTrue(bool(out[0].get("diagnostic_only", False)))
+        self.assertFalse(bool(out[0].get("eligible_for_training", True)))
+        self.assertEqual(str(out[0].get("training_eligibility_reason", "")), "prediction_semantics_placeholder_or_fallback")
+        self.assertEqual(str(out[1].get("prediction_semantics", "")), "heuristic")
+
+    def test_manual_and_scanner_stock_symbols_share_blind_onboarding_path(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            self._write_json(
+                os.path.join(td, "stocks", "manual_watchlist.json"),
+                {"symbols": {"MU": {"symbol": "MU", "added_by_user": True}}},
+            )
+            self._write_json(
+                os.path.join(td, "stocks", "stock_universe_cache.json"),
+                {"symbols": ["AAPL", "MU"]},
+            )
+            calls: list[tuple[str, str]] = []
+
+            def _fake_onboard(**kwargs: dict) -> dict:
+                calls.append((str(kwargs.get("symbol", "")), str(kwargs.get("symbol_source", ""))))
+                symbol = str(kwargs.get("symbol", ""))
+                source = str(kwargs.get("symbol_source", ""))
+                return {
+                    "symbol": symbol,
+                    "status": {
+                        "symbol": symbol,
+                        "symbol_source": source,
+                        "status": "learning_ready_not_trade_ready",
+                        "eligible_for_scan": True,
+                        "eligible_for_trade_consideration": False,
+                        "cooldown_until": 0,
+                        "blockers": ["market_rollout_not_ready"],
+                    },
+                    "summary": {},
+                    "trades": [],
+                    "decisions": [],
+                    "skips": [],
+                }
+
+            with mock.patch.dict(os.environ, {"HISTORICAL_BLIND_SIM_ENABLED": "1", "HISTORICAL_BLIND_SIM_MARKETS": "stocks", "HISTORICAL_BLIND_SIM_MAX_SYMBOLS": "4"}, clear=False):
+                with mock.patch("app.model_quality_pass._build_stock_symbol_onboarding", side_effect=_fake_onboard):
+                    report = _build_historical_blind_simulation(hub_dir=td, base_dir=td, settings={})
+
+            self.assertTrue(bool(report.get("enabled")))
+            self.assertIn(("MU", "manual_watchlist"), calls)
+            self.assertIn(("AAPL", "scanner_discovered"), calls)
+            self.assertTrue(os.path.exists(os.path.join(td, "stocks", "candidate_universe.json")))
+            self.assertTrue(os.path.exists(os.path.join(td, "stocks", "active_scan_set.json")))
+
+    def test_historical_blind_simulation_artifacts_stay_separate_from_completed_live_files(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            completed_live_path = os.path.join(td, "completed_live_decisions.jsonl")
+            with open(completed_live_path, "w", encoding="utf-8") as f:
+                f.write("{\"sentinel\":true}\n")
+
+            fake_crypto = {
+                "rows": [
+                    {
+                        "symbol": "BTC-USD",
+                        "entry_ts": 100,
+                        "exit_ts": 200,
+                        "entry_price": 100.0,
+                        "exit_price": 105.0,
+                        "pnl_pct": 5.0,
+                        "actual_direction": "up",
+                        "actual_exit_trigger": "Trailing",
+                    }
+                ],
+                "diagnostics": {
+                    "historical_strategy_replay_provider": "kucoin",
+                    "historical_strategy_replay_skipped_reasons": [],
+                },
+            }
+            with mock.patch.dict(os.environ, {"HISTORICAL_BLIND_SIM_ENABLED": "1", "HISTORICAL_BLIND_SIM_MARKETS": "crypto"}, clear=False):
+                with mock.patch("app.model_quality_pass.build_crypto_historical_strategy_replay", return_value=fake_crypto):
+                    report = _build_historical_blind_simulation(hub_dir=td, base_dir=td, settings={})
+
+            self.assertFalse(bool(report.get("historical_blind_simulation_used_as_primary")))
+            self.assertTrue(bool(report.get("historical_blind_simulation_used_as_supplemental")))
+            self.assertEqual(open(completed_live_path, "r", encoding="utf-8").read().strip(), "{\"sentinel\":true}")
+            self.assertTrue(os.path.exists(os.path.join(td, "crypto", "historical_blind_simulation_trades.jsonl")))
+            self.assertTrue(os.path.exists(os.path.join(td, "historical_blind_simulation_summary.json")))
+
+    def test_crypto_residual_mismatch_artifact_is_written(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            fake_crypto = {
+                "rows": [
+                    {
+                        "symbol": "BTC-USD",
+                        "entry_ts": 100,
+                        "exit_ts": 200,
+                        "entry_price": 100.0,
+                        "exit_price": 95.0,
+                        "pnl_pct": -5.0,
+                        "actual_direction": "down",
+                        "actual_exit_trigger": "Risk Cut",
+                        "current_candle_pct_move": 0.9,
+                        "recent_return_3": 2.2,
+                        "recent_return_6": 2.5,
+                        "recent_return_12": 2.8,
+                        "recent_return_24": 3.2,
+                        "recent_volatility": 0.72,
+                        "trend_momentum_score": 2.5,
+                        "signal_margin": 0.34,
+                        "active_timeframe_count": 6,
+                        "bars_since_entry": 6,
+                        "current_unrealized_pnl_pct": 1.8,
+                        "max_favorable_excursion_pct_so_far": 2.8,
+                        "max_adverse_excursion_pct_so_far": -0.7,
+                        "drawdown_from_peak_pct_so_far": -0.9,
+                        "trailing_armed_so_far": True,
+                        "bars_since_trailing_armed": 2,
+                        "risk_cut_distance_pct": 0.7,
+                        "take_profit_distance_pct": 0.9,
+                        "peak_to_current_reversal_pct": 0.9,
+                        "favorable_then_softened_flag_so_far": True,
+                    }
+                ],
+                "diagnostics": {
+                    "historical_strategy_replay_provider": "kucoin",
+                    "historical_strategy_replay_skipped_reasons": [],
+                },
+            }
+            with mock.patch.dict(os.environ, {"HISTORICAL_BLIND_SIM_ENABLED": "1", "HISTORICAL_BLIND_SIM_MARKETS": "crypto"}, clear=False):
+                with mock.patch("app.model_quality_pass.build_crypto_historical_strategy_replay", return_value=fake_crypto):
+                    _build_historical_blind_simulation(hub_dir=td, base_dir=td, settings={})
+            self.assertTrue(os.path.exists(os.path.join(td, "crypto", "blind_sim_residual_mismatches.jsonl")))
+            self.assertTrue(os.path.exists(os.path.join(td, "crypto", "blind_sim_residual_mismatch_summary.json")))
+
+    def test_historical_blind_diagnostics_emit_confusion_matrices_and_mismatch_buckets(self) -> None:
+        rows = [
+            {
+                "symbol": "BTC-USD",
+                "predicted_direction": "up",
+                "actual_direction": "down",
+                "predicted_exit_trigger": "Trailing",
+                "actual_exit_trigger": "Risk Cut",
+                "predicted_pnl_trend": "profit",
+                "actual_pnl_trend": "down",
+                "hold_time": 12.0,
+                "bars_in_trade": 6,
+                "recent_volatility": 1.2,
+                "drawdown_from_peak_pct": -2.2,
+                "confidence": 0.8,
+                "prediction_semantics": "heuristic",
+                "prediction_semantics_warning": "heuristic_only",
+                "prediction_semantics_placeholder_only": False,
+                "eligible_for_training": True,
+                "diagnostic_only": False,
+            },
+            {
+                "symbol": "ETH-USD",
+                "predicted_direction": "down",
+                "actual_direction": "down",
+                "predicted_exit_trigger": "Unknown",
+                "actual_exit_trigger": "Stale Alignment",
+                "predicted_pnl_trend": "negative",
+                "actual_pnl_trend": "loss",
+                "hold_time": 40.0,
+                "bars_in_trade": 20,
+                "recent_volatility": 0.4,
+                "drawdown_from_peak_pct": -0.4,
+                "confidence": 0.0,
+                "prediction_semantics": "heuristic",
+                "prediction_semantics_warning": "heuristic_only",
+                "prediction_semantics_placeholder_only": True,
+                "eligible_for_training": False,
+                "diagnostic_only": True,
+            },
+        ]
+        diag = _historical_blind_diagnostics(
+            market="crypto",
+            rows=rows,
+            status_by_symbol={"BTC-USD": {"blockers": ["poor_blind_sim_metrics"]}, "ETH-USD": {"blockers": ["existing_readiness_gate"]}},
+            active_rows=[{"symbol": "BTC-USD"}],
+            eligible_rows=[],
+            rejected_rows=[],
+        )
+        self.assertEqual(str(diag.get("prediction_semantics", "")), "heuristic")
+        self.assertIn("down", diag.get("actual_direction_counts", {}))
+        self.assertIn("Risk Cut", diag.get("actual_trigger_counts", {}))
+        self.assertIn("down", (diag.get("pnl_trend_confusion_matrix", {}).get("down", {}) if isinstance(diag.get("pnl_trend_confusion_matrix", {}).get("down", {}), dict) else {}))
+        self.assertTrue(bool(diag.get("top_mismatch_buckets", {}).get("symbol", {})))
+        self.assertEqual(int(diag.get("diagnostic_only_rows", 0) or 0), 1)
+        self.assertEqual(int(diag.get("eligible_for_training_rows", 0) or 0), 1)
+
+    def test_crypto_blind_trigger_scorer_can_choose_non_trailing_classes(self) -> None:
+        train_rows = self._crypto_trigger_train_rows()
+        risk_candidate = {
+            "symbol": "BTC-USD",
+            "entry_price": 100.0,
+            "regime": "high_volatility",
+            "current_candle_pct_move": 0.1,
+            "recent_return_3": 0.2,
+            "recent_return_6": 0.4,
+            "recent_return_12": 0.5,
+            "recent_return_24": 0.7,
+            "recent_volatility": 1.0,
+            "trend_momentum_score": 0.5,
+            "signal_margin": 0.10,
+            "active_timeframe_count": 3,
+            "bars_since_entry": 4,
+            "current_unrealized_pnl_pct": -1.4,
+            "max_favorable_excursion_pct_so_far": 0.4,
+            "max_adverse_excursion_pct_so_far": -2.0,
+            "drawdown_from_peak_pct_so_far": -1.4,
+            "risk_cut_distance_pct": 0.2,
+            "take_profit_distance_pct": 4.0,
+            "risk_cut_touched_so_far": True,
+            "peak_to_current_reversal_pct": 1.2,
+        }
+        tp_candidate = {
+            "symbol": "BTC-USD",
+            "entry_price": 100.0,
+            "regime": "high_volatility",
+            "current_candle_pct_move": 0.8,
+            "recent_return_3": 1.9,
+            "recent_return_6": 2.1,
+            "recent_return_12": 2.3,
+            "recent_return_24": 2.5,
+            "recent_volatility": 0.40,
+            "trend_momentum_score": 2.1,
+            "signal_margin": 0.30,
+            "active_timeframe_count": 5,
+            "bars_since_entry": 4,
+            "current_unrealized_pnl_pct": 2.8,
+            "max_favorable_excursion_pct_so_far": 4.0,
+            "max_adverse_excursion_pct_so_far": -0.2,
+            "drawdown_from_peak_pct_so_far": -0.3,
+            "take_profit_distance_pct": 0.1,
+            "risk_cut_distance_pct": 2.0,
+            "take_profit_touched_so_far": True,
+            "peak_to_current_reversal_pct": 0.3,
+        }
+        stale_candidate = {
+            "symbol": "BTC-USD",
+            "entry_price": 100.0,
+            "regime": "high_volatility",
+            "current_candle_pct_move": 0.2,
+            "recent_return_3": 0.6,
+            "recent_return_6": 0.7,
+            "recent_return_12": 0.9,
+            "recent_return_24": 1.0,
+            "recent_volatility": 0.48,
+            "trend_momentum_score": 1.0,
+            "signal_margin": 0.16,
+            "active_timeframe_count": 4,
+            "bars_since_entry": 8,
+            "current_unrealized_pnl_pct": 0.1,
+            "max_favorable_excursion_pct_so_far": 0.6,
+            "max_adverse_excursion_pct_so_far": -0.4,
+            "drawdown_from_peak_pct_so_far": -0.2,
+            "risk_cut_distance_pct": 1.8,
+            "take_profit_distance_pct": 3.8,
+            "peak_to_current_reversal_pct": 0.2,
+        }
+        trailing_candidate = {
+            "symbol": "BTC-USD",
+            "entry_price": 100.0,
+            "regime": "high_volatility",
+            "current_candle_pct_move": 1.4,
+            "recent_return_3": 2.5,
+            "recent_return_6": 2.9,
+            "recent_return_12": 3.3,
+            "recent_return_24": 3.7,
+            "recent_volatility": 0.78,
+            "trend_momentum_score": 2.9,
+            "signal_margin": 0.50,
+            "active_timeframe_count": 6,
+            "bars_since_entry": 5,
+            "current_unrealized_pnl_pct": 2.4,
+            "max_favorable_excursion_pct_so_far": 3.5,
+            "max_adverse_excursion_pct_so_far": -0.4,
+            "drawdown_from_peak_pct_so_far": -0.7,
+            "trailing_armed_so_far": True,
+            "bars_since_trailing_armed": 2,
+            "risk_cut_distance_pct": 2.0,
+            "take_profit_distance_pct": 1.6,
+            "peak_to_current_reversal_pct": 0.7,
+            "favorable_then_softened_flag_so_far": True,
+        }
+        self.assertEqual(str(_crypto_blind_trigger_predict(train_rows=train_rows, candidate=risk_candidate, regime="high_volatility").get("predicted_exit_trigger", "")), "Risk Cut")
+        self.assertEqual(str(_crypto_blind_trigger_predict(train_rows=train_rows, candidate=tp_candidate, regime="high_volatility").get("predicted_exit_trigger", "")), "Take Profit")
+        self.assertEqual(str(_crypto_blind_trigger_predict(train_rows=train_rows, candidate=stale_candidate, regime="high_volatility").get("predicted_exit_trigger", "")), "Stale Alignment")
+        self.assertEqual(str(_crypto_blind_trigger_predict(train_rows=train_rows, candidate=trailing_candidate, regime="high_volatility").get("predicted_exit_trigger", "")), "Trailing")
+
+    def test_crypto_second_stage_discriminator_can_restore_trailing_from_risk_cut(self) -> None:
+        pred = _crypto_blind_trigger_predict(
+            train_rows=self._crypto_trigger_train_rows(),
+            candidate={
+                "symbol": "BTC-USD",
+                "entry_price": 100.0,
+                "regime": "high_volatility",
+                "current_candle_pct_move": 0.9,
+                "recent_return_3": 2.2,
+                "recent_return_6": 2.5,
+                "recent_return_12": 2.8,
+                "recent_return_24": 3.2,
+                "recent_volatility": 0.72,
+                "trend_momentum_score": 2.5,
+                "signal_margin": 0.34,
+                "active_timeframe_count": 6,
+                "bars_since_entry": 6,
+                "current_unrealized_pnl_pct": 1.8,
+                "max_favorable_excursion_pct_so_far": 2.8,
+                "max_adverse_excursion_pct_so_far": -0.7,
+                "drawdown_from_peak_pct_so_far": -1.0,
+                "trailing_armed_so_far": True,
+                "bars_since_trailing_armed": 2,
+                "risk_cut_distance_pct": 0.55,
+                "take_profit_distance_pct": 0.9,
+                "peak_to_current_reversal_pct": 0.9,
+                "favorable_then_softened_flag_so_far": True,
+            },
+            regime="high_volatility",
+        )
+        self.assertEqual(str(pred.get("predicted_exit_trigger", "")), "Trailing")
+        self.assertTrue(bool(pred.get("second_stage_discriminator_applied", False)))
+        self.assertEqual(str(pred.get("second_stage_discriminator_to", "")), "Trailing")
+
+    def test_crypto_second_stage_discriminator_can_restore_stale_alignment_from_risk_cut(self) -> None:
+        pred = _crypto_blind_trigger_predict(
+            train_rows=self._crypto_trigger_train_rows(),
+            candidate={
+                "symbol": "BTC-USD",
+                "entry_price": 100.0,
+                "regime": "high_volatility",
+                "current_candle_pct_move": 0.1,
+                "recent_return_3": 0.6,
+                "recent_return_6": 0.8,
+                "recent_return_12": 1.1,
+                "recent_return_24": 1.0,
+                "recent_volatility": 0.5,
+                "trend_momentum_score": 1.0,
+                "signal_margin": 0.16,
+                "active_timeframe_count": 4,
+                "bars_since_entry": 10,
+                "current_unrealized_pnl_pct": 0.0,
+                "max_favorable_excursion_pct_so_far": 0.7,
+                "max_adverse_excursion_pct_so_far": -1.2,
+                "drawdown_from_peak_pct_so_far": -0.3,
+                "risk_cut_distance_pct": 0.1,
+                "take_profit_distance_pct": 3.7,
+                "peak_to_current_reversal_pct": 0.2,
+                "momentum_decay": 1.2,
+            },
+            regime="high_volatility",
+        )
+        self.assertEqual(str(pred.get("predicted_exit_trigger", "")), "Stale Alignment")
+        self.assertTrue(bool(pred.get("second_stage_discriminator_applied", False)))
+
+    def test_crypto_second_stage_discriminator_can_restore_take_profit_from_risk_cut(self) -> None:
+        decision = _crypto_apply_second_stage_discriminator(
+            {
+                "pred_trigger": "Risk Cut",
+                "trigger_scores": {"Risk Cut": 4.6, "Take Profit": 3.4, "Trailing": 1.2, "Stale Alignment": 0.2},
+                "selected_margin": 1.2,
+                "risk_pressure_score": 3.2,
+                "take_profit_pressure_score": 4.4,
+                "trailing_quality_score": 1.5,
+                "stale_alignment_score": 0.3,
+                "bars_since_entry": 5,
+                "max_favorable_excursion_pct_so_far": 3.8,
+                "max_adverse_excursion_pct_so_far": -1.0,
+                "drawdown_from_peak_pct_so_far": -0.5,
+                "trailing_armed": False,
+                "bars_since_trailing_armed": -1,
+                "risk_cut_distance_pct": 0.6,
+                "take_profit_distance_pct": 0.2,
+                "risk_cut_touched_so_far": False,
+                "take_profit_touched_so_far": True,
+                "peak_to_current_reversal_pct": 0.3,
+                "favorable_then_softened_flag_so_far": False,
+                "momentum_decay": 0.6,
+                "margin_context": "unit-test",
+            }
+        )
+        self.assertEqual(str(decision.get("pred_trigger", "")), "Take Profit")
+        self.assertTrue(bool(decision.get("second_stage_discriminator_applied", False)))
+        self.assertEqual(str(decision.get("second_stage_discriminator_to", "")), "Take Profit")
+        self.assertEqual(str(decision.get("second_stage_discriminator_reason", "")), "target_before_reversal_restored_take_profit")
+
+    def test_crypto_second_stage_discriminator_does_not_override_high_margin_risk_cut(self) -> None:
+        pred = _crypto_blind_trigger_predict(
+            train_rows=self._crypto_trigger_train_rows(),
+            candidate={
+                "symbol": "BTC-USD",
+                "entry_price": 100.0,
+                "regime": "high_volatility",
+                "current_candle_pct_move": -0.4,
+                "recent_return_3": 0.1,
+                "recent_return_6": 0.2,
+                "recent_return_12": 0.2,
+                "recent_return_24": 0.4,
+                "recent_volatility": 1.1,
+                "trend_momentum_score": 0.4,
+                "signal_margin": 0.05,
+                "active_timeframe_count": 3,
+                "bars_since_entry": 4,
+                "current_unrealized_pnl_pct": -2.2,
+                "max_favorable_excursion_pct_so_far": 0.1,
+                "max_adverse_excursion_pct_so_far": -2.6,
+                "drawdown_from_peak_pct_so_far": -2.0,
+                "risk_cut_distance_pct": 0.05,
+                "risk_cut_touched_so_far": True,
+                "peak_to_current_reversal_pct": 1.3,
+            },
+            regime="high_volatility",
+        )
+        self.assertEqual(str(pred.get("predicted_exit_trigger", "")), "Risk Cut")
+        self.assertFalse(bool(pred.get("second_stage_discriminator_applied", False)))
+
+    def test_crypto_blind_diagnostic_only_rows_use_reason_counts(self) -> None:
+        rows = [
+            {
+                "symbol": "BTC-USD",
+                "predicted_direction": "up",
+                "actual_direction": "down",
+                "predicted_exit_trigger": "Unknown",
+                "actual_exit_trigger": "Risk Cut",
+                "predicted_pnl_trend": "up",
+                "actual_pnl_trend": "down",
+                "confidence": 0.0,
+                "diagnostic_only": True,
+                "eligible_for_training": False,
+                "training_eligibility_reason": "prediction_semantics_placeholder_or_fallback",
+            },
+            {
+                "symbol": "ETH-USD",
+                "predicted_direction": "up",
+                "actual_direction": "up",
+                "predicted_exit_trigger": "Trailing",
+                "actual_exit_trigger": "Trailing",
+                "predicted_pnl_trend": "up",
+                "actual_pnl_trend": "up",
+                "confidence": 0.2,
+                "trigger_score_selected_margin": 0.05,
+                "diagnostic_only": True,
+                "eligible_for_training": False,
+                "training_eligibility_reason": "trigger_margin_below_diagnostic_floor",
+            },
+        ]
+        diag = _historical_blind_diagnostics(
+            market="crypto",
+            rows=rows,
+            status_by_symbol={},
+            active_rows=[],
+            eligible_rows=[],
+            rejected_rows=[],
+        )
+        self.assertEqual(int((diag.get("diagnostic_only_reason_counts", {}) or {}).get("prediction_semantics_placeholder_or_fallback", 0)), 1)
+        self.assertEqual(int((diag.get("diagnostic_only_reason_counts", {}) or {}).get("trigger_margin_below_diagnostic_floor", 0)), 1)
+
+    def test_crypto_blind_row_augmentation_preserves_trigger_score_fields(self) -> None:
+        rows = [
+            {
+                "symbol": "BTC-USD",
+                "entry_ts": 100,
+                "exit_ts": 200,
+                "entry_price": 100.0,
+                "exit_price": 104.0,
+                "pnl_pct": 4.0,
+                "actual_direction": "up",
+                "actual_exit_trigger": "Trailing",
+                "current_candle_pct_move": 1.1,
+                "recent_return_3": 1.8,
+                "recent_return_6": 2.2,
+                "recent_return_12": 2.8,
+                "recent_return_24": 3.0,
+                "recent_volatility": 0.7,
+                "trend_momentum_score": 2.4,
+                "signal_margin": 0.42,
+                "active_timeframe_count": 5,
+            },
+            {
+                "symbol": "ETH-USD",
+                "entry_ts": 300,
+                "exit_ts": 420,
+                "entry_price": 100.0,
+                "exit_price": 96.0,
+                "pnl_pct": -4.0,
+                "actual_direction": "down",
+                "actual_exit_trigger": "Risk Cut",
+                "current_candle_pct_move": -0.6,
+                "recent_return_3": -0.4,
+                "recent_return_6": 0.2,
+                "recent_return_12": 0.3,
+                "recent_return_24": 0.5,
+                "recent_volatility": 0.9,
+                "trend_momentum_score": 0.6,
+                "signal_margin": 0.08,
+                "active_timeframe_count": 3,
+            },
+        ]
+        augmented = _augment_historical_blind_rows(
+            rows,
+            market="crypto",
+            symbol_sources={"BTC-USD": "configured_universe", "ETH-USD": "configured_universe"},
+            crypto_trigger_mode="improved",
+        )
+        scored = next((r for r in augmented if str(r.get("symbol", "")) == "ETH-USD"), {})
+        self.assertTrue(str(scored.get("predictor_variant", "")).startswith("blind_sequence_trigger_scorer"))
+        self.assertIn("trigger_score_selected_margin", scored)
+        self.assertGreaterEqual(float(scored.get("trigger_score_selected_margin", 0.0) or 0.0), 0.0)
+        self.assertTrue(bool(str(scored.get("trigger_score_reason", ""))))
+        self.assertEqual(str(scored.get("source_feature_availability", "")), "entry_features_only")
+
+    def test_stock_blind_sim_summary_reports_nonzero_pnl_trend_metrics_after_label_fix(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            onboarding_payloads = {
+                "MU": {
+                    "symbol": "MU",
+                    "status": {
+                        "symbol": "MU",
+                        "symbol_source": "manual_watchlist",
+                        "status": "learning_ready_not_trade_ready",
+                        "eligible_for_scan": True,
+                        "eligible_for_trade_consideration": False,
+                        "eligible_for_training": True,
+                        "blockers": ["market_rollout_not_ready"],
+                        "cooldown_until": 0,
+                    },
+                    "summary": {},
+                    "trades": [
+                        {
+                            "symbol": "MU",
+                            "entry_ts": 100,
+                            "exit_ts": 120,
+                            "entry_price": 10.0,
+                            "exit_price": 11.0,
+                            "pnl_usd": 1.0,
+                            "predicted_direction": "up",
+                            "actual_direction": "up",
+                            "predicted_exit_trigger": "Trailing",
+                            "actual_exit_trigger": "Trailing",
+                            "predicted_pnl_trend": "profit",
+                            "confidence": 0.7,
+                            "prediction_semantics": "heuristic",
+                            "prediction_semantics_warning": "heuristic_only",
+                            "eligible_for_training": True,
+                            "diagnostic_only": False,
+                            "training_eligibility_reason": "eligible",
+                        },
+                        {
+                            "symbol": "MU",
+                            "entry_ts": 200,
+                            "exit_ts": 220,
+                            "entry_price": 10.0,
+                            "exit_price": 9.0,
+                            "pnl_usd": -1.0,
+                            "predicted_direction": "down",
+                            "actual_direction": "down",
+                            "predicted_exit_trigger": "Stale Alignment",
+                            "actual_exit_trigger": "Stale Alignment",
+                            "predicted_pnl_trend": "negative",
+                            "confidence": 0.8,
+                            "prediction_semantics": "heuristic",
+                            "prediction_semantics_warning": "heuristic_only",
+                            "eligible_for_training": True,
+                            "diagnostic_only": False,
+                            "training_eligibility_reason": "eligible",
+                        },
+                        {
+                            "symbol": "MU",
+                            "entry_ts": 300,
+                            "exit_ts": 320,
+                            "entry_price": 10.0,
+                            "exit_price": 11.5,
+                            "pnl_usd": 1.5,
+                            "predicted_direction": "up",
+                            "actual_direction": "up",
+                            "predicted_exit_trigger": "Trailing",
+                            "actual_exit_trigger": "Trailing",
+                            "predicted_pnl_trend": "positive",
+                            "confidence": 0.82,
+                            "prediction_semantics": "heuristic",
+                            "prediction_semantics_warning": "heuristic_only",
+                            "eligible_for_training": True,
+                            "diagnostic_only": False,
+                            "training_eligibility_reason": "eligible",
+                        },
+                    ],
+                    "decisions": [],
+                    "skips": [],
+                }
+            }
+
+            def _fake_onboard(**kwargs: dict) -> dict:
+                return onboarding_payloads[str(kwargs.get("symbol", ""))]
+
+            with mock.patch.dict(os.environ, {"HISTORICAL_BLIND_SIM_ENABLED": "1", "HISTORICAL_BLIND_SIM_MARKETS": "stocks", "HISTORICAL_BLIND_SIM_MAX_SYMBOLS": "1"}, clear=False):
+                with mock.patch("app.model_quality_pass._collect_stock_blind_sim_candidates", return_value=(["MU"], {"MU": "manual_watchlist"})):
+                    with mock.patch("app.model_quality_pass._build_stock_symbol_onboarding", side_effect=_fake_onboard):
+                        report = _build_historical_blind_simulation(hub_dir=td, base_dir=td, settings={})
+            summary = (((report.get("markets", {}) or {}).get("stocks", {}) or {}).get("summary", {}) or {})
+            self.assertIn("up", summary.get("predicted_pnl_trend_counts", {}))
+            self.assertIn("down", summary.get("actual_pnl_trend_counts", {}))
+            self.assertEqual(int((summary.get("pnl_trend_confusion_matrix", {}).get("up", {}) if isinstance(summary.get("pnl_trend_confusion_matrix", {}).get("up", {}), dict) else {}).get("up", 0)), 2)
+            self.assertEqual(int((summary.get("pnl_trend_confusion_matrix", {}).get("down", {}) if isinstance(summary.get("pnl_trend_confusion_matrix", {}).get("down", {}), dict) else {}).get("down", 0)), 1)
+            self.assertEqual(str(summary.get("label_alignment_status", "")), "aligned")
 
 
 if __name__ == "__main__":

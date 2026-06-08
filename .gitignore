@@ -13,6 +13,10 @@ venv/
 .vscode/
 
 # Runtime artifacts
+hub_data/
+forex/
+references/
+gui_settings.json
 hub_data/logs/
 hub_data/cache/
 hub_data/history_cache/

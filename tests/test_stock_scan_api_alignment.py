@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import json
+import os
 import tempfile
 import unittest
 import urllib.error
@@ -34,6 +36,9 @@ class _UniverseClient:
 class TestStockScanApiAlignment(unittest.TestCase):
     def test_all_tradable_universe_filters_non_scannable_symbols(self) -> None:
         with tempfile.TemporaryDirectory() as td:
+            os.makedirs(os.path.join(td, "stocks"), exist_ok=True)
+            with open(os.path.join(td, "stocks", "manual_watchlist.json"), "w", encoding="utf-8") as fh:
+                json.dump({"symbols": {"MU": {"source": "manual"}}}, fh)
             settings = {
                 "market_rollout_stage": "scan_expanded",
                 "stock_universe_mode": "all_tradable_filtered",
@@ -44,7 +49,7 @@ class TestStockScanApiAlignment(unittest.TestCase):
             with patch.object(stock_thinker, "AlpacaBrokerClient", _UniverseClient):
                 out = stock_thinker._select_universe(settings, td, api_key="k", secret="s")
             # Watchlist symbol should be kept at front, then liquid scannable symbols.
-            self.assertEqual(out[:4], ["MSFT", "QQQ", "AAPL", "TSLA"])
+            self.assertEqual(out[:5], ["MSFT", "MU", "QQQ", "AAPL", "TSLA"])
             self.assertNotIn("BRK.B", out)
             self.assertNotIn("KMTUY", out)
             self.assertNotIn("ABCD1", out)

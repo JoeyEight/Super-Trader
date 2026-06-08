@@ -617,6 +617,57 @@ class TestStockThinkerFallback(unittest.TestCase):
             symbols = {str((row or {}).get("symbol", "")).upper() for row in list(out.get("all_scores", []) or [])}
             self.assertIn("QQQ", symbols)
 
+    def test_manual_watchlist_symbol_survives_published_all_scores_trim(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            stocks_dir = os.path.join(td, "stocks")
+            os.makedirs(stocks_dir, exist_ok=True)
+            with open(os.path.join(stocks_dir, "manual_watchlist.json"), "w", encoding="utf-8") as f:
+                json.dump({"symbols": {"MU": {"source": "manual"}}}, f)
+
+            settings = {
+                "alpaca_api_key_id": "abc",
+                "alpaca_secret_key": "xyz",
+                "stock_scan_max_symbols": 80,
+                "market_rollout_stage": "scan_expanded",
+            }
+            symbols = [f"A{chr(65 + (i // 26))}{chr(65 + (i % 26))}" for i in range(45)]
+            if "MU" not in symbols:
+                symbols.append("MU")
+
+            score_map = {sym: 10.0 - idx for idx, sym in enumerate(symbols)}
+            score_map["MU"] = -100.0
+
+            def _score(symbol: str, bars: list[dict], spread_bps: float = 0.0) -> dict:
+                return {
+                    "symbol": str(symbol).upper(),
+                    "score": float(score_map.get(str(symbol).upper(), 0.0)),
+                    "side": "long",
+                    "last": 100.0,
+                    "change_6h_pct": 0.5,
+                    "change_24h_pct": 1.0,
+                    "volatility_pct": 0.4,
+                    "spread_bps": float(spread_bps),
+                    "confidence": "MED",
+                    "reason": "test",
+                }
+
+            bars_map = {sym: [_mk_bar(i, 100.0 + (i * 0.1)) for i in range(48)] for sym in symbols}
+
+            with (
+                patch.object(stock_thinker, "get_alpaca_creds", return_value=("abc", "xyz")),
+                patch.object(stock_thinker, "AlpacaBrokerClient", _FakeAlpacaClient),
+                patch.object(stock_thinker, "_select_universe", return_value=symbols),
+                patch.object(stock_thinker, "_market_open_now", return_value=True),
+                patch.object(stock_thinker, "_score_bars", side_effect=_score),
+                patch.object(stock_thinker, "_apply_stock_mtf_confirmation", return_value=None),
+                patch.object(stock_thinker, "_fetch_bars_for_symbols", return_value=bars_map),
+            ):
+                out = stock_thinker.run_scan(settings, td)
+
+            published = [str((row or {}).get("symbol", "")).upper() for row in list(out.get("all_scores", []) or []) if isinstance(row, dict)]
+            self.assertIn("MU", published)
+            self.assertLessEqual(len(published), 40)
+
     def test_open_session_symbol_fallback_uses_time_bounded_intraday_window(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             os.makedirs(os.path.join(td, "stocks"), exist_ok=True)
