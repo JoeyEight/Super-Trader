@@ -68,6 +68,8 @@ def main() -> int:
     console: Dict[str, Any] = {
         "status": "ok",
         "output": out,
+        "performance_diagnostics_path": str(payload.get("performance_diagnostics_path", "")) if isinstance(payload, dict) else "",
+        "runtime_seconds": round(_f((payload.get("performance_diagnostics", {}) if isinstance(payload.get("performance_diagnostics", {}), dict) else {}).get("runtime_seconds", 0.0), 0.0), 4),
         "crypto": {
             "state": str(crypto_ready.get("state", "")),
             "directional_accuracy_pct": round(_f(c_metrics.get("directional_accuracy_pct", 0.0), 0.0), 4),

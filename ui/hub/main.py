@@ -19778,11 +19778,15 @@ class PowerTraderHub(tk.Tk):
     def _read_jsonl_tail_rows(self, path: str, limit: int = 300) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         try:
+            tail: deque[str] = deque(maxlen=max(1, int(limit)))
             with open(path, "r", encoding="utf-8") as f:
-                lines = [ln.strip() for ln in f if ln.strip()]
+                for ln in f:
+                    txt = ln.strip()
+                    if txt:
+                        tail.append(txt)
         except Exception:
             return rows
-        for ln in lines[-max(1, int(limit)):]:
+        for ln in list(tail):
             try:
                 row = fast_json_loads(ln, default=None)
             except Exception:

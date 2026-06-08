@@ -4,13 +4,21 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 from typing import List
 
 
 def _run(cmd: List[str], cwd: str) -> int:
     print(f"[quality] {' '.join(cmd)}")
-    proc = subprocess.run(cmd, cwd=cwd, check=False)
-    return int(proc.returncode)
+    timeout_s = max(30, int(float(os.environ.get("QUALITY_SUITE_STEP_TIMEOUT_S", 1800) or 1800)))
+    started = time.time()
+    try:
+        proc = subprocess.run(cmd, cwd=cwd, check=False, timeout=timeout_s)
+        print(f"[quality] step_seconds={time.time() - started:.2f}")
+        return int(proc.returncode)
+    except subprocess.TimeoutExpired:
+        print(f"[quality] step_timeout after {timeout_s}s")
+        return 124
 
 
 def main() -> int:

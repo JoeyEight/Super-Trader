@@ -20,7 +20,10 @@ from app.model_quality_pass import (
     _crypto_blind_trigger_predict,
     _crypto_trigger_classifier_dataset_rows,
     _historical_blind_diagnostics,
+    _performance_diagnostics_path,
+    _safe_read_jsonl,
     _split_walkforward_rows,
+    _write_jsonl,
     _completed_live_decision_rows,
     _verify_completed_live_synthetic_paths,
     _generate_stock_historical_replay_closed_trades,
@@ -4771,6 +4774,65 @@ class TestModelQualityPass(unittest.TestCase):
             self.assertEqual(str(payload.get("env_flag", "")), "MODEL_QUALITY_USE_CRYPTO_TRIGGER_CLASSIFIER")
             self.assertEqual(list(payload.get("original_model_responsibility", [])), ["direction", "bounds", "confidence"])
 
+    def test_safe_read_jsonl_respects_performance_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "rows.jsonl")
+            self._write_jsonl(path, [{"idx": i} for i in range(6)])
+            diag: dict = {}
+            with mock.patch.dict(os.environ, {"MODEL_QUALITY_MAX_JSONL_ROWS_READ": "3"}, clear=False):
+                rows = _safe_read_jsonl(path, max_lines=10, diag=diag)
+            self.assertEqual(len(rows), 3)
+            self.assertTrue(bool(diag.get("truncated", False)))
+            self.assertEqual(int(diag.get("effective_limit", 0)), 3)
+
+    def test_write_jsonl_caps_residual_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "blind_sim_residual_mismatches.jsonl")
+            diag: dict = {}
+            with mock.patch.dict(os.environ, {"MODEL_QUALITY_MAX_RESIDUAL_ROWS_WRITTEN": "2"}, clear=False):
+                _write_jsonl(path, [{"idx": i} for i in range(5)], diag=diag)
+            written = _safe_read_jsonl(path, max_lines=10)
+            self.assertEqual(len(written), 2)
+            self.assertTrue(bool(diag.get("truncated", False)))
+            self.assertEqual(int(diag.get("rows_written", 0)), 2)
+
+    def test_crypto_trigger_classifier_dataset_cap_is_reported(self) -> None:
+        rows = []
+        for idx in range(12):
+            rows.append(
+                {
+                    "symbol": "BTC-USD",
+                    "entry_ts": 100 + idx,
+                    "exit_ts": 200 + idx,
+                    "replay_row_id": f"row-{idx}",
+                    "actual_exit_trigger": "Risk Cut" if idx % 2 == 0 else "Trailing",
+                    "predicted_exit_trigger": "Trailing",
+                    "future_leakage_detected": False,
+                    "prediction_semantics_placeholder_only": False,
+                    "original_confidence": 0.66,
+                    "bars_since_entry": 4,
+                    "bars_in_trade": 4,
+                    "current_unrealized_pnl_pct": -1.2,
+                    "recent_return_3": 0.4,
+                    "recent_return_6": 0.5,
+                    "recent_return_12": 0.6,
+                    "recent_return_24": 0.7,
+                    "recent_volatility": 0.8,
+                    "trend_momentum_score": 0.9,
+                    "signal_margin": 0.1,
+                    "hold_hours": 6.0,
+                    "original_predicted_direction": "down",
+                    "original_signal_side": "short",
+                }
+            )
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"MODEL_QUALITY_MAX_CLASSIFIER_DATASET_ROWS": "5"}, clear=False):
+                result = _build_crypto_trigger_classifier_candidate(td, rows)
+            dataset_payload = json.load(open(result["dataset_path"], "r", encoding="utf-8"))
+            self.assertEqual(int(dataset_payload.get("rows", 0)), 5)
+            self.assertEqual(int(dataset_payload.get("attempted_rows", 0)), 12)
+            self.assertTrue(bool(dataset_payload.get("dataset_rows_truncated", False)))
+
     def test_historical_blind_simulation_crypto_summary_keeps_classifier_candidate_only(self) -> None:
         fake_crypto = {
             "rows": _augment_historical_blind_rows(
@@ -4790,6 +4852,42 @@ class TestModelQualityPass(unittest.TestCase):
         self.assertFalse(bool(crypto_summary.get("crypto_trigger_classifier_live_enabled", True)))
         self.assertEqual(str(crypto_summary.get("crypto_trigger_classifier_effect_on_primary_source", "")), "none_candidate_only")
         self.assertFalse(bool(report.get("historical_blind_simulation_used_as_primary", True)))
+
+    def test_run_model_quality_full_pass_emits_performance_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            self._write_jsonl(
+                os.path.join(td, "trade_history.jsonl"),
+                [
+                    {
+                        "market": "crypto",
+                        "symbol": "BTC-USD",
+                        "entry_ts": 100,
+                        "exit_ts": 200,
+                        "entry_price": 100.0,
+                        "exit_price": 104.0,
+                        "pnl_pct": 4.0,
+                        "actual_direction": "up",
+                        "actual_exit_trigger": "Take Profit",
+                        "actual_pnl_trend": "up",
+                    }
+                ],
+            )
+            with mock.patch("app.model_quality_pass.build_synthetic_replay_artifact", return_value={"meta": {}, "replay_source_diagnostics": {}, "crypto_classifier_diagnostics": {}}):
+                with mock.patch("app.model_quality_pass.build_replay_diagnostics", return_value={"state": "READY", "source": "", "headline_metrics": {}}):
+                    with mock.patch("app.model_quality_pass.build_all_market_regimes", return_value={}):
+                        with mock.patch("app.model_quality_pass.build_walkforward_report", return_value={}):
+                            with mock.patch("app.model_quality_pass.build_confidence_calibration_payload", return_value={}):
+                                with mock.patch("app.model_quality_pass.build_shadow_scorecards", return_value={}):
+                                    with mock.patch("app.model_quality_pass.build_legacy_trade_model_replay", return_value={"legacy_rows_replayed": 0}):
+                                        with mock.patch("app.model_quality_pass._build_market_readiness_artifact", return_value={}):
+                                            payload = run_model_quality_full_pass(base_dir=td, hub_dir=td, settings={})
+            perf_path = _performance_diagnostics_path(td)
+            self.assertEqual(str(payload.get("performance_diagnostics_path", "")), perf_path)
+            self.assertTrue(os.path.exists(perf_path))
+            perf = json.load(open(perf_path, "r", encoding="utf-8"))
+            self.assertIn("runtime_seconds_by_major_step", perf)
+            self.assertIn("rows_read_by_source", perf)
+            self.assertTrue(bool(perf.get("blind_sim_supplemental_only", False)))
 
     def test_stock_blind_sim_summary_reports_nonzero_pnl_trend_metrics_after_label_fix(self) -> None:
         with tempfile.TemporaryDirectory() as td:

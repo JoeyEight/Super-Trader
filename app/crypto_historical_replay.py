@@ -25,6 +25,22 @@ TIMEFRAME_MINUTES = {
 }
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(float(os.environ.get(name, default)))
+    except Exception:
+        return int(default)
+
+
+def _performance_limits() -> Dict[str, int]:
+    return {
+        "max_symbols_per_replay": max(1, _env_int("MODEL_QUALITY_MAX_SYMBOLS_PER_REPLAY", 50)),
+        "max_lookback_days": max(30, _env_int("MODEL_QUALITY_MAX_LOOKBACK_DAYS", 365)),
+        "max_network_retry_attempts": max(1, _env_int("MODEL_QUALITY_MAX_NETWORK_RETRY_ATTEMPTS", 2)),
+        "max_cached_candle_rows": max(200, _env_int("MODEL_QUALITY_MAX_CACHED_CANDLE_ROWS", 30000)),
+    }
+
+
 def _s(value: Any) -> str:
     if value is None:
         return ""
@@ -62,7 +78,9 @@ def _safe_read_json_rows(path: str) -> List[Any]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             payload = json.load(f)
-        return payload if isinstance(payload, list) else []
+        if not isinstance(payload, list):
+            return []
+        return payload[-int(_performance_limits()["max_cached_candle_rows"]):]
     except Exception:
         return []
 
@@ -186,12 +204,24 @@ def _fetch_kucoin_candles(symbol: str, timeframe: str, start_ts_ms: int, end_ts_
     out: List[List[float]] = []
     cursor_end = int(end_ts_ms / 1000)
     start_s = int(start_ts_ms / 1000)
+    max_retries = int(_performance_limits()["max_network_retry_attempts"])
     while cursor_end >= start_s:
         cursor_start = max(start_s, cursor_end - (1500 * interval_s))
         params = {"symbol": pair, "type": timeframe, "startAt": cursor_start, "endAt": cursor_end}
-        resp = session.get("https://api.kucoin.com/api/v1/market/candles", params=params, timeout=12)
-        resp.raise_for_status()
-        payload = resp.json() if resp.content else {}
+        payload: Dict[str, Any] = {}
+        last_exc: Exception | None = None
+        for _attempt in range(max_retries):
+            try:
+                resp = session.get("https://api.kucoin.com/api/v1/market/candles", params=params, timeout=12)
+                resp.raise_for_status()
+                payload = resp.json() if resp.content else {}
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(0.15 * (_attempt + 1))
+        if last_exc is not None:
+            raise last_exc
         data = payload.get("data", []) if isinstance(payload, dict) else []
         rows = _normalize_kucoin_rows(data if isinstance(data, list) else [])
         if not rows:
@@ -737,12 +767,17 @@ def build_crypto_historical_strategy_replay(
     deterministic: bool = False,
 ) -> Dict[str, Any]:
     cfg = settings if isinstance(settings, dict) else {}
+    limits = _performance_limits()
     main_neural_dir = _s(cfg.get("main_neural_dir", ""))
     if not main_neural_dir:
         main_neural_dir = os.path.join(os.path.dirname(hub_dir), "market_data", "coins")
     cache_path = _cache_root(hub_dir)
     os.makedirs(cache_path, exist_ok=True)
-    replay_symbols = [str(s) for s in list(symbols or []) if _s(s)] or _crypto_symbols(cfg, main_neural_dir, max_symbols=max_symbols)
+    requested_max_symbols = int(max_symbols) if max_symbols is not None else int(limits["max_symbols_per_replay"])
+    requested_lookback_days = int(lookback_days)
+    capped_max_symbols = min(int(limits["max_symbols_per_replay"]), max(1, requested_max_symbols))
+    capped_lookback_days = min(int(limits["max_lookback_days"]), max(1, requested_lookback_days))
+    replay_symbols = [str(s) for s in list(symbols or []) if _s(s)] or _crypto_symbols(cfg, main_neural_dir, max_symbols=capped_max_symbols)
     lock_path = _s(symbols_lock_file) or os.path.join(hub_dir, "crypto", "historical_replay_cache", "symbols.lock.json")
     if freeze_symbols and os.path.exists(lock_path):
         try:
@@ -753,8 +788,8 @@ def build_crypto_historical_strategy_replay(
                 replay_symbols = locked_symbols
         except Exception:
             pass
-    if max_symbols is not None and max_symbols > 0:
-        replay_symbols = replay_symbols[: int(max_symbols)]
+    if capped_max_symbols > 0:
+        replay_symbols = replay_symbols[: int(capped_max_symbols)]
     if freeze_symbols and (not os.path.exists(lock_path)):
         try:
             os.makedirs(os.path.dirname(lock_path), exist_ok=True)
@@ -768,7 +803,7 @@ def build_crypto_historical_strategy_replay(
     if derived_cutoff_ts <= 0:
         derived_cutoff_ts = int(time.time())
     end_ts_ms = int(derived_cutoff_ts * 1000)
-    start_ts_ms = int((start_ts if start_ts is not None else int((end_ts_ms / 1000) - (max(7, int(lookback_days)) * 86400))) * 1000)
+    start_ts_ms = int((start_ts if start_ts is not None else int((end_ts_ms / 1000) - (max(7, int(capped_lookback_days)) * 86400))) * 1000)
     thresholds = {
         "entry_signal_margin_min": 0.35,
         "entry_trend_score_min": 0.12,
@@ -940,6 +975,20 @@ def build_crypto_historical_strategy_replay(
         "crypto_replay_cache_frozen": bool(freeze_cache),
         "crypto_replay_rows_hash": row_hash,
         "crypto_replay_symbols_lock_file": lock_path,
+        "performance_caps": {
+            "max_symbols_per_replay": int(limits["max_symbols_per_replay"]),
+            "requested_max_symbols": int(requested_max_symbols),
+            "max_symbols_capped": bool(requested_max_symbols > capped_max_symbols),
+            "max_lookback_days": int(limits["max_lookback_days"]),
+            "requested_lookback_days": int(requested_lookback_days),
+            "lookback_days_capped": bool(requested_lookback_days > capped_lookback_days),
+            "max_network_retry_attempts": int(limits["max_network_retry_attempts"]),
+            "max_cached_candle_rows": int(limits["max_cached_candle_rows"]),
+        },
+        "live_api_calls_avoided": {
+            "robinhood_called": False,
+            "kucoin_live_called_only_when_cache_missing": bool(used_remote_api),
+        },
     }
     state = "READY" if rows else "NO_DATA"
     return {"state": state, "rows": rows, "diagnostics": diagnostics, "skipped": skipped, "provider_cache_details": diagnostics}

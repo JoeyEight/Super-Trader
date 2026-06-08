@@ -128,6 +128,59 @@ def _env_str(name: str, default: str = "") -> str:
     return _s(os.environ.get(name, default)) or default
 
 
+def _performance_limits() -> Dict[str, int]:
+    return {
+        "max_jsonl_rows_read": max(1, _env_int("MODEL_QUALITY_MAX_JSONL_ROWS_READ", 250000)),
+        "max_artifact_rows_written": max(1, _env_int("MODEL_QUALITY_MAX_ARTIFACT_ROWS_WRITTEN", 200000)),
+        "max_residual_rows_written": max(1, _env_int("MODEL_QUALITY_MAX_RESIDUAL_ROWS_WRITTEN", 5000)),
+        "max_classifier_training_rows": max(1, _env_int("MODEL_QUALITY_MAX_CLASSIFIER_TRAINING_ROWS", 5000)),
+        "max_classifier_dataset_rows": max(1, _env_int("MODEL_QUALITY_MAX_CLASSIFIER_DATASET_ROWS", 12000)),
+        "max_lookback_days": max(30, _env_int("MODEL_QUALITY_MAX_LOOKBACK_DAYS", 365)),
+        "max_symbols_per_replay": max(1, _env_int("MODEL_QUALITY_MAX_SYMBOLS_PER_REPLAY", 50)),
+        "max_file_size_warning_bytes": max(1024 * 1024, _env_int("MODEL_QUALITY_MAX_FILE_SIZE_WARNING_BYTES", 25 * 1024 * 1024)),
+        "max_full_pass_runtime_warning_seconds": max(10, _env_int("MODEL_QUALITY_MAX_FULL_PASS_RUNTIME_WARNING_SECONDS", 180)),
+        "max_network_retry_attempts": max(1, _env_int("MODEL_QUALITY_MAX_NETWORK_RETRY_ATTEMPTS", 2)),
+        "max_scanner_trainer_subprocesses": max(1, _env_int("MODEL_QUALITY_MAX_SCANNER_TRAINER_SUBPROCESSES", 2)),
+    }
+
+
+def _cap_int(value: int, cap: int) -> int:
+    return max(0, min(int(value), int(cap)))
+
+
+def _bounded_rows(
+    rows: Iterable[Dict[str, Any]],
+    *,
+    cap: int,
+) -> Tuple[List[Dict[str, Any]], int, bool]:
+    bounded: List[Dict[str, Any]] = []
+    attempted = 0
+    for row in list(rows or []):
+        if not isinstance(row, dict):
+            continue
+        attempted += 1
+        if len(bounded) < int(cap):
+            bounded.append(row)
+    return bounded, int(attempted), bool(attempted > len(bounded))
+
+
+def _artifact_row_cap_for_path(path: str) -> int:
+    limits = _performance_limits()
+    lower = _s(path).lower()
+    if "residual" in lower:
+        return int(limits["max_residual_rows_written"])
+    if "classifier" in lower:
+        return int(limits["max_classifier_dataset_rows"])
+    return int(limits["max_artifact_rows_written"])
+
+
+def _file_size_bytes(path: str) -> int:
+    try:
+        return int(os.path.getsize(path))
+    except Exception:
+        return 0
+
+
 def _bool_setting(cfg: Dict[str, Any], key: str, default: bool = False) -> bool:
     return bool(cfg.get(key, default))
 
@@ -224,12 +277,15 @@ def _existing_runtime_settings_diagnostics(cfg: Dict[str, Any], base_dir: str) -
     }
 
 
-def _safe_read_jsonl(path: str, max_lines: int = 800000) -> List[Dict[str, Any]]:
+def _safe_read_jsonl(path: str, max_lines: int = 800000, diag: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
+    attempted = 0
+    effective_limit = min(int(max_lines), int(_performance_limits()["max_jsonl_rows_read"]))
     try:
         with open(path, "r", encoding="utf-8") as f:
             for i, line in enumerate(f):
-                if i >= int(max_lines):
+                attempted = i + 1
+                if i >= int(effective_limit):
                     break
                 txt = _s(line)
                 if not txt:
@@ -242,6 +298,20 @@ def _safe_read_jsonl(path: str, max_lines: int = 800000) -> List[Dict[str, Any]]
                     out.append(row)
     except Exception:
         return []
+    if isinstance(diag, dict):
+        diag.update(
+            {
+                "path": path,
+                "cap_name": "max_jsonl_rows_read",
+                "configured_limit": int(_performance_limits()["max_jsonl_rows_read"]),
+                "requested_limit": int(max_lines),
+                "effective_limit": int(effective_limit),
+                "actual_attempted_count": int(attempted),
+                "rows_returned": int(len(out)),
+                "truncated": bool(attempted > effective_limit),
+                "result_validity": "valid_bounded_read",
+            }
+        )
     return out
 
 
@@ -1989,11 +2059,27 @@ def _attach_crypto_artifact_features(
     }
 
 
-def _write_jsonl(path: str, rows: Iterable[Dict[str, Any]]) -> str:
+def _write_jsonl(path: str, rows: Iterable[Dict[str, Any]], *, diag: Optional[Dict[str, Any]] = None, max_rows: Optional[int] = None) -> str:
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    cap = int(max_rows if max_rows is not None else _artifact_row_cap_for_path(path))
+    bounded, attempted, truncated = _bounded_rows(list(rows or []), cap=cap)
     with open(path, "w", encoding="utf-8") as f:
-        for row in rows:
+        for row in bounded:
             f.write(json.dumps(row, separators=(",", ":"), ensure_ascii=True) + "\n")
+    if isinstance(diag, dict):
+        diag.update(
+            {
+                "path": path,
+                "cap_name": "max_artifact_rows_written",
+                "configured_limit": int(cap),
+                "actual_attempted_count": int(attempted),
+                "rows_written": int(len(bounded)),
+                "truncated": bool(truncated),
+                "result_validity": "valid_bounded_artifact",
+                "sha256": _sha256_file(path),
+                "file_size_bytes": _file_size_bytes(path),
+            }
+        )
     return path
 
 
@@ -2006,6 +2092,21 @@ def _sha256_file(path: str) -> str:
                 break
             h.update(chunk)
     return h.hexdigest()
+
+
+def _performance_diagnostics_path(hub_dir: str) -> str:
+    return os.path.join(hub_dir, "performance_diagnostics.json")
+
+
+def _largest_files(paths: Iterable[str], limit: int = 10) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for path in list(paths or []):
+        p = _s(path)
+        if not p or not os.path.exists(p):
+            continue
+        items.append({"path": p, "file_size_bytes": _file_size_bytes(p)})
+    items.sort(key=lambda item: int(item.get("file_size_bytes", 0)), reverse=True)
+    return items[: max(1, int(limit))]
 
 
 def _stable_row_sort_key(row: Dict[str, Any]) -> Tuple[int, int, str, str]:
@@ -5760,14 +5861,18 @@ def _export_crypto_blind_residual_mismatches(hub_dir: str, rows: List[Dict[str, 
                 "second_stage_residual_family": _s(row.get("second_stage_residual_family", "")),
             }
         )
-    _write_jsonl(paths["rows"], exported)
+    write_diag: Dict[str, Any] = {}
+    _write_jsonl(paths["rows"], exported, diag=write_diag, max_rows=int(_performance_limits()["max_residual_rows_written"]))
     summary = {
-        "rows": int(len(exported)),
-        "pairs": _count_by(exported, lambda r: f"{_s(r.get('actual_trigger', 'Unknown'))}->{_s(r.get('predicted_trigger', 'Unknown'))}"),
+        "rows": int(write_diag.get("rows_written", len(exported))),
+        "attempted_rows": int(len(exported)),
+        "truncated": bool(write_diag.get("truncated", False)),
+        "pairs": _count_by(exported[: int(write_diag.get("rows_written", len(exported)))], lambda r: f"{_s(r.get('actual_trigger', 'Unknown'))}->{_s(r.get('predicted_trigger', 'Unknown'))}"),
         "discriminator_counts": _count_by(
-            [r for r in exported if bool(r.get("second_stage_discriminator_applied", False))],
+            [r for r in exported[: int(write_diag.get("rows_written", len(exported)))] if bool(r.get("second_stage_discriminator_applied", False))],
             lambda r: f"{_s(r.get('second_stage_discriminator_from', 'Unknown'))}->{_s(r.get('second_stage_discriminator_to', 'Unknown'))}",
         ),
+        "write_diagnostics": write_diag,
     }
     _write_json_atomic(paths["summary"], summary)
     return {"paths": paths, "summary": summary}
@@ -7120,8 +7225,17 @@ def _crypto_trigger_classifier_ready_decision(
 
 def _build_crypto_trigger_classifier_candidate(hub_dir: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     dataset = _crypto_trigger_classifier_dataset_rows(rows)
+    limits = _performance_limits()
+    dataset_rows, dataset_attempted, dataset_truncated = _bounded_rows(
+        list(dataset.get("rows", []) or []),
+        cap=int(limits["max_classifier_dataset_rows"]),
+    )
+    dataset["rows"] = dataset_rows
     split_rows = _split_walkforward_rows(dataset.get("rows", []))
-    train_rows = list(split_rows.get("train", []) or [])
+    train_rows, train_attempted, train_truncated = _bounded_rows(
+        list(split_rows.get("train", []) or []),
+        cap=int(limits["max_classifier_training_rows"]),
+    )
     validation_rows = list(split_rows.get("validation", []) or [])
     test_rows = list(split_rows.get("test", []) or [])
     model = _crypto_trigger_classifier_model_fit(train_rows, list(dataset.get("feature_names", []) or []))
@@ -7145,7 +7259,11 @@ def _build_crypto_trigger_classifier_candidate(hub_dir: str, rows: List[Dict[str
         "candidate_name": "crypto_trigger_classifier_v1",
         "target": "actual_exit_trigger",
         "rows": int(len(dataset.get("rows", []) or [])),
+        "attempted_rows": int(dataset_attempted),
+        "dataset_rows_truncated": bool(dataset_truncated),
         "train_rows": int(len(train_rows)),
+        "attempted_train_rows": int(train_attempted),
+        "train_rows_truncated": bool(train_truncated),
         "validation_rows": int(len(validation_rows)),
         "test_rows": int(len(test_rows)),
         "split_method": "chronological_70_15_15",
@@ -7161,6 +7279,13 @@ def _build_crypto_trigger_classifier_candidate(hub_dir: str, rows: List[Dict[str
         "excluded_leakage_fields": list(dataset.get("excluded_leakage_fields", []) or []),
         "rejected_reasons": dict(dataset.get("rejected_reasons", {}) if isinstance(dataset.get("rejected_reasons", {}), dict) else {}),
         "leakage_check_status": "pass" if not bool(dataset.get("leakage_detected", False)) else "blocked",
+        "cap_diagnostics": {
+            "max_classifier_dataset_rows": int(limits["max_classifier_dataset_rows"]),
+            "max_classifier_training_rows": int(limits["max_classifier_training_rows"]),
+            "dataset_truncated": bool(dataset_truncated),
+            "training_truncated": bool(train_truncated),
+            "result_validity": "valid_bounded_classifier_dataset",
+        },
     }
     eval_payload = {
         "schema_version": HISTORICAL_BLIND_SIM_SCHEMA_VERSION,
@@ -7466,9 +7591,12 @@ def _build_historical_blind_simulation(
 ) -> Dict[str, Any]:
     enabled = _env_flag("HISTORICAL_BLIND_SIM_ENABLED") or _env_flag("SYMBOL_ONBOARDING_BLIND_SIM_ENABLED")
     configured_markets = _historical_blind_sim_enabled_markets()
-    lookback_days = _env_int("HISTORICAL_BLIND_SIM_LOOKBACK_DAYS", _env_int("SYMBOL_ONBOARDING_LOOKBACK_DAYS", 365))
+    limits = _performance_limits()
+    requested_lookback_days = _env_int("HISTORICAL_BLIND_SIM_LOOKBACK_DAYS", _env_int("SYMBOL_ONBOARDING_LOOKBACK_DAYS", 365))
+    lookback_days = min(int(requested_lookback_days), int(limits["max_lookback_days"]))
     timeframe = _env_str("HISTORICAL_BLIND_SIM_TIMEFRAME", _env_str("SYMBOL_ONBOARDING_TIMEFRAME", "1hour")) or "1hour"
-    max_symbols = _env_int("HISTORICAL_BLIND_SIM_MAX_SYMBOLS", max(1, _env_int("SYMBOL_ONBOARDING_MAX_SYMBOLS_PER_RUN", 20)))
+    requested_max_symbols = _env_int("HISTORICAL_BLIND_SIM_MAX_SYMBOLS", max(1, _env_int("SYMBOL_ONBOARDING_MAX_SYMBOLS_PER_RUN", 20)))
+    max_symbols = min(int(requested_max_symbols), int(limits["max_symbols_per_replay"]))
     deterministic = _env_flag("HISTORICAL_BLIND_SIM_DETERMINISTIC")
     force_refresh = False
     report: Dict[str, Any] = {
@@ -7480,6 +7608,14 @@ def _build_historical_blind_simulation(
         "artifact_paths": {},
         "symbol_bucket_artifacts": {},
         "unified_artifacts": {},
+        "performance_caps": {
+            "max_lookback_days": int(limits["max_lookback_days"]),
+            "requested_lookback_days": int(requested_lookback_days),
+            "lookback_days_capped": bool(int(requested_lookback_days) > int(lookback_days)),
+            "max_symbols_per_replay": int(limits["max_symbols_per_replay"]),
+            "requested_max_symbols": int(requested_max_symbols),
+            "max_symbols_capped": bool(int(requested_max_symbols) > int(max_symbols)),
+        },
     }
     if not enabled:
         return report
@@ -9879,6 +10015,11 @@ def run_model_quality_full_pass(
     settings: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     cfg = sanitize_settings(settings if isinstance(settings, dict) else {})
+    perf_limits = _performance_limits()
+    perf_started = time.time()
+    step_started = perf_started
+    step_seconds: Dict[str, float] = {}
+    performance_warnings: List[str] = []
     crypto_backfill_enabled = _env_flag("CRYPTO_REPLAY_BACKFILL")
     crypto_backfill_lookback_days = _env_int("CRYPTO_REPLAY_BACKFILL_LOOKBACK_DAYS", 365 if crypto_backfill_enabled else 90)
     crypto_backfill_timeframe = _s(os.environ.get("CRYPTO_REPLAY_BACKFILL_TIMEFRAME", "1hour" if crypto_backfill_enabled else "1hour")) or "1hour"
@@ -9916,6 +10057,7 @@ def run_model_quality_full_pass(
     crypto_artifact_report: Dict[str, Any] = {}
     existing_runtime_settings = _existing_runtime_settings_diagnostics(cfg, base_dir)
     for m in markets:
+        market_started = time.time()
         loaded = load_market_trade_events(hub_dir, m)
         events = loaded.get("events", []) if isinstance(loaded.get("events", []), list) else []
         closed = build_closed_trades(events, m).get("closed_trades", [])
@@ -10093,13 +10235,16 @@ def run_model_quality_full_pass(
                 "source_selection_reason": "forex_execution_log_default_primary",
                 "model_quality_source_priority_used": "execution_log",
             }
+        step_seconds[f"{m}_source_selection"] = round(time.time() - market_started, 6)
         closed_by_market[m] = list(closed if isinstance(closed, list) else [])
         snap_path = os.path.join(out_dir, f"{m}_closed_trades_v1_{stamp}.jsonl")
-        _write_jsonl(snap_path, closed if isinstance(closed, list) else [])
+        snap_diag: Dict[str, Any] = {}
+        _write_jsonl(snap_path, closed if isinstance(closed, list) else [], diag=snap_diag)
         snapshots[m] = {
             "path": snap_path,
             "sha256": _sha256_file(snap_path),
             "rows": int(len(closed) if isinstance(closed, list) else 0),
+            "write_diagnostics": snap_diag,
         }
         dataset_reports[m] = build_market_dataset_quality(hub_dir, m)
         if isinstance(dataset_reports.get(m, {}), dict):
@@ -10155,7 +10300,9 @@ def run_model_quality_full_pass(
                     )
                 dataset_reports[m]["feature_source_diagnostics"] = feature_diag
                 replay_generation[m]["crypto_feature_source_diagnostics"] = feature_diag
+    step_seconds["closed_trade_source_and_snapshot_build"] = round(time.time() - step_started, 6)
 
+    step_started = time.time()
     completed_live_decision_artifacts = _write_completed_live_decision_artifacts(
         hub_dir,
         completed_live_rows_by_market,
@@ -10195,8 +10342,10 @@ def run_model_quality_full_pass(
         "completed_live_synthetic_path_verified_by_market": dict(synthetic_completed_live_verification.get("completed_live_synthetic_path_verified_by_market", {})),
         "completed_live_synthetic_blockers_by_market": dict(synthetic_completed_live_verification.get("completed_live_synthetic_blockers_by_market", {})),
     }
+    step_seconds["completed_live_decision_rows"] = round(time.time() - step_started, 6)
 
     # Build/refresh replay artifacts for all markets from normalized closed trades.
+    step_started = time.time()
     openai_dir = os.path.join(hub_dir, "openai")
     os.makedirs(openai_dir, exist_ok=True)
     synthetic_paths: Dict[str, str] = {}
@@ -10318,13 +10467,18 @@ def run_model_quality_full_pass(
         with open(rpath, "w", encoding="utf-8") as f:
             json.dump(payload if isinstance(payload, dict) else {}, f, indent=2)
         synthetic_paths[m] = rpath
+    step_seconds["quality_scoring_and_synthetic_replay_artifacts"] = round(time.time() - step_started, 6)
 
+    step_started = time.time()
     regimes = build_all_market_regimes(hub_dir)
     walk = build_walkforward_report(hub_dir)
     calibration = build_confidence_calibration_payload(hub_dir, cfg)
     shadow = build_shadow_scorecards(hub_dir)
     replay_diag = {m: build_replay_diagnostics(hub_dir, m) for m in markets}
     legacy_trade_replay = build_legacy_trade_model_replay(hub_dir=hub_dir, base_dir=base_dir, settings=cfg)
+    step_seconds["core_quality_artifacts"] = round(time.time() - step_started, 6)
+
+    step_started = time.time()
     blind_simulation = _build_historical_blind_simulation(
         hub_dir=hub_dir,
         base_dir=base_dir,
@@ -10349,7 +10503,9 @@ def run_model_quality_full_pass(
             blind_market.get("symbol_bucket_artifacts", {}) if isinstance(blind_market.get("symbol_bucket_artifacts", {}), dict) else {}
         )
         replay_generation[m]["historical_blind_simulation_blocker"] = _s(blind_summary.get("blocker", blind_market.get("blocker", "")))
+    step_seconds["historical_blind_simulation"] = round(time.time() - step_started, 6)
 
+    step_started = time.time()
     promotion_thresholds = {"directional_accuracy_pct": 90.0, "trigger_match_pct": 90.0, "pnl_trend_match_pct": 90.0}
     promotion_minima = {
         "ci_lower_bound_pct": 85.0,
@@ -10453,6 +10609,79 @@ def run_model_quality_full_pass(
         completed_live_artifacts=completed_live_decision_artifacts,
         existing_runtime_settings=existing_runtime_settings,
     )
+    step_seconds["promotion_readiness_and_market_readiness"] = round(time.time() - step_started, 6)
+
+    ended = time.time()
+    runtime_seconds = round(ended - perf_started, 6)
+    if runtime_seconds > float(perf_limits["max_full_pass_runtime_warning_seconds"]):
+        performance_warnings.append(
+            f"full_pass_runtime_warning({runtime_seconds:.2f}s>{float(perf_limits['max_full_pass_runtime_warning_seconds']):.2f}s)"
+        )
+    artifact_paths = [snapshots[m]["path"] for m in snapshots if isinstance(snapshots.get(m, {}), dict)]
+    artifact_paths.extend(list(synthetic_paths.values()))
+    artifact_paths.extend(
+        [
+            _s((((blind_simulation.get("markets", {}) or {}).get("crypto", {}) or {}).get("summary", {}) or {}).get("crypto_trigger_classifier_dataset_summary_path", "")),
+            _s((((blind_simulation.get("markets", {}) or {}).get("crypto", {}) or {}).get("summary", {}) or {}).get("crypto_trigger_classifier_eval_path", "")),
+            _s((((blind_simulation.get("markets", {}) or {}).get("crypto", {}) or {}).get("summary", {}) or {}).get("residual_mismatch_artifact_path", "")),
+        ]
+    )
+    largest_artifacts = _largest_files(artifact_paths, limit=12)
+    for item in largest_artifacts:
+        if int(item.get("file_size_bytes", 0)) > int(perf_limits["max_file_size_warning_bytes"]):
+            performance_warnings.append(
+                f"artifact_file_size_warning({os.path.basename(_s(item.get('path', '')))}:{int(item.get('file_size_bytes', 0))}>{int(perf_limits['max_file_size_warning_bytes'])})"
+            )
+    blind_rows_by_market = {}
+    for m in markets:
+        market_entry = ((blind_simulation.get("markets", {}) or {}).get(m, {}) or {})
+        market_summary = market_entry.get("summary", {}) if isinstance(market_entry, dict) else {}
+        blind_rows_by_market[m] = int(_f(market_summary.get("completed_mock_trades", 0), 0.0))
+    written_rows_by_artifact = {
+        m: int((((snapshots.get(m, {}) or {}).get("write_diagnostics", {}) or {}).get("rows_written", 0) or 0))
+        for m in snapshots
+    }
+
+    performance_diagnostics = {
+        "start_timestamp": int(perf_started),
+        "end_timestamp": int(ended),
+        "runtime_seconds": runtime_seconds,
+        "runtime_seconds_by_major_step": step_seconds,
+        "limits": perf_limits,
+        "rows_read_by_source": {
+            "closed_trade_rows_by_market": {m: int(len(list(closed_by_market.get(m, []) or []))) for m in markets},
+            "completed_live_rows_by_market": {m: int(len(list(completed_live_rows_by_market.get(m, []) or []))) for m in markets},
+            "historical_blind_simulation_rows_by_market": blind_rows_by_market,
+        },
+        "rows_written_by_artifact": written_rows_by_artifact,
+        "symbols_evaluated_by_market": {
+            "crypto": int(len(list((replay_generation.get("crypto", {}).get("historical_strategy_replay", {}) if isinstance(replay_generation.get("crypto", {}).get("historical_strategy_replay", {}), dict) else {}).get("historical_strategy_replay_symbols", []) or []))),
+            "stocks": int(_f(replay_generation.get("stocks", {}).get("stock_symbols_considered", 0), 0.0)) if isinstance(replay_generation.get("stocks", {}), dict) else 0,
+            "forex": int(len(list(closed_by_market.get("forex", []) or []))),
+        },
+        "cache_hits_misses": {
+            "crypto_replay_used_local_cache": bool((replay_generation.get("crypto", {}).get("historical_strategy_replay", {}) if isinstance(replay_generation.get("crypto", {}).get("historical_strategy_replay", {}), dict) else {}).get("replay_used_local_cache", False)),
+            "crypto_replay_used_remote_api": bool((replay_generation.get("crypto", {}).get("historical_strategy_replay", {}) if isinstance(replay_generation.get("crypto", {}).get("historical_strategy_replay", {}), dict) else {}).get("replay_used_remote_api", False)),
+        },
+        "remote_api_calls_attempted": {
+            "crypto_historical_replay_remote_rows_fetched": int(_f((replay_generation.get("crypto", {}).get("historical_strategy_replay", {}) if isinstance(replay_generation.get("crypto", {}).get("historical_strategy_replay", {}), dict) else {}).get("remote_rows_fetched", 0), 0.0)),
+        },
+        "dry_run_live_api_calls_avoided": {
+            "crypto_original_dry_run_called_robinhood": False,
+            "crypto_original_dry_run_called_kucoin_live": False,
+            "crypto_trigger_classifier_live_api_calls": False,
+        },
+        "artifact_file_sizes": largest_artifacts,
+        "warnings": performance_warnings,
+        "hard_blockers": [],
+        "primary_sources_unchanged": {
+            "crypto": "historical_strategy_replay",
+            "stocks": "historical_api_replay",
+            "forex": "execution_log",
+        },
+        "blind_sim_supplemental_only": True,
+    }
+    _write_json_atomic(_performance_diagnostics_path(hub_dir), performance_diagnostics)
 
     return {
         "ts": ts,
@@ -10487,4 +10716,6 @@ def run_model_quality_full_pass(
         "controlled_rollout_readiness": controlled_rollout_readiness,
         "promotion_readiness": promotion_readiness,
         "model_quality_market_readiness": market_readiness,
+        "performance_diagnostics": performance_diagnostics,
+        "performance_diagnostics_path": _performance_diagnostics_path(hub_dir),
     }
